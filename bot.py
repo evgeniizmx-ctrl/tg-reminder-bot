@@ -2,7 +2,7 @@ import os
 import json
 import re
 import asyncio
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dtime
 import pytz
 
 from aiogram import Bot, Dispatcher, F
@@ -21,8 +21,6 @@ OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 
 TZ = os.getenv("APP_TZ", "Europe/Moscow")
 tz = pytz.timezone(TZ)
-
-print("ENV:", "BOT", bool(BOT_TOKEN), "OPENAI", bool(OPENAI_API_KEY), "OCR", bool(OCR_SPACE_API_KEY), "TZ", TZ)
 
 # ===================== ИНИЦИАЛИЗАЦИЯ =====================
 bot = Bot(token=BOT_TOKEN)
@@ -69,7 +67,6 @@ def clean_description(desc: str) -> str:
     d = desc.strip()
     d = re.sub(r"^(напомни(те)?|пожалуйста)\b[\s,:-]*", "", d, flags=re.IGNORECASE)
     d = re.sub(r"^(о|про|насч[её]т)\s+", "", d, flags=re.IGNORECASE)
-    # убираем служебные слова-дни в начале
     d = re.sub(r"^(сегодня|завтра|послезавтра)\b", "", d, flags=re.IGNORECASE).strip()
     return d or "Напоминание"
 
@@ -79,6 +76,9 @@ def _variants_keyboard(variants: list[datetime]) -> InlineKeyboardMarkup:
                               callback_data=f"time|{dt.isoformat()}")]
         for dt in variants
     ])
+
+def _mk_dt(base_d: date, hh: int, mm: int) -> datetime:
+    return tz.localize(datetime(base_d.year, base_d.month, base_d.day, hh % 24, mm % 60))
 
 # ===================== ПАРСЕРЫ =====================
 # --- «через … / спустя … / полчаса / минуту/час/день» ---
@@ -166,12 +166,6 @@ DAYTIME_RX = re.compile(
 )
 
 def parse_daytime_phrase(raw_text: str):
-    """
-    Возвращает:
-      ("amb", remainder, [dt1, dt2]) — двусмысленно (утро/вечер, кнопки)
-      ("ok", dt, remainder)          — однозначно
-      None                           — нет совпадения
-    """
     s = normalize_spaces(raw_text)
     m = DAYTIME_RX.search(s)
     if not m:
@@ -184,22 +178,19 @@ def parse_daytime_phrase(raw_text: str):
 
     now = datetime.now(tz).replace(second=0, microsecond=0)
     base = now if day_word == "сегодня" else (now + timedelta(days=1 if day_word == "завтра" else 2))
-
     remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
 
     if mer in ("утра", "дня", "вечера", "ночи"):
         h = hour_raw
         if mer in ("дня", "вечера") and h < 12: h += 12
         if mer == "ночи" and h == 12: h = 0
-        h = max(0, min(h, 23)); minute = max(0, min(minute, 59))
-        target = base.replace(hour=h, minute=minute)
+        target = base.replace(hour=h % 24, minute=minute % 60)
         return ("ok", target, remainder)
 
     # без «утра/вечера» → два варианта
-    h1 = max(0, min(hour_raw, 23))
-    dt1 = base.replace(hour=h1, minute=minute)            # утро
+    dt1 = base.replace(hour=hour_raw % 24, minute=minute % 60)
     h2 = 0 if hour_raw == 12 else (hour_raw + 12) % 24
-    dt2 = base.replace(hour=h2, minute=minute)            # вечер
+    dt2 = base.replace(hour=h2, minute=minute % 60)
     return ("amb", remainder, [dt1, dt2])
 
 # --- «просто в HH[:MM]» (без дня) → кнопки/однозначно ---
@@ -220,7 +211,7 @@ def parse_onlytime_phrase(raw_text: str):
         h = hour_raw
         if mer in ("дня", "вечера") and h < 12: h += 12
         if mer == "ночи" and h == 12: h = 0
-        target = now.replace(hour=h, minute=minute)
+        target = now.replace(hour=h % 24, minute=minute % 60)
         if target <= now: target += timedelta(days=1)
         remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
         return ("ok", target, remainder)
@@ -228,37 +219,74 @@ def parse_onlytime_phrase(raw_text: str):
     # двусмысленно → варианты (сегодня): HH и HH+12, если прошло — на завтра
     cand = []
     for h in [hour_raw % 24, (hour_raw + 12) % 24]:
-        dt = now.replace(hour=h, minute=minute)
+        dt = now.replace(hour=h, minute=minute % 60)
         if dt <= now: dt += timedelta(days=1)
         cand.append(dt)
     remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
     return ("amb", remainder, cand)
 
-# --- «только день, без времени» → запомнить день и спросить время ---
-DAY_ONLY_RX = re.compile(r"\b(сегодня|завтра|послезавтра)\b(?!.*\bв\s*\d)", re.IGNORECASE | re.UNICODE)
+# --- НОВОЕ: «только дата без времени» (числом) ---
+# ловим: 25, 25 числа, на 25; 25.09; 25/9; 25-09-2025; и т.д., если НЕТ времени «в \d»
+DATE_NUM_RX = re.compile(
+    r"(?:\bна\s+)?\b(\d{1,2})\b(?:\s*числа)?(?!\s*[:.]\d)\b(?!.*\bв\s*\d)", re.IGNORECASE | re.UNICODE
+)
+DATE_DOT_RX = re.compile(
+    r"\b(\d{1,2})[.\-\/](\d{1,2})(?:[.\-\/](\d{2,4}))?\b(?!.*\bв\s*\d)", re.IGNORECASE | re.UNICODE
+)
 
-def parse_day_only(raw_text: str):
-    """
-    Если пользователь указал только день («послезавтра свадьба»), возвращаем
-    ('day', base_date(date), remainder_description)
-    """
+def nearest_future_day(day: int, now: datetime) -> date:
+    """Ближайшее будущее число (day) в этом или следующем месяце."""
+    y, m = now.year, now.month
+    try:
+        candidate = date(y, m, day)
+    except ValueError:
+        # если дня нет в этом месяце — берём след. месяц
+        m2 = m + 1 if m < 12 else 1
+        y2 = y if m < 12 else y + 1
+        return date(y2, m2, min(day, 28))
+    if candidate <= now.date():
+        m2 = m + 1 if m < 12 else 1
+        y2 = y if m < 12 else y + 1
+        # защищаемся от 31/30 февраля и т.п.
+        for dcap in (31, 30, 29, 28):
+            try:
+                return date(y2, m2, min(day, dcap))
+            except ValueError:
+                continue
+    return candidate
+
+def parse_numeric_date_only(raw_text: str):
     s = normalize_spaces(raw_text)
-    m = DAY_ONLY_RX.search(s)
-    if not m:
-        return None
-    word = m.group(1).lower()
-    now = datetime.now(tz)
-    if word == "сегодня":
-        base = now.date()
-    elif word == "завтра":
-        base = (now + timedelta(days=1)).date()
-    else:
-        base = (now + timedelta(days=2)).date()
-    remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
-    desc = clean_description(remainder)
-    return ("day", base, desc)
+    # DD.MM(.YYYY)
+    m = DATE_DOT_RX.search(s)
+    if m:
+        dd = int(m.group(1)); mm = int(m.group(2))
+        yy = m.group(3)
+        now = datetime.now(tz)
+        if yy:
+            yyyy = int(yy)
+            if yyyy < 100: yyyy += 2000
+        else:
+            yyyy = now.year
+        try:
+            base = date(yyyy, mm, dd)
+        except ValueError:
+            return None
+        desc = clean_description(DATE_DOT_RX.sub("", s))
+        return ("day", base, desc)
 
-# ===================== OpenAI (GPT/Whisper) — Fallback =====================
+    # «25», «25 числа», «на 25» — ближайшее будущее
+    m2 = DATE_NUM_RX.search(s)
+    if m2:
+        dd = int(m2.group(1))
+        now = datetime.now(tz)
+        base = nearest_future_day(dd, now)
+        desc = clean_description(DATE_NUM_RX.sub("", s))
+        return ("day", base, desc)
+
+    return None
+
+# ===================== OpenAI (fallback при полной неразберихе) =====================
 OPENAI_BASE = "https://api.openai.com/v1"
 
 async def gpt_parse(text: str) -> dict:
@@ -292,11 +320,9 @@ async def gpt_parse(text: str) -> dict:
 async def start(message: Message):
     await message.answer(
         "Привет! Я бот-напоминалка.\n"
-        "• Пиши: «послезавтра свадьба» — я спрошу только время;\n"
-        "  «в 10» — предложу 10:00 или 22:00; «в 17 часов» — ближайшее 17:00;\n"
-        "  «через 3 минуты», «завтра в это же время», «завтра в 5» и т. п.\n"
-        "• Голос/скрин тоже можно.\n"
-        "• /list — список, /ping — проверка."
+        "Понимаю: «послезавтра свадьба», «Свадьба 25», «25.09», «в 10», «в 17 часов», «через 3 минуты», «завтра в 5».\n"
+        "Если указал только день — спрошу лишь время (ответ «18» — сразу 18:00; «6» — предложу 06:00/18:00).\n"
+        "Голос/скрин тоже можно. /list — список, /ping — проверка."
     )
 
 @dp.message(Command("ping"))
@@ -327,14 +353,14 @@ async def on_any_text(message: Message):
     # 0) если ждём уточнение
     if uid in PENDING:
         st = PENDING[uid]
-        # если ждём выбор по кнопкам
+
+        # ждём выбор по кнопкам
         if st.get("variants"):
             await message.reply("Нажмите одну из кнопок ниже, чтобы выбрать время ⬇️")
             return
 
-        # если известен день и ждём только время
+        # известен день — ждём только время
         if st.get("base_date"):
-            # распознаём простое время из ответа: "6", "18", "6:30", "в 6", "6 утра", ...
             m = re.search(r"(?:^|\bв\s*)(\d{1,2})(?::(\d{2}))?\s*(утра|дня|вечера|ночи)?\b", text, re.IGNORECASE)
             if not m:
                 await message.reply("Во сколько? Например: 6, 18, 6:30, «6 утра» или «6 вечера».")
@@ -344,18 +370,13 @@ async def on_any_text(message: Message):
             mer = (m.group(3) or "").lower()
 
             base_d: date = st["base_date"]
-            base_dt = datetime.combine(base_d, datetime.now(tz).time()).replace(tzinfo=tz)
-            base_dt = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
-            def mk(hh, mm):
-                return tz.localize(datetime(base_d.year, base_d.month, base_d.day, hh, mm))
-
-            # «18» — однозначно 18:00; «6» — двусмысленно → кнопки (06:00/18:00)
+            # метка «утра/вечера» — однозначно
             if mer:
                 h = hour
                 if mer in ("дня", "вечера") and h < 12: h += 12
                 if mer == "ночи" and h == 12: h = 0
-                dt = mk(h % 24, minute)
+                dt = _mk_dt(base_d, h, minute)
                 desc = st.get("description", "Напоминание")
                 PENDING.pop(uid, None)
                 REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
@@ -363,8 +384,9 @@ async def on_any_text(message: Message):
                 await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
                 return
 
-            if hour == 18:
-                dt = mk(18, minute)
+            # «18» — сразу 18:00
+            if hour == 18 and minute == 0:
+                dt = _mk_dt(base_d, 18, 0)
                 desc = st.get("description", "Напоминание")
                 PENDING.pop(uid, None)
                 REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
@@ -372,15 +394,14 @@ async def on_any_text(message: Message):
                 await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
                 return
 
-            # всё остальное без метки — двусмысленно (06:00 или 18:00)
-            v1 = mk(hour % 24, minute)
-            v2 = mk((hour + 12) % 24, minute)
+            # иначе двусмысленно: HH и HH+12
+            v1 = _mk_dt(base_d, hour, minute)
+            v2 = _mk_dt(base_d, (hour + 12) % 24, minute)
             PENDING[uid]["variants"] = [v1, v2]
-            kb = _variants_keyboard([v1, v2])
-            await message.reply("Уточните время:", reply_markup=kb)
+            await message.reply("Уточните время:", reply_markup=_variants_keyboard([v1, v2]))
             return
 
-        # иначе обычный цикл парсеров
+        # обычная ветка уточнения (без base_date)
         for parser in (parse_daytime_phrase, parse_onlytime_phrase):
             pack = parser(text)
             if pack:
@@ -433,12 +454,24 @@ async def on_any_text(message: Message):
         await message.reply("Не понял время. Например: 6, 18, 6:30, «6 утра» или «6 вечера».")
         return
 
-    # 1) новая фраза — сначала «день без времени»
-    day_only = parse_day_only(text)
-    if day_only:
-        _, base_d, desc = day_only
-        PENDING[uid] = {"description": desc, "base_date": base_d, "repeat": "none"}
-        await message.reply(f"Ок, {base_d.strftime('%d.%m')}. Во сколько напомнить? (например: 6, 18, 6:30)")
+    # 1) Сначала — «только дата без времени» (словесная и числовая)
+    day_only_words = re.search(r"\b(сегодня|завтра|послезавтра)\b(?!.*\bв\s*\d)", text, re.IGNORECASE)
+    if day_only_words:
+        word = day_only_words.group(1).lower()
+        now = datetime.now(tz)
+        base = (now.date() if word == "сегодня"
+                else (now + timedelta(days=1)).date() if word == "завтра"
+                else (now + timedelta(days=2)).date())
+        desc = clean_description(re.sub(r"\b(сегодня|завтра|послезавтра)\b", "", text, flags=re.IGNORECASE))
+        PENDING[uid] = {"description": desc, "base_date": base, "repeat": "none"}
+        await message.reply(f"Ок, {base.strftime('%d.%m')}. Во сколько напомнить? (например: 6, 18, 6:30)")
+        return
+
+    day_only_num = parse_numeric_date_only(text)
+    if day_only_num:
+        _, base, desc = day_only_num
+        PENDING[uid] = {"description": desc, "base_date": base, "repeat": "none"}
+        await message.reply(f"Ок, {base.strftime('%d.%m')}. Во сколько напомнить? (например: 6, 18, 6:30)")
         return
 
     # 2) затем «день + время», «только время», «через…», «в это же время»
@@ -527,9 +560,7 @@ async def on_time_choice(cb: CallbackQuery):
 
 # ===================== ЗАПУСК =====================
 async def main():
-    print("Scheduler start")
     scheduler.start()
-    print("Polling start")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
