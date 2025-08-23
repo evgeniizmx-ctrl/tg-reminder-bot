@@ -78,7 +78,6 @@ def clean_description(desc: str) -> str:
     return d or "Напоминание"
 
 # ---------- РОБАСТНЫЙ ПАРСЕР «ЧЕРЕЗ … / СПУСТЯ …» ----------
-# поддерживаем: «через минуту/час/день», «спустя минуту», «через 3 минуты», «через полчаса»
 REL_NUM_PATTERNS = [
     (r"(через|спустя)\s+(\d+)\s*(секунд(?:у|ы)?|сек\.?)\b", "seconds"),
     (r"(через|спустя)\s+(\d+)\s*(минут(?:у|ы)?|мин\.?)\b", "minutes"),
@@ -92,19 +91,14 @@ REL_SINGULAR_PATTERNS = [  # без числа = 1
     (r"(через|спустя)\s+день\b", "days", 1),
 ]
 REL_HALF_HOUR_RX = re.compile(r"(через)\s+пол\s*часа\b", re.IGNORECASE | re.UNICODE)
-
 REL_NUM_REGEXES = [re.compile(p, re.IGNORECASE | re.UNICODE | re.DOTALL) for p, _ in REL_NUM_PATTERNS]
 REL_SING_REGEXES = [(re.compile(p, re.IGNORECASE | re.UNICODE | re.DOTALL), kind, val)
                     for p, kind, val in REL_SINGULAR_PATTERNS]
 
 def parse_relative_phrase(raw_text: str):
-    """
-    Возвращает (dt, remainder) если нашёл относительное выражение.
-    """
     s = normalize_spaces(raw_text)
     now = datetime.now(tz).replace(second=0, microsecond=0)
 
-    # полчаса
     m = REL_HALF_HOUR_RX.search(s)
     if m:
         dt = now + timedelta(minutes=30)
@@ -112,7 +106,6 @@ def parse_relative_phrase(raw_text: str):
         print(f"[REL] 'полчаса' → {dt}")
         return dt, remainder
 
-    # формы без числа (секунду/минуту/час/день)
     for rx, kind, val in REL_SING_REGEXES:
         m = rx.search(s)
         if m:
@@ -120,12 +113,10 @@ def parse_relative_phrase(raw_text: str):
             elif kind == "minutes": dt = now + timedelta(minutes=val)
             elif kind == "hours": dt = now + timedelta(hours=val)
             elif kind == "days": dt = now + timedelta(days=val)
-            else: continue
             remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
             print(f"[REL] {kind}=1 → {dt}")
             return dt, remainder
 
-    # формы с числом
     for rx, (_, kind) in zip(REL_NUM_REGEXES, REL_NUM_PATTERNS):
         m = rx.search(s)
         if not m: 
@@ -135,7 +126,6 @@ def parse_relative_phrase(raw_text: str):
         elif kind == "minutes": dt = now + timedelta(minutes=amount)
         elif kind == "hours":   dt = now + timedelta(hours=amount)
         elif kind == "days":    dt = now + timedelta(days=amount)
-        else: continue
         remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
         print(f"[REL] {kind}={amount} → {dt}")
         return dt, remainder
@@ -171,6 +161,57 @@ def parse_same_time_phrase(raw_text: str):
     remainder = IN_N_DAYS_RX.sub("", remainder)
     remainder = remainder.strip(" ,.-")
     print(f"[SAME] +{days}d → {target}")
+    return target, remainder
+
+# ---------- «СЕГОДНЯ/ЗАВТРА/ПОСЛЕЗАВТРА В HH[:MM] (утра/дня/вечера/ночи)» ----------
+DAYTIME_RX = re.compile(
+    r"\b(сегодня|завтра|послезавтра)\s*в\s*(\d{1,2})(?::(\d{2}))?(?:\s*(утра|дня|вечера|ночи))?\b",
+    re.IGNORECASE | re.UNICODE
+)
+
+def parse_daytime_phrase(raw_text: str):
+    """
+    Примеры:
+      «завтра в 5», «сегодня в 9:30», «послезавтра в 7 вечера», «завтра в 12 ночи».
+    Если не указано 'утра/вечера' — считаем утро: 'в 5' → 05:00.
+    """
+    s = normalize_spaces(raw_text)
+    m = DAYTIME_RX.search(s)
+    if not m:
+        return None
+
+    day_word = m.group(1).lower()
+    hour = int(m.group(2))
+    minute = int(m.group(3) or 0)
+    mer = (m.group(4) or "").lower()
+
+    now = datetime.now(tz).replace(second=0, microsecond=0)
+    if day_word == "сегодня":
+        base = now
+    elif day_word == "завтра":
+        base = now + timedelta(days=1)
+    else:  # послезавтра
+        base = now + timedelta(days=2)
+
+    # интерпретация 12-часовых пометок
+    if mer in ("дня", "вечера"):
+        if hour < 12:
+            hour += 12
+    elif mer == "ночи":
+        if hour == 12:
+            hour = 0
+        # иначе оставляем как есть (1..5 ночи → 01..05)
+    else:
+        # без уточнения — считаем утро (05:00, 09:30, и т.п.)
+        pass
+
+    # нормализуем в границы 0..23
+    hour = max(0, min(hour, 23))
+    minute = max(0, min(minute, 59))
+
+    target = base.replace(hour=hour, minute=minute)
+    remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
+    print(f"[DAYTIME] {day_word} {hour:02d}:{minute:02d} → {target}")
     return target, remainder
 
 # ===================== OpenAI (GPT/Whisper) =====================
@@ -239,7 +280,7 @@ async def start(message: Message):
     await message.answer(
         "Привет! Я бот-напоминалка.\n"
         "• Пиши: «Запись к стоматологу сегодня 14:25», «напомни через 3 минуты помыться», "
-        "или «завтра в это же время позвонить»\n"
+        "«завтра в 5 позвонить», «послезавтра в это же время…»\n"
         "• Пришли голосовое/скрин — я распознаю.\n"
         "• /ping — проверка, жив ли бот.\n"
         "• /list — список напоминаний (в текущей сессии)."
@@ -272,22 +313,15 @@ async def on_any_text(message: Message):
 
     # 1) если ждём уточнение времени
     if uid in PENDING:
-        # пробуем распознать «через …» или «в это же время»
-        rel = parse_relative_phrase(text)
-        same = None if rel else parse_same_time_phrase(text)
+        # сперва «сегодня/завтра/послезавтра в HH[:MM]»
+        dt_pack = parse_daytime_phrase(text)
+        if not dt_pack:
+            # затем «через … / спустя …» или «в это же время»
+            dt_pack = parse_relative_phrase(text) or parse_same_time_phrase(text)
 
-        # если в ответе есть и время, и новый «остаток» текста — считаем это НОВОЙ задачей
-        if rel and rel[1]:
-            dt, remainder = rel
-            desc = clean_description(remainder)
-            PENDING.pop(uid, None)
-            reminder = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"}
-            REMINDERS.append(reminder)
-            schedule_one(reminder)
-            await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-            return
-        if same and same[1]:
-            dt, remainder = same
+        if dt_pack and dt_pack[1]:
+            # если есть новый текст — это новая задача (меняем описание)
+            dt, remainder = dt_pack
             desc = clean_description(remainder)
             PENDING.pop(uid, None)
             reminder = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"}
@@ -296,14 +330,12 @@ async def on_any_text(message: Message):
             await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
             return
 
-        # иначе — используем описание из черновика
         dt = None
-        if rel: dt = rel[0]
-        elif same: dt = same[0]
+        if dt_pack: dt = dt_pack[0]
         else: dt = as_local_iso(text)
 
         if not dt:
-            await message.reply("Не понял время. Пример: «25.08 14:25», «через минуту» или «завтра в это же время».")
+            await message.reply("Не понял время. Пример: «25.08 14:25», «завтра в 5», «через минуту» или «завтра в это же время».")
             return
 
         draft = PENDING.pop(uid)
@@ -314,7 +346,17 @@ async def on_any_text(message: Message):
         await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
         return
 
-    # 2) новая фраза — сначала «через …»
+    # 2) новая фраза — порядок: day/time → relative → same-time → GPT
+    pack = parse_daytime_phrase(text)
+    if pack:
+        dt, remainder = pack
+        desc = clean_description(remainder or text)
+        reminder = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"}
+        REMINDERS.append(reminder)
+        schedule_one(reminder)
+        await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
+        return
+
     rel = parse_relative_phrase(text)
     if rel:
         dt, remainder = rel
@@ -325,7 +367,6 @@ async def on_any_text(message: Message):
         await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
         return
 
-    # 2b) «в это же время»
     same = parse_same_time_phrase(text)
     if same:
         dt, remainder = same
@@ -346,7 +387,7 @@ async def on_any_text(message: Message):
     remind_dt = as_local_iso(remind_iso)
 
     if plan.get("needs_clarification") or not remind_dt:
-        question = plan.get("clarification_question") or "Уточните дату и время (например, 25.08 14:25, «через минуту» или «завтра в это же время»):"
+        question = plan.get("clarification_question") or "Уточните дату и время (например, 25.08 14:25, «завтра в 5», «через минуту»):"
         PENDING[uid] = {"description": desc, "repeat": "none"}
         await message.reply(question)
         return
