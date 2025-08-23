@@ -153,8 +153,6 @@ SYSTEM_PROMPT = """Ты — интеллектуальный парсер нап
   "clarify_type": "time|date|both|none",
   "reason": "строка"
 }
-Понимай разговорные формы; двусмысленные часы -> два кандидата (06:00 и 18:00).
-Если только дата — попроси время. Если только время — поставь на ближайшее будущее. Описание очисти от вводных слов.
 """
 
 def build_user_prompt(uid: int, text: str) -> str:
@@ -211,17 +209,13 @@ async def cmd_start(m: Message):
         await ask_tz(m)
     else:
         await m.answer(
-            "Готов работать. Пиши: «завтра в полтретьего падел», «через 2 часа чай», «сегодня в 1710 отчёт».\n"
+            "Готов работать. Пиши: «завтра в полтретьего падел», «через 2 часа чай».\n"
             "/tz — сменить часовой пояс, /list — список, /cancel — отменить уточнение."
         )
 
 @router.message(Command("tz"))
 async def cmd_tz(m: Message):
-    await m.answer(
-        "Для начала укажи свой часовой пояс.\n"
-        "Выбери из списка или введи либо смещение формата +03:00.",
-        reply_markup=tz_kb()
-    )
+    await ask_tz(m)
 
 @router.message(Command("list"))
 async def cmd_list(m: Message):
@@ -258,29 +252,6 @@ async def on_text(m: Message):
         await ask_tz(m)
         return
 
-    if uid in PENDING:
-        st = PENDING[uid]
-        enriched = f"{text}. Контекст: {st.get('description','')}"
-        data = await ai_parse(uid, enriched)
-        desc = st.get("description") or data.get("description") or clean_desc(text)
-
-        if data.get("ok") and data.get("datetimes"):
-            dt = as_local_for(uid, data["datetimes"][0])
-            PENDING.pop(uid, None)
-            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-            plan(REMINDERS[-1])
-            await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
-            return
-
-        cands = data.get("datetimes", []) or st.get("candidates", [])
-        if len(cands) >= 2:
-            PENDING[uid] = {"description": desc, "candidates": cands}
-            await m.reply("Уточни время:", reply_markup=kb_variants_for(uid, cands))
-            return
-
-        await m.reply("Нужно уточнить время. Примеры: 10, 10:30, 1710.")
-        return
-
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
 
@@ -291,21 +262,9 @@ async def on_text(m: Message):
         await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
         return
 
-    cands = data.get("datetimes", [])
-    if len(cands) >= 2:
-        PENDING[uid] = {"description": desc, "candidates": cands}
-        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
-        return
-
     if data.get("need_clarification", True):
         PENDING[uid] = {"description": desc}
-        ct = data.get("clarify_type", "time")
-        if ct == "time":
-            await m.reply(f"Окей, «{desc}». Во сколько? (например: 10, 10:30, 1710)")
-        elif ct == "date":
-            await m.reply(f"Окей, «{desc}». На какой день?")
-        else:
-            await m.reply(f"Окей, «{desc}». Уточни дату и время.")
+        await m.reply(f"Окей, «{desc}». Уточни дату/время.")
         return
 
     await m.reply("Не понял. Скажи, когда напомнить (например: «завтра в 19 отчёт»).")
@@ -315,71 +274,50 @@ async def on_text(m: Message):
 async def cb_settz(cb: CallbackQuery):
     uid = cb.from_user.id
     _, payload = cb.data.split("|", 1)
-    if payload == "ASK_OFFSET":
-        await cb.message.answer("Введи смещение: +03:00, +3:00, +3, 3, 03 или укажи IANA (например, Europe/Moscow).")
-        await cb.answer()
-        return
     tz_obj = parse_user_tz_string(payload)
-    if tz_obj is None:
-        await cb.answer("Не понял часовой пояс", show_alert=True)
-        return
-    store_user_tz(uid, tz_obj)
-    try:
-        await cb.message.edit_text("Часовой пояс сохранён. Пиши напоминание ✍️")
-    except Exception:
+    if tz_obj:
+        store_user_tz(uid, tz_obj)
         await cb.message.answer("Часовой пояс сохранён. Пиши напоминание ✍️")
     await cb.answer("OK")
 
 @router.callback_query(F.data.startswith("time|"))
 async def cb_time(cb: CallbackQuery):
     uid = cb.from_user.id
-    if uid not in PENDING or not PENDING[uid].get("candidates"):
-        await cb.answer("Нет активного уточнения"); return
     iso = cb.data.split("|", 1)[1]
     dt = as_local_for(uid, iso)
     desc = PENDING[uid].get("description","Напоминание")
     PENDING.pop(uid, None)
     REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
     plan(REMINDERS[-1])
-    try:
-        await cb.message.edit_text(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
-    except Exception:
-        await cb.message.answer(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
+    await cb.message.answer(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
     await cb.answer("Установлено ✅")
 
-# ===== VOICE (OGG -> WAV -> Whisper API) =====
+# ===== VOICE =====
 voice_router = Router()
 dp.include_router(voice_router)
 
 oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if OpenAI else None
 
 def resolve_ffmpeg_path() -> str:
-    # приоритет: переменная окружения → which → дефолтный путь для mac brew
     env = os.getenv("FFMPEG_PATH")
-    if env and os.path.exists(env):
-        return env
+    if env and os.path.exists(env): return env
     found = shutil.which("ffmpeg")
-    if found:
-        return found
-    # fallback для macOS brew
-    mac_default = "/opt/homebrew/bin/ffmpeg"
-    return mac_default
+    if found: return found
+    return "/opt/homebrew/bin/ffmpeg"
 
 FFMPEG_PATH = resolve_ffmpeg_path()
 print(f"[init] Using ffmpeg at: {FFMPEG_PATH}")
 
 async def ogg_to_wav(src_ogg: str, dst_wav: str):
-    """Конвертирует OGG/OPUS → WAV (mono, 16kHz) через ffmpeg."""
     proc = await asyncio.create_subprocess_exec(
         FFMPEG_PATH, "-y", "-i", src_ogg, "-ac", "1", "-ar", "16000", dst_wav,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     out, err = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg convert failed (code={proc.returncode})\nSTDERR:\n{err.decode(errors='ignore')}")
+        raise RuntimeError(f"ffmpeg convert failed: {err.decode(errors='ignore')[:500]}")
 
 async def transcribe_wav(path: str, lang: str = "ru") -> str:
-    """Отправляет WAV в OpenAI Whisper и возвращает текст."""
     if not oa_client:
         raise RuntimeError("OpenAI client not initialized")
     loop = asyncio.get_running_loop()
@@ -400,41 +338,36 @@ async def on_voice(m: Message):
         await ask_tz(m)
         return
 
-    tg_file = await m.bot.get_file(m.voice.file_id)
+    file = await m.bot.get_file(m.voice.file_id)
     with tempfile.TemporaryDirectory() as tmpd:
         ogg_path = f"{tmpd}/in.ogg"
         wav_path = f"{tmpd}/in.wav"
-        await m.bot.download_file(tg_file.file_path, ogg_path)
+        await m.bot.download(file, destination=ogg_path)
 
-        try:
-            size = os.path.getsize(ogg_path)
-            print(f"[voice] downloaded OGG size={size} bytes")
-        except Exception:
-            pass
+        size = os.path.getsize(ogg_path)
+        print(f"[voice] downloaded OGG size={size} bytes")
+        if size == 0:
+            await m.reply("Файл не скачался (0 байт). Попробуй ещё раз.")
+            return
 
-        # OGG -> WAV
         try:
             await ogg_to_wav(ogg_path, wav_path)
         except Exception as e:
             print("FFmpeg error:", e)
-            await m.reply("Не смог обработать аудио (конвертация). Проверь ffmpeg и попробуй ещё раз.")
+            await m.reply("Не смог обработать аудио (конвертация).")
             return
 
-        await m.chat.do("typing")
-
-        # WAV -> Whisper
         try:
             text = await transcribe_wav(wav_path, lang="ru")
         except Exception as e:
             print("Whisper API error:", e)
-            await m.reply("Не смог распознать голос 😕 Попробуй ещё раз.")
+            await m.reply("Не смог распознать голос 😕")
             return
 
     if not text:
         await m.reply("Пустая расшифровка — повтори, пожалуйста.")
         return
 
-    # Общий пайплайн
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
 
@@ -445,24 +378,7 @@ async def on_voice(m: Message):
         await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
         return
 
-    cands = data.get("datetimes", [])
-    if len(cands) >= 2:
-        PENDING[uid] = {"description": desc, "candidates": cands}
-        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
-        return
-
-    if data.get("need_clarification", True):
-        PENDING[uid] = {"description": desc}
-        ct = data.get("clarify_type", "time")
-        if ct == "time":
-            await m.reply(f"Окей, «{desc}». Во сколько? (например: 10, 10:30, 1710)")
-        elif ct == "date":
-            await m.reply(f"Окей, «{desc}». На какой день?")
-        else:
-            await m.reply(f"Окей, «{desc}». Уточни дату и время.")
-        return
-
-    await m.reply("Не понял из голосового. Скажи, когда напомнить (например: «завтра в 19 отчёт»).")
+    await m.reply(f"Окей, «{desc}». Уточни дату и время.")
 
 # ===== RUN =====
 async def main():
