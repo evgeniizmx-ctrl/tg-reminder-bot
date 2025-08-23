@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import re
 import asyncio
 from datetime import datetime, timedelta
 import pytz
@@ -14,14 +15,7 @@ import httpx
 from dateutil import parser as dateparser
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ===================== Диагностика окружения =====================
-print("ENV CHECK:",
-      "BOT_TOKEN set:", bool(os.getenv("BOT_TOKEN")),
-      "OPENAI_API_KEY set:", bool(os.getenv("OPENAI_API_KEY")),
-      "OCR_SPACE_API_KEY set:", bool(os.getenv("OCR_SPACE_API_KEY")))
-# ================================================================
-
-# --------- КЛЮЧИ/НАСТРОЙКИ ---------
+# ===================== ОКРУЖЕНИЕ =====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
@@ -29,26 +23,24 @@ OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 TZ = os.getenv("APP_TZ", "Europe/Moscow")
 tz = pytz.timezone(TZ)
 
-# --------- ИНИЦИАЛИЗАЦИЯ (с метками и ловлей ошибок) ---------
+print("ENV CHECK:",
+      "BOT_TOKEN set:", bool(BOT_TOKEN),
+      "OPENAI_API_KEY set:", bool(OPENAI_API_KEY),
+      "OCR_SPACE_API_KEY set:", bool(OCR_SPACE_API_KEY))
+
+# ===================== ИНИЦИАЛИЗАЦИЯ =====================
 print("STEP: creating Bot/Dispatcher...")
-try:
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
-    print("STEP: Bot/Dispatcher OK")
-except Exception as e:
-    import traceback, time
-    print("BOOT ERROR:", e)
-    traceback.print_exc()
-    time.sleep(120)
-    raise
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+print("STEP: Bot/Dispatcher OK")
 
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-# Храним черновики и напоминания в памяти (MVP)
-PENDING = {}   # user_id -> {"description": str, "repeat": "none|daily|weekly"}
-REMINDERS = [] # список словарей: {user_id, text, remind_dt, repeat}
+# Память (MVP)
+PENDING = {}    # user_id -> {"description": str, "repeat": "none|daily|weekly"}
+REMINDERS = []  # {user_id, text, remind_dt, repeat}
 
-# --------- УТИЛИТЫ ---------
+# ===================== УТИЛИТЫ =====================
 async def send_reminder(user_id: int, text: str):
     try:
         await bot.send_message(user_id, f"🔔 Напоминание: {text}")
@@ -57,10 +49,11 @@ async def send_reminder(user_id: int, text: str):
 
 def schedule_one(reminder: dict):
     run_dt = reminder["remind_dt"]
-    scheduler.add_job(send_reminder, "date", run_date=run_dt, args=[reminder["user_id"], reminder["text"]])
+    scheduler.add_job(send_reminder, "date", run_date=run_dt,
+                      args=[reminder["user_id"], reminder["text"]])
 
 def as_local_iso(dt_like: str | None) -> datetime | None:
-    """Парсим «сегодня 14:25» / «25.08 15:00» / ISO и приводим к таймзоне TZ."""
+    """Парсим дату/время вида '25.08 14:25', 'сегодня 18:30', '2025-08-25 15:00' и т.п."""
     if not dt_like:
         return None
     try:
@@ -75,17 +68,67 @@ def as_local_iso(dt_like: str | None) -> datetime | None:
     except Exception:
         return None
 
-# --------- OpenAI GPT / Whisper ---------
+# ---- парсер относительного времени: «через 3 минуты/2 часа/1 день», «через полчаса» ----
+REL_PATTERNS = [
+    (re.compile(r"через\s+(\d+)\s*(секунд(?:у|ы|)|сек)\b", re.IGNORECASE), "seconds"),
+    (re.compile(r"через\s+(\d+)\s*(минут(?:у|ы)?|мин)\b", re.IGNORECASE), "minutes"),
+    (re.compile(r"через\s+пол\s*часа", re.IGNORECASE), "half_hour"),
+    (re.compile(r"через\s+(\d+)\s*(час(?:а|ов)?|ч)\b", re.IGNORECASE), "hours"),
+    (re.compile(r"через\s+(\d+)\s*(д(е|н)й|дня|день)\b", re.IGNORECASE), "days"),
+]
+
+def parse_relative_phrase(text: str):
+    """
+    Возвращает (dt, remainder) если нашёл относительное выражение.
+    dt — datetime в TZ, remainder — текст без найденной фразы (для описания).
+    """
+    s = text
+    now = datetime.now(tz).replace(second=0, microsecond=0)
+
+    # «через полчаса»
+    m = REL_PATTERNS[2][0].search(s)
+    if m:
+        dt = now + timedelta(minutes=30)
+        remainder = (s[:m.start()] + s[m.end():]).strip(",. -")
+        return dt, remainder
+
+    # остальные шаблоны
+    for i, (pat, kind) in enumerate(REL_PATTERNS):
+        if i == 2:
+            continue  # «полчаса» уже обработали
+        m = pat.search(s)
+        if not m:
+            continue
+        amount = int(m.group(1))
+        if kind == "seconds":
+            dt = now + timedelta(seconds=amount)
+        elif kind == "minutes":
+            dt = now + timedelta(minutes=amount)
+        elif kind == "hours":
+            dt = now + timedelta(hours=amount)
+        elif kind == "days":
+            dt = now + timedelta(days=amount)
+        else:
+            continue
+        remainder = (s[:m.start()] + s[m.end():]).strip(",. -")
+        return dt, remainder
+
+    return None
+
+# ===================== OpenAI (GPT/Whisper) =====================
 OPENAI_BASE = "https://api.openai.com/v1"
 
 async def gpt_parse(text: str) -> dict:
-    """Просим GPT вернуть JSON-структуру задачи."""
+    """
+    Просим GPT вернуть JSON:
+    { description, event_time, remind_time, repeat(daily|weekly|none), needs_clarification, clarification_question }
+    """
     system = (
         "Ты — ассистент для напоминаний на русском. "
-        "Разбирай текст пользователя и возвращай СТРОГО JSON со структурой: "
-        "{description, event_time, remind_time, repeat(daily|weekly|none), needs_clarification, clarification_question}. "
+        "Верни СТРОГО JSON с ключами: description, event_time, remind_time, repeat(daily|weekly|none), "
+        "needs_clarification, clarification_question. "
         "Если указано 'напомни за X', вычисли remind_time относительно event_time. "
-        "Даты/время возвращай в формате 'YYYY-MM-DD HH:MM' 24h."
+        "Даты/время возвращай в формате 'YYYY-MM-DD HH:MM' (24h)."
     )
     payload = {
         "model": "gpt-4o-mini",
@@ -101,9 +144,9 @@ async def gpt_parse(text: str) -> dict:
         r.raise_for_status()
         answer = r.json()["choices"][0]["message"]["content"]
     try:
-        data = json.loads(answer)
+        return json.loads(answer)
     except json.JSONDecodeError:
-        data = {
+        return {
             "description": text,
             "event_time": "",
             "remind_time": "",
@@ -111,7 +154,6 @@ async def gpt_parse(text: str) -> dict:
             "needs_clarification": True,
             "clarification_question": "Уточните дату и время напоминания (например, 25.08 14:25)."
         }
-    return data
 
 async def openai_whisper_bytes(ogg_bytes: bytes) -> str:
     """Распознаём голос через OpenAI Whisper API."""
@@ -126,7 +168,7 @@ async def openai_whisper_bytes(ogg_bytes: bytes) -> str:
         r.raise_for_status()
         return r.json().get("text", "").strip()
 
-# --------- OCR.Space (скрины) ---------
+# ===================== OCR.Space для скринов =====================
 async def ocr_space_image(bytes_png: bytes) -> str:
     url = "https://api.ocr.space/parse/image"
     data = {"apikey": OCR_SPACE_API_KEY, "language": "rus", "OCREngine": 2}
@@ -136,18 +178,17 @@ async def ocr_space_image(bytes_png: bytes) -> str:
         r.raise_for_status()
         js = r.json()
     try:
-        parsed = js["ParsedResults"][0]["ParsedText"]
+        return js["ParsedResults"][0]["ParsedText"].strip()
     except Exception:
-        parsed = ""
-    return parsed.strip()
+        return ""
 
-# --------- КОМАНДЫ ---------
+# ===================== ХЕНДЛЕРЫ =====================
 @dp.message(Command("start"))
 async def start(message: Message):
     await message.answer(
         "Привет! Я бот-напоминалка.\n"
-        "• Пиши: «Запись к стоматологу сегодня 14:25»\n"
-        "• Или пришли голосовое/скрин — я распознаю.\n"
+        "• Пиши: «Запись к стоматологу сегодня 14:25» или «напомни через 3 минуты позвонить»\n"
+        "• Пришли голосовое/скрин — я распознаю.\n"
         "• /ping — проверка, жив ли бот.\n"
         "• /list — список напоминаний (в текущей сессии)."
     )
@@ -171,26 +212,43 @@ async def list_cmd(message: Message):
         )
     await message.answer("\n".join(lines))
 
-# --------- ЕДИНЫЙ обработчик текста (новое/уточнение) ---------
+# ---- единый обработчик текста (новое/уточнение) ----
 @dp.message(F.text)
 async def on_any_text(message: Message):
     uid = message.from_user.id
     text = message.text.strip()
 
-    # Если ждём уточнение
+    # 1) если ждём уточнение времени — обрабатываем это
     if uid in PENDING:
         dt = as_local_iso(text)
         if not dt:
-            await message.reply("Не понял время. Пример: 25.08 14:25")
+            # попробуем относительное
+            parsed = parse_relative_phrase(text)
+            if parsed:
+                dt, _ = parsed
+        if not dt:
+            await message.reply("Не понял время. Пример: «25.08 14:25» или «через 10 минут».")
             return
         draft = PENDING.pop(uid)
-        reminder = {"user_id": uid, "text": draft["description"], "remind_dt": dt, "repeat": draft.get("repeat","none")}
+        reminder = {"user_id": uid, "text": draft["description"], "remind_dt": dt,
+                    "repeat": draft.get("repeat","none")}
         REMINDERS.append(reminder)
         schedule_one(reminder)
         await message.reply(f"Принял. Напомню: «{reminder['text']}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
         return
 
-    # Новая задача
+    # 2) новая фраза — сначала пробуем ПОНЯТЬ «через N ...» сами
+    rel = parse_relative_phrase(text)
+    if rel:
+        dt, remainder = rel
+        desc = remainder.strip() or text
+        reminder = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"}
+        REMINDERS.append(reminder)
+        schedule_one(reminder)
+        await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
+        return
+
+    # 3) если относительного нет — даём GPT разобрать структуру
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     plan = await gpt_parse(text)
 
@@ -200,7 +258,7 @@ async def on_any_text(message: Message):
     remind_dt = as_local_iso(remind_iso)
 
     if plan.get("needs_clarification") or not remind_dt:
-        question = plan.get("clarification_question") or "Уточните дату и время напоминания (например, 25.08 14:25):"
+        question = plan.get("clarification_question") or "Уточните дату и время (например, 25.08 14:25 или «через 10 минут»):"
         PENDING[uid] = {"description": desc, "repeat": "none"}
         await message.reply(question)
         return
@@ -211,7 +269,7 @@ async def on_any_text(message: Message):
     schedule_one(reminder)
     await message.reply(f"Готово. Напомню: «{desc}» в {remind_dt.strftime('%d.%m %H:%M')} ({TZ})")
 
-# --------- ВОЙСЫ ---------
+# ---- войсы ----
 @dp.message(F.voice)
 async def on_voice(message: Message):
     await bot.send_chat_action(message.chat.id, ChatAction.RECORD_VOICE)
@@ -225,7 +283,7 @@ async def on_voice(message: Message):
     # Переиспользуем общий путь
     await on_any_text(Message.model_construct(**{**message.model_dump(), "text": text}))
 
-# --------- ФОТО / ДОК с изображением ---------
+# ---- фото/док с изображением ----
 @dp.message(F.photo | F.document)
 async def on_image(message: Message):
     await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
@@ -249,7 +307,7 @@ async def on_image(message: Message):
     # Переиспользуем общий путь
     await on_any_text(Message.model_construct(**{**message.model_dump(), "text": text}))
 
-# --------- ЗАПУСК (с метками) ---------
+# ===================== ЗАПУСК =====================
 async def main():
     print("STEP: starting scheduler...")
     scheduler.start()
