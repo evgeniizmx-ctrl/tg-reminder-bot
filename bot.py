@@ -128,6 +128,13 @@ RX_REL = [
     (re.compile(r"\bчерез\s+(\d+)\s*(час(?:а|ов)?|ч\.?)\b", re.I), "hours"),
     (re.compile(r"\bчерез\s+(\d+)\s*(дн(?:я|ей)?|день|дн\.?)\b", re.I), "days"),
 ]
+# 2a) ЕДИН. число: «через минуту/секунду/час/день»
+RX_REL_SINGULAR = [
+    (re.compile(r"\bчерез\s+секунд[ую]\b", re.I), "seconds", 1),
+    (re.compile(r"\bчерез\s+минут[ую]\b", re.I), "minutes", 1),
+    (re.compile(r"\bчерез\s+час\b", re.I), "hours", 1),
+    (re.compile(r"\bчерез\s+день\b", re.I), "days", 1),
+]
 # 3) в это же время завтра/послезавтра/через N дней
 RX_SAME_TIME = re.compile(r"\bв это же время\b", re.I)
 RX_TMR = re.compile(r"\bзавтра\b", re.I)
@@ -162,11 +169,28 @@ RX_DAY_OF_MONTH = re.compile(
 def parse_relative(text: str):
     s = norm(text)
     now = datetime.now(tz).replace(second=0, microsecond=0)
+
     if RX_HALF_HOUR.search(s):
         dt = now + timedelta(minutes=30)
         s2 = RX_HALF_HOUR.sub("", s).strip(" ,.-")
         return dt, s2
 
+    # единичные формы
+    for rx, kind, val in RX_REL_SINGULAR:
+        m = rx.search(s)
+        if m:
+            if kind == "seconds":
+                dt = now + timedelta(seconds=val)
+            elif kind == "minutes":
+                dt = now + timedelta(minutes=val)
+            elif kind == "hours":
+                dt = now + timedelta(hours=val)
+            else:
+                dt = now + timedelta(days=val)
+            s2 = (s[:m.start()] + s[m.end():]).strip(" ,.-")
+            return dt, s2
+
+    # с количеством
     for rx, kind in RX_REL:
         m = rx.search(s)
         if m:
@@ -380,8 +404,8 @@ def parse_day_of_month(text: str):
 async def cmd_start(m: Message):
     await m.answer(
         "Привет! Я бот-напоминалка.\n"
-        "Понимаю: «24 мая в 19», «1 числа в 7», «через 30 минут», «завтра в 6», "
-        "«в 10 (утра/вечера)», «в это же время завтра».\n"
+        "Понимаю: «24 мая в 19», «1 числа в 7», «через 30 минут/час/минуту», "
+        "«завтра в 6», «в это же время завтра».\n"
         "/list — список, /ping — проверка."
     )
 
@@ -428,6 +452,7 @@ async def on_text(m: Message):
             return
         PENDING.pop(uid, None)
 
+    # ВАЖНО: порядок! сначала относительное/конкретные даты, потом «просто время»
     # «через …»
     r = parse_relative(text)
     if r:
@@ -467,25 +492,7 @@ async def on_text(m: Message):
                           reply_markup=kb_variants(variants))
             return
 
-    # только время «в 7[:30] …»
-    r = parse_only_time(text)
-    if r:
-        tag = r[0]
-        if tag == "ok":
-            _, dt, rest = r
-            desc = clean_desc(rest or text)
-            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-            plan(REMINDERS[-1])
-            await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
-            return
-        else:
-            _, rest, variants = r
-            desc = clean_desc(rest or text)
-            PENDING[uid] = {"description": desc, "variants": variants, "repeat": "none"}
-            await m.reply(f"Уточните, во сколько напомнить «{desc}»?",
-                          reply_markup=kb_variants(variants))
-            return
-
+    # КОНКРЕТНЫЕ ДАТЫ (раньше, чем «просто время»!)
     # дата через точки «DD.MM[.YYYY] [в HH[:MM] …]»
     r = parse_dot_date(text)
     if r:
@@ -559,6 +566,25 @@ async def on_text(m: Message):
             desc = clean_desc(rest or text)
             PENDING[uid] = {"description": desc, "base_date": base, "repeat":"none"}
             await m.reply(f"Окей, {base.strftime('%d.%m')}. В какое время?")
+            return
+
+    # И ТОЛЬКО ТЕПЕРЬ — «просто время»
+    r = parse_only_time(text)
+    if r:
+        tag = r[0]
+        if tag == "ok":
+            _, dt, rest = r
+            desc = clean_desc(rest or text)
+            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
+            plan(REMINDERS[-1])
+            await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
+            return
+        else:
+            _, rest, variants = r
+            desc = clean_desc(rest or text)
+            PENDING[uid] = {"description": desc, "variants": variants, "repeat": "none"}
+            await m.reply(f"Уточните, во сколько напомнить «{desc}»?",
+                          reply_markup=kb_variants(variants))
             return
 
     await m.reply("Не понял дату/время. Примеры: «24.05 19:00», «24 мая в 19», «1 числа в 7», «через 30 минут», «завтра в 6».")
