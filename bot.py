@@ -1,4 +1,10 @@
 import os
+# --- диагностика окружения ---
+print("ENV CHECK:",
+      "BOT_TOKEN set:", bool(os.getenv("BOT_TOKEN")),
+      "OPENAI_API_KEY set:", bool(os.getenv("OPENAI_API_KEY")),
+      "OCR_SPACE_API_KEY set:", bool(os.getenv("OCR_SPACE_API_KEY")))
+# --- конец диагностики ---
 import io
 import json
 import asyncio
