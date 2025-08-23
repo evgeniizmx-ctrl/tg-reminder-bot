@@ -265,7 +265,7 @@ async def cmd_list(m: Message):
     lines = [f"• {r['text']} — {fmt_dt_local(r['remind_dt'])}" for r in items]
     await m.answer("\n".join(lines))
 
-@router.message(Command("cancel")))
+@router.message(Command("cancel"))
 async def cmd_cancel(m: Message):
     uid = m.from_user.id
     if uid in PENDING:
