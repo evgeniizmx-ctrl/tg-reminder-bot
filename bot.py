@@ -69,13 +69,41 @@ def _mk_dt(base_d: date, hh: int, mm: int) -> datetime:
 def _order_by_soonest(variants: list[datetime]) -> list[datetime]:
     return sorted(variants, key=lambda dt: dt)
 
+# Человеко-читаемая подпись для кнопок: «сегодня/завтра/ДД.ММ в H[:MM] утра/дня/вечера/ночи»
+def _human_label_for_variant(dt: datetime) -> str:
+    now = datetime.now(tz)
+    dword = None
+    if dt.date() == now.date():
+        dword = "сегодня"
+    elif dt.date() == (now + timedelta(days=1)).date():
+        dword = "завтра"
+    else:
+        dword = dt.strftime("%d.%m")
+
+    h = dt.hour
+    m = dt.minute
+    # меридианы: 0–4 ночи, 5–11 утра, 12–16 дня, 17–23 вечера
+    if 0 <= h <= 4:
+        mer = "ночи"
+    elif 5 <= h <= 11:
+        mer = "утра"
+    elif 12 <= h <= 16:
+        mer = "дня"
+    else:
+        mer = "вечера"
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+    tpart = f"{h12}:{m:02d}" if m else f"{h12}"
+    return f"{dword} в {tpart} {mer}"
+
 def _variants_keyboard(variants: list[datetime]) -> InlineKeyboardMarkup:
     variants = _order_by_soonest(variants)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=dt.strftime("%d.%m %H:%M"),
-                              callback_data=f"time|{dt.isoformat()}")]
-        for dt in variants
-    ])
+    rows = []
+    for dt in variants:
+        label = _human_label_for_variant(dt)
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"time|{dt.isoformat()}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ========= ПАРСЕРЫ =========
 # --- «через …» ---
@@ -363,7 +391,7 @@ async def on_any_text(message: Message):
                 await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
                 return
 
-            # двусмысленно — покажем 06/18 (сортировка по ближайшему)
+            # двусмысленно — покажем 2 варианта (сортировка по ближайшему)
             v1 = _mk_dt(base_d, hour, minute)
             v2 = _mk_dt(base_d, (hour + 12) % 24, minute)
             PENDING[uid]["variants"] = _order_by_soonest([v1, v2])
@@ -417,13 +445,13 @@ async def on_any_text(message: Message):
             PENDING.pop(uid, None)
             REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": st.get("repeat","none")})
             schedule_one(REMINDERS[-1])
-            await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%м %H:%M')} ({TZ})")
+            await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
             return
 
         await message.reply("Не понял время.")
         return
 
-    # --- новая сессия команды ---
+    # --- новая сессия ---
     # 1) только день (словами)
     day_only_words = re.search(r"\b(сегодня|завтра|послезавтра)\b(?!.*\bв\s*\d)", text, re.IGNORECASE)
     if day_only_words:
