@@ -2,7 +2,7 @@ import os
 import json
 import re
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pytz
 
 from aiogram import Bot, Dispatcher, F
@@ -29,14 +29,14 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-# Хранилище (MVP)
 # PENDING[user_id] = {
 #   "description": str,
-#   "repeat": str ("none|daily|weekly"),
-#   "variants": [datetime, ...]  # если ждём выбор времени
+#   "repeat": "none|daily|weekly",
+#   "variants": [datetime, ...],   # если ждём выбор времени с кнопок
+#   "base_date": date              # если известен день, но ждём только время
 # }
-PENDING = {}
-REMINDERS = []  # [{user_id, text, remind_dt, repeat}]
+PENDING: dict[int, dict] = {}
+REMINDERS: list[dict] = []
 
 # ===================== УТИЛИТЫ =====================
 async def send_reminder(user_id: int, text: str):
@@ -69,9 +69,18 @@ def clean_description(desc: str) -> str:
     d = desc.strip()
     d = re.sub(r"^(напомни(те)?|пожалуйста)\b[\s,:-]*", "", d, flags=re.IGNORECASE)
     d = re.sub(r"^(о|про|насч[её]т)\s+", "", d, flags=re.IGNORECASE)
+    # убираем служебные слова-дни в начале
+    d = re.sub(r"^(сегодня|завтра|послезавтра)\b", "", d, flags=re.IGNORECASE).strip()
     return d or "Напоминание"
 
-# ===================== ПАРСЕРЫ ЯЗЫКА =====================
+def _variants_keyboard(variants: list[datetime]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=dt.strftime("%d.%m %H:%M"),
+                              callback_data=f"time|{dt.isoformat()}")]
+        for dt in variants
+    ])
+
+# ===================== ПАРСЕРЫ =====================
 # --- «через … / спустя … / полчаса / минуту/час/день» ---
 REL_NUM_PATTERNS = [
     (r"(через|спустя)\s+(\d+)\s*(секунд(?:у|ы)?|сек\.?)\b", "seconds"),
@@ -110,7 +119,7 @@ def parse_relative_phrase(raw_text: str):
 
     for rx, (_, kind) in zip(REL_NUM_REGEXES, REL_NUM_PATTERNS):
         m = rx.search(s)
-        if not m: 
+        if not m:
             continue
         amount = int(m.group(2))
         if kind == "seconds": dt = now + timedelta(seconds=amount)
@@ -151,7 +160,6 @@ def parse_same_time_phrase(raw_text: str):
     return target, remainder
 
 # --- «сегодня/завтра/послезавтра … в HH[:MM] (утра/дня/вечера/ночи)» ---
-# допускаем ЛЮБОЙ текст между словами: «завтра свадьба в 5»
 DAYTIME_RX = re.compile(
     r"\b(сегодня|завтра|послезавтра)\b.*?\bв\s*(\d{1,2})(?::(\d{2}))?(?:\s*(утра|дня|вечера|ночи))?\b",
     re.IGNORECASE | re.UNICODE | re.DOTALL
@@ -194,15 +202,10 @@ def parse_daytime_phrase(raw_text: str):
     dt2 = base.replace(hour=h2, minute=minute)            # вечер
     return ("amb", remainder, [dt1, dt2])
 
-# --- «просто в HH[:MM]» (без дня) → ближайшее / кнопки ---
+# --- «просто в HH[:MM]» (без дня) → кнопки/однозначно ---
 ONLYTIME_RX = re.compile(r"\bв\s*(\d{1,2})(?::(\d{2}))?\b", re.I | re.UNICODE)
 
 def parse_onlytime_phrase(raw_text: str):
-    """
-    Если есть «утра/вечера/дня/ночи» — трактуем однозначно.
-    Иначе возвращаем две опции (сегодня HH:MM и сегодня HH+12:MM).
-    Каждую, если уже прошло, двигаем на завтра.
-    """
     s = normalize_spaces(raw_text)
     m = ONLYTIME_RX.search(s)
     if not m:
@@ -218,29 +221,47 @@ def parse_onlytime_phrase(raw_text: str):
         if mer in ("дня", "вечера") and h < 12: h += 12
         if mer == "ночи" and h == 12: h = 0
         target = now.replace(hour=h, minute=minute)
-        if target <= now:
-            target += timedelta(days=1)
+        if target <= now: target += timedelta(days=1)
         remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
         return ("ok", target, remainder)
 
-    # двусмысленно → варианты
+    # двусмысленно → варианты (сегодня): HH и HH+12, если прошло — на завтра
     cand = []
     for h in [hour_raw % 24, (hour_raw + 12) % 24]:
         dt = now.replace(hour=h, minute=minute)
-        if dt <= now:
-            dt += timedelta(days=1)
+        if dt <= now: dt += timedelta(days=1)
         cand.append(dt)
     remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
     return ("amb", remainder, cand)
 
-# ===================== OpenAI (GPT/Whisper) =====================
+# --- «только день, без времени» → запомнить день и спросить время ---
+DAY_ONLY_RX = re.compile(r"\b(сегодня|завтра|послезавтра)\b(?!.*\bв\s*\d)", re.IGNORECASE | re.UNICODE)
+
+def parse_day_only(raw_text: str):
+    """
+    Если пользователь указал только день («послезавтра свадьба»), возвращаем
+    ('day', base_date(date), remainder_description)
+    """
+    s = normalize_spaces(raw_text)
+    m = DAY_ONLY_RX.search(s)
+    if not m:
+        return None
+    word = m.group(1).lower()
+    now = datetime.now(tz)
+    if word == "сегодня":
+        base = now.date()
+    elif word == "завтра":
+        base = (now + timedelta(days=1)).date()
+    else:
+        base = (now + timedelta(days=2)).date()
+    remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
+    desc = clean_description(remainder)
+    return ("day", base, desc)
+
+# ===================== OpenAI (GPT/Whisper) — Fallback =====================
 OPENAI_BASE = "https://api.openai.com/v1"
 
 async def gpt_parse(text: str) -> dict:
-    """
-    Fallback-парсинг через GPT (если правила не справились).
-    Возвращаем СТРОГО JSON.
-    """
     system = (
         "Ты — ассистент-напоминалка. Верни СТРОГО JSON с ключами: "
         "description, event_time, remind_time, repeat(daily|weekly|none), "
@@ -249,10 +270,8 @@ async def gpt_parse(text: str) -> dict:
     )
     payload = {
         "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": text}
-        ],
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": text}],
         "temperature": 0
     }
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -264,48 +283,20 @@ async def gpt_parse(text: str) -> dict:
         return json.loads(answer)
     except Exception as e:
         print("GPT parse fail:", e)
-        return {
-            "description": text, "event_time": "", "remind_time": "", "repeat": "none",
-            "needs_clarification": True,
-            "clarification_question": "Уточните дату и время (например, 25.08 14:25)."
-        }
-
-async def openai_whisper_bytes(ogg_bytes: bytes) -> str:
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    files = {"file": ("voice.ogg", ogg_bytes, "audio/ogg"),
-             "model": (None, "whisper-1"), "language": (None, "ru")}
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(f"{OPENAI_BASE}/audio/transcriptions", headers=headers, files=files)
-            r.raise_for_status()
-            return r.json().get("text", "").strip()
-    except Exception as e:
-        print("Whisper fail:", e)
-        return ""
-
-async def ocr_space_image(bytes_png: bytes) -> str:
-    url = "https://api.ocr.space/parse/image"
-    data = {"apikey": OCR_SPACE_API_KEY, "language": "rus", "OCREngine": 2}
-    files = {"file": ("image.png", bytes_png, "image/png")}
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(url, data=data, files=files)
-            r.raise_for_status()
-            js = r.json()
-        return js["ParsedResults"][0]["ParsedText"].strip()
-    except Exception as e:
-        print("OCR fail:", e)
-        return ""
+        return {"description": text, "event_time": "", "remind_time": "",
+                "repeat": "none", "needs_clarification": True,
+                "clarification_question": "Уточните дату и время (например, 25.08 14:25)."}
 
 # ===================== КОМАНДЫ =====================
 @dp.message(Command("start"))
 async def start(message: Message):
     await message.answer(
         "Привет! Я бот-напоминалка.\n"
-        "• Пиши: «через 3 минуты помыться», «завтра в это же время позвонить»,\n"
-        "  «завтра свадьба в 5», «в 10» (предложу 10:00 или 22:00), «в 17 часов» — ближайшее 17:00.\n"
-        "• Голос/скрин тоже можно — распознаю.\n"
-        "• /list — список напоминаний, /ping — проверка."
+        "• Пиши: «послезавтра свадьба» — я спрошу только время;\n"
+        "  «в 10» — предложу 10:00 или 22:00; «в 17 часов» — ближайшее 17:00;\n"
+        "  «через 3 минуты», «завтра в это же время», «завтра в 5» и т. п.\n"
+        "• Голос/скрин тоже можно.\n"
+        "• /list — список, /ping — проверка."
     )
 
 @dp.message(Command("ping"))
@@ -327,80 +318,130 @@ async def list_cmd(message: Message):
     await message.answer("\n".join(lines))
 
 # ===================== ОСНОВНАЯ ЛОГИКА =====================
-def _variants_keyboard(desc: str, variants: list[datetime]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=dt.strftime("%d.%m %H:%M"),
-                              callback_data=f"time|{dt.isoformat()}")]
-        for dt in variants
-    ])
-
 @dp.message(F.text)
 async def on_any_text(message: Message):
     uid = message.from_user.id
-    raw_text = message.text or ""
-    text = normalize_spaces(raw_text)
+    text_raw = message.text or ""
+    text = normalize_spaces(text_raw)
 
-    # если ждём уточнение
+    # 0) если ждём уточнение
     if uid in PENDING:
-        if PENDING[uid].get("variants"):
+        st = PENDING[uid]
+        # если ждём выбор по кнопкам
+        if st.get("variants"):
             await message.reply("Нажмите одну из кнопок ниже, чтобы выбрать время ⬇️")
             return
 
-        # пробуем все парсеры
+        # если известен день и ждём только время
+        if st.get("base_date"):
+            # распознаём простое время из ответа: "6", "18", "6:30", "в 6", "6 утра", ...
+            m = re.search(r"(?:^|\bв\s*)(\d{1,2})(?::(\d{2}))?\s*(утра|дня|вечера|ночи)?\b", text, re.IGNORECASE)
+            if not m:
+                await message.reply("Во сколько? Например: 6, 18, 6:30, «6 утра» или «6 вечера».")
+                return
+            hour = int(m.group(1))
+            minute = int(m.group(2) or 0)
+            mer = (m.group(3) or "").lower()
+
+            base_d: date = st["base_date"]
+            base_dt = datetime.combine(base_d, datetime.now(tz).time()).replace(tzinfo=tz)
+            base_dt = base_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            def mk(hh, mm):
+                return tz.localize(datetime(base_d.year, base_d.month, base_d.day, hh, mm))
+
+            # «18» — однозначно 18:00; «6» — двусмысленно → кнопки (06:00/18:00)
+            if mer:
+                h = hour
+                if mer in ("дня", "вечера") and h < 12: h += 12
+                if mer == "ночи" and h == 12: h = 0
+                dt = mk(h % 24, minute)
+                desc = st.get("description", "Напоминание")
+                PENDING.pop(uid, None)
+                REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
+                schedule_one(REMINDERS[-1])
+                await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
+                return
+
+            if hour == 18:
+                dt = mk(18, minute)
+                desc = st.get("description", "Напоминание")
+                PENDING.pop(uid, None)
+                REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
+                schedule_one(REMINDERS[-1])
+                await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
+                return
+
+            # всё остальное без метки — двусмысленно (06:00 или 18:00)
+            v1 = mk(hour % 24, minute)
+            v2 = mk((hour + 12) % 24, minute)
+            PENDING[uid]["variants"] = [v1, v2]
+            kb = _variants_keyboard([v1, v2])
+            await message.reply("Уточните время:", reply_markup=kb)
+            return
+
+        # иначе обычный цикл парсеров
         for parser in (parse_daytime_phrase, parse_onlytime_phrase):
             pack = parser(text)
             if pack:
                 tag = pack[0]
                 if tag == "amb":
                     _, remainder, variants = pack
-                    desc = clean_description(remainder or PENDING[uid].get("description", text))
+                    desc = clean_description(remainder or st.get("description", text))
                     PENDING[uid] = {"description": desc, "variants": variants, "repeat": "none"}
-                    kb = _variants_keyboard(desc, variants)
-                    await message.reply(f"Уточните, во сколько напомнить «{desc}»?", reply_markup=kb)
+                    await message.reply(f"Уточните, во сколько напомнить «{desc}»?", reply_markup=_variants_keyboard(variants))
                     return
                 else:
                     _, dt, remainder = pack
-                    draft = PENDING.pop(uid)
-                    desc = clean_description(remainder or draft.get("description", text))
-                    r = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": draft.get("repeat", "none")}
-                    REMINDERS.append(r); schedule_one(r)
+                    desc = clean_description(remainder or st.get("description", text))
+                    PENDING.pop(uid, None)
+                    REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": st.get("repeat","none")})
+                    schedule_one(REMINDERS[-1])
                     await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
                     return
 
         rel = parse_relative_phrase(text)
         if rel:
             dt, remainder = rel
-            draft = PENDING.pop(uid)
-            desc = clean_description(remainder or draft.get("description", text))
-            r = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": draft.get("repeat", "none")}
-            REMINDERS.append(r); schedule_one(r)
+            desc = clean_description(remainder or st.get("description", text))
+            PENDING.pop(uid, None)
+            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": st.get("repeat","none")})
+            schedule_one(REMINDERS[-1])
             await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
             return
 
         same = parse_same_time_phrase(text)
         if same:
             dt, remainder = same
-            draft = PENDING.pop(uid)
-            desc = clean_description(remainder or draft.get("description", text))
-            r = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": draft.get("repeat", "none")}
-            REMINDERS.append(r); schedule_one(r)
+            desc = clean_description(remainder or st.get("description", text))
+            PENDING.pop(uid, None)
+            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": st.get("repeat","none")})
+            schedule_one(REMINDERS[-1])
             await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
             return
 
-        # свободный парс датой
+        # свободный парс
         dt = as_local_iso(text)
         if dt:
-            draft = PENDING.pop(uid)
-            desc = clean_description(draft.get("description", text))
-            r = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": draft.get("repeat", "none")}
-            REMINDERS.append(r); schedule_one(r)
+            desc = clean_description(st.get("description", text))
+            PENDING.pop(uid, None)
+            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": st.get("repeat","none")})
+            schedule_one(REMINDERS[-1])
             await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
             return
 
-        await message.reply("Не понял время. Пример: «в 10», «завтра в 5» или «через 10 минут».")
+        await message.reply("Не понял время. Например: 6, 18, 6:30, «6 утра» или «6 вечера».")
         return
 
-    # новая фраза — порядок: daytime → onlytime → relative → same-time → GPT
+    # 1) новая фраза — сначала «день без времени»
+    day_only = parse_day_only(text)
+    if day_only:
+        _, base_d, desc = day_only
+        PENDING[uid] = {"description": desc, "base_date": base_d, "repeat": "none"}
+        await message.reply(f"Ок, {base_d.strftime('%d.%m')}. Во сколько напомнить? (например: 6, 18, 6:30)")
+        return
+
+    # 2) затем «день + время», «только время», «через…», «в это же время»
     for parser in (parse_daytime_phrase, parse_onlytime_phrase):
         pack = parser(text)
         if pack:
@@ -409,14 +450,13 @@ async def on_any_text(message: Message):
                 _, remainder, variants = pack
                 desc = clean_description(remainder or text)
                 PENDING[uid] = {"description": desc, "variants": variants, "repeat": "none"}
-                kb = _variants_keyboard(desc, variants)
-                await message.reply(f"Уточните, во сколько напомнить «{desc}»?", reply_markup=kb)
+                await message.reply(f"Уточните, во сколько напомнить «{desc}»?", reply_markup=_variants_keyboard(variants))
                 return
             else:
                 _, dt, remainder = pack
                 desc = clean_description(remainder or text)
-                r = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"}
-                REMINDERS.append(r); schedule_one(r)
+                REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
+                schedule_one(REMINDERS[-1])
                 await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
                 return
 
@@ -424,8 +464,8 @@ async def on_any_text(message: Message):
     if rel:
         dt, remainder = rel
         desc = clean_description(remainder or text)
-        r = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"}
-        REMINDERS.append(r); schedule_one(r)
+        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
+        schedule_one(REMINDERS[-1])
         await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
         return
 
@@ -433,12 +473,12 @@ async def on_any_text(message: Message):
     if same:
         dt, remainder = same
         desc = clean_description(remainder or text)
-        r = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"}
-        REMINDERS.append(r); schedule_one(r)
+        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
+        schedule_one(REMINDERS[-1])
         await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
         return
 
-    # GPT fallback
+    # 3) GPT fallback
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     plan = await gpt_parse(text)
     desc = clean_description(plan.get("description") or "Напоминание")
@@ -452,9 +492,9 @@ async def on_any_text(message: Message):
                             "Уточните дату/время (например, 25.08 14:25).")
         return
 
-    r = {"user_id": uid, "text": desc, "remind_dt": remind_dt,
-         "repeat": "none" if repeat not in ("daily","weekly") else repeat}
-    REMINDERS.append(r); schedule_one(r)
+    REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": remind_dt,
+                      "repeat": "none" if repeat not in ("daily","weekly") else repeat})
+    schedule_one(REMINDERS[-1])
     await message.reply(f"Готово. Напомню: «{desc}» в {remind_dt.strftime('%d.%m %H:%M')} ({TZ})")
 
 # ===================== КНОПКИ ВЫБОРА ВРЕМЕНИ =====================
@@ -476,48 +516,14 @@ async def on_time_choice(cb: CallbackQuery):
     desc = PENDING[uid].get("description", "Напоминание")
     PENDING.pop(uid, None)
 
-    r = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"}
-    REMINDERS.append(r); schedule_one(r)
+    REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
+    schedule_one(REMINDERS[-1])
 
     try:
         await cb.message.edit_text(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
     except Exception:
         await cb.message.answer(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
     await cb.answer("Установлено ✅")
-
-# ===================== МЕДИА (голос/картинки) =====================
-@dp.message(F.voice)
-async def on_voice(message: Message):
-    await bot.send_chat_action(message.chat.id, ChatAction.RECORD_VOICE)
-    file = await bot.get_file(message.voice.file_id)
-    buf = await bot.download_file(file.file_path)  # BytesIO
-    buf.seek(0)
-    text = await openai_whisper_bytes(buf.read())
-    if not text:
-        await message.reply("Не удалось распознать голос. Попробуйте ещё раз.")
-        return
-    await on_any_text(Message.model_construct(**{**message.model_dump(), "text": text}))
-
-@dp.message(F.photo | F.document)
-async def on_image(message: Message):
-    await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-    file_id = None
-    if message.photo:
-        file_id = message.photo[-1].file_id
-    elif message.document and str(message.document.mime_type).startswith("image/"):
-        file_id = message.document.file_id
-    else:
-        await message.reply("Пришлите изображение (фото/скрин) с текстом.")
-        return
-    file = await bot.get_file(file_id)
-    buf = await bot.download_file(file.file_path)
-    buf.seek(0)
-    from io import BytesIO
-    text = await ocr_space_image(buf.read())
-    if not text:
-        await message.reply("Не удалось прочитать текст на изображении.")
-        return
-    await on_any_text(Message.model_construct(**{**message.model_dump(), "text": text}))
 
 # ===================== ЗАПУСК =====================
 async def main():
@@ -533,5 +539,5 @@ if __name__ == "__main__":
         import traceback, time
         print("FATAL:", e)
         traceback.print_exc()
-        time.sleep(15)
+        time.sleep(10)
         raise
