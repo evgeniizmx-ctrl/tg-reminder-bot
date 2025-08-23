@@ -22,7 +22,7 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Планировщик: передаём tzinfo (не строку)
+# Планировщик: передаём tzinfo
 scheduler = AsyncIOScheduler(timezone=tz)
 
 # в оперативной памяти —
@@ -177,6 +177,10 @@ RX_IN_N_DAYS = re.compile(r"\bчерез\s+(\d+)\s*(дн(?:я|ей)?|день|д
 RX_COMPACT_HHMM = re.compile(r"(?<![:\d])([01]?\d|2[0-3])([0-5]\d)(?!\d)", re.I)
 RX_HALF_OF_NEXT = re.compile(r"\bпол\s*([А-Яа-яё]+|\d+)\b", re.I)
 RX_BEZ = re.compile(r"\bбез\s+([А-Яа-яё]+|\d+)\s+([А-Яа-яё]+|\d+)\b", re.I)
+
+# Новое: «голое» время на этапе уточнения
+RX_BARE_HHMM = re.compile(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)")
+RX_BARE_HH   = re.compile(r"(?<!\d)([01]?\d|2[0-3])(?!\d)")
 
 # Будние
 RX_WEEKDAY = re.compile(
@@ -403,27 +407,43 @@ def parse_in_weeks(text: str):
 
 # ======= TIME-ONLY PARSING FOR PENDING (base_date) =======
 def parse_time_for_base(text: str, base_date: date):
-    """Понимаем время для заранее выбранной даты (этап уточнения)"""
+    """Разбираем время на этапе уточнения.
+       Допускаем: 'в 19', '19', '19:30', '1710', 'полтретьего', 'без пяти пять'."""
     s = norm(text)
 
-    # 1) явное HH[:MM]
+    # HH:MM без 'в'
+    mbare = RX_BARE_HHMM.search(s)
+    if mbare:
+        h = int(mbare.group(1)); mm = int(mbare.group(2))
+        return ("ok", mk_dt(base_date, h % 24, mm), None)
+
+    # явное 'в HH[:MM]'
     m = RX_ONLY_TIME.search(s)
     if m:
         h = int(m.group(1)); mm = int(m.group(2) or 0)
-        # двусмысленные часы -> amb
         if hour_is_unambiguous(h):
             return ("ok", mk_dt(base_date, h % 24, mm), None)
         v1 = mk_dt(base_date, h % 24, mm)
         v2 = mk_dt(base_date, (h + 12) % 24, mm)
         return ("amb", None, soonest([v1, v2]))
 
-    # 2) компактное HHMM
+    # компактное HHMM (1710)
     mc = RX_COMPACT_HHMM.search(s)
     if mc:
         h = int(mc.group(1)); mm = int(mc.group(2))
         return ("ok", mk_dt(base_date, h % 24, mm), None)
 
-    # 3) полтретьего
+    # голое HH без 'в'
+    mhh = RX_BARE_HH.search(s)
+    if mhh:
+        h = int(mhh.group(1)); mm = 0
+        if hour_is_unambiguous(h):
+            return ("ok", mk_dt(base_date, h % 24, mm), None)
+        v1 = mk_dt(base_date, h % 24, mm)
+        v2 = mk_dt(base_date, (h + 12) % 24, mm)
+        return ("amb", None, soonest([v1, v2]))
+
+    # полтретьего
     mh = RX_HALF_OF_NEXT.search(s)
     if mh:
         token = mh.group(1).lower()
@@ -436,12 +456,11 @@ def parse_time_for_base(text: str, base_date: date):
                 if word.startswith("дн") or word.startswith("веч"): h = h + 12 if h < 12 else h
                 if word.startswith("ноч"): h = 0 if h == 12 else h
                 return ("ok", mk_dt(base_date, h % 24, 30), None)
-            # варианты 02:30 и 14:30
             v1 = mk_dt(base_date, base_h % 24, 30)
             v2 = mk_dt(base_date, (base_h + 12) % 24, 30)
             return ("amb", None, soonest([v1, v2]))
 
-    # 4) без пяти пять / без 15 четыре
+    # без пяти пять
     mb = RX_BEZ.search(s)
     if mb:
         mins = word_or_digit_to_int(mb.group(1))
@@ -462,7 +481,7 @@ def parse_time_for_base(text: str, base_date: date):
 
     return None
 
-# ========= КАЛЕНДАРНЫЕ ДАТЫ (были отсутствующие) =========
+# ========= КАЛЕНДАРНЫЕ ДАТЫ =========
 def _apply_meridian(h: int, mer: str | None) -> int:
     if not mer:
         return h
@@ -489,7 +508,6 @@ def parse_dot_date(text: str):
             return ("ok", mk_dt(base, h % 24, mi), rest)
         if hour_is_unambiguous(h):
             return ("ok", mk_dt(base, h % 24, mi), rest)
-        # двусмысленно — AM/PM
         v1 = mk_dt(base, h % 24, mi)
         v2 = mk_dt(base, (h + 12) % 24, mi)
         return ("amb", rest, soonest([v1, v2]))
@@ -561,7 +579,7 @@ def parse_weekday(text: str):
     now = datetime.now(tz)
     base = next_weekday(now, WEEKDAY_INDEX[wd_word])
 
-    # Если в той же строке есть время — попытаемся разобрать его на эту дату
+    # Если в той же строке есть время — пробуем привязать
     parsed_time = parse_time_for_base(s, base)
     rest = (s[:m.start()] + s[m.end():]).strip(" ,.-")
 
@@ -574,7 +592,6 @@ def parse_weekday(text: str):
             _, _, variants = parsed_time
             return ("amb", rest, variants)
 
-    # Есть только «в понедельник (утром/вечером)» или вообще без времени — спросим время
     return ("need_time", base, rest)
 
 # ========= COMMANDS =========
@@ -585,7 +602,7 @@ async def cmd_start(m: Message):
         "Понимаю: «завтра в 19», «24.05 21:30», «завтра в 1540», «через неделю в 15», "
         "«полтретьего», «без пятнадцати четыре», «в понедельник утром» (попрошу время).\n"
         "Если только «сегодня/завтра/…» — спрошу время для этого дня.\n"
-        "Если указал только время типа «в 6» — уточню 06:00 или 18:00.\n"
+        "На этапе уточнения можно писать просто: 5, 12, 12:30, 1710 — без «в».\n"
         "/list — список, /ping — проверка, /cancel — отменить уточнение."
     )
 
@@ -654,7 +671,7 @@ async def on_text(m: Message):
                     await m.reply("Уточните, какое именно время:", reply_markup=kb_variants(variants))
                     return
 
-            await m.reply("Нужно время. Примеры: 19, 19:30, 1710, «полтретьего», «без пяти пять».")
+            await m.reply("Нужно время. Примеры: 10, 10:30, 1710, «полтретьего», «без пяти пять».")
             return
         # если было variants — выше return; иначе продолжаем как новое
 
@@ -686,7 +703,7 @@ async def on_text(m: Message):
             await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}"); return
         _, base, rest = r; desc = clean_desc(rest or text)
         PENDING[uid] = {"description": desc, "base_date": base}
-        await m.reply(f"Окей, {base.strftime('%d.%m')}. Во сколько?"); return
+        await m.reply(f"Окей, {base.strftime('%d.%м')}. Во сколько?"); return
 
     # 4) относительное «через …»
     r = parse_relative(text)
@@ -730,7 +747,7 @@ async def on_text(m: Message):
     if r:
         tag = r[0]
         if tag == "ok":
-            _, dt, rest = r; desc = clean_desc(rest or text)
+            _, dt, rest = r; desc = clean_desc(rest или text)
             REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"}); plan(REMINDERS[-1])
             await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}"); return
         _, rest, variants = r; desc = clean_desc(rest or text)
@@ -782,7 +799,7 @@ async def on_text(m: Message):
         if tag == "need_time":
             _, base, rest = r; desc = clean_desc(rest or text)
             PENDING[uid] = {"description": desc, "base_date": base}
-            await m.reply(f"Окей, {base.strftime('%d.%m')}. Во сколько? (например: 10, 10:30)"); return
+            await м.reply(f"Окей, {base.strftime('%d.%m')}. Во сколько? (например: 10, 10:30)"); return
 
     # 11) «в 17 часов»
     r = parse_exact_hour(text)
@@ -835,3 +852,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
