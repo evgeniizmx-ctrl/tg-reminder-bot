@@ -4,6 +4,7 @@ import re
 import asyncio
 import json
 import tempfile
+import shutil
 from datetime import datetime, timedelta
 import pytz
 
@@ -19,12 +20,12 @@ except Exception:
     OpenAI = None
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # для парсинга текста
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")  # для распознавания аудио
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
 
 # ===== ENV / TZ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_TZ_NAME = os.getenv("APP_TZ", "Europe/Moscow")  # дефолт до выбора пользователем
+BASE_TZ_NAME = os.getenv("APP_TZ", "Europe/Moscow")
 BASE_TZ = pytz.timezone(BASE_TZ_NAME)
 
 if not BOT_TOKEN:
@@ -38,9 +39,9 @@ dp.include_router(router)
 scheduler = AsyncIOScheduler(timezone=BASE_TZ)
 
 # ===== In-memory storage (MVP) =====
-REMINDERS: list[dict] = []           # {"user_id","text","remind_dt","repeat"}
-PENDING: dict[int, dict] = {}        # {"description","candidates":[iso,...]}
-USER_TZS: dict[int, str] = {}        # user_id -> IANA name or "UTC+<minutes>"
+REMINDERS: list[dict] = []
+PENDING: dict[int, dict] = {}
+USER_TZS: dict[int, str] = {}
 
 # ===== TZ helpers =====
 RU_TZ_CHOICES = [
@@ -65,12 +66,10 @@ OFFSET_FLEX_RX = re.compile(r"^[+-]?\s*(\d{1,2})(?::\s*([0-5]\d))?$")
 
 def parse_user_tz_string(s: str):
     s = (s or "").strip()
-    # IANA?
     try:
         return pytz.timezone(s)
     except Exception:
         pass
-    # +HH[:MM] (знак опционален, по умолчанию '+')
     m = OFFSET_FLEX_RX.match(s)
     if not m:
         return None
@@ -108,7 +107,7 @@ def clean_desc(s: str) -> str:
     return s.strip() or "Напоминание"
 
 def fmt_dt_local(dt: datetime) -> str:
-    return f"{dt.strftime('%d.%m')} в {dt.strftime('%H:%M')}"  # без TZ
+    return f"{dt.strftime('%d.%m')} в {dt.strftime('%H:%M')}"
 
 def as_local_for(uid: int, dt_iso: str) -> datetime:
     user_tz = get_user_tz(uid)
@@ -354,15 +353,30 @@ dp.include_router(voice_router)
 
 oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if OpenAI else None
 
+def resolve_ffmpeg_path() -> str:
+    # приоритет: переменная окружения → which → дефолтный путь для mac brew
+    env = os.getenv("FFMPEG_PATH")
+    if env and os.path.exists(env):
+        return env
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # fallback для macOS brew
+    mac_default = "/opt/homebrew/bin/ffmpeg"
+    return mac_default
+
+FFMPEG_PATH = resolve_ffmpeg_path()
+print(f"[init] Using ffmpeg at: {FFMPEG_PATH}")
+
 async def ogg_to_wav(src_ogg: str, dst_wav: str):
     """Конвертирует OGG/OPUS → WAV (mono, 16kHz) через ffmpeg."""
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", src_ogg, "-ac", "1", "-ar", "16000", dst_wav,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.STDOUT
+        FFMPEG_PATH, "-y", "-i", src_ogg, "-ac", "1", "-ar", "16000", dst_wav,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    await proc.wait()
+    out, err = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError("ffmpeg convert failed")
+        raise RuntimeError(f"ffmpeg convert failed (code={proc.returncode})\nSTDERR:\n{err.decode(errors='ignore')}")
 
 async def transcribe_wav(path: str, lang: str = "ru") -> str:
     """Отправляет WAV в OpenAI Whisper и возвращает текст."""
@@ -392,6 +406,12 @@ async def on_voice(m: Message):
         wav_path = f"{tmpd}/in.wav"
         await m.bot.download_file(tg_file.file_path, ogg_path)
 
+        try:
+            size = os.path.getsize(ogg_path)
+            print(f"[voice] downloaded OGG size={size} bytes")
+        except Exception:
+            pass
+
         # OGG -> WAV
         try:
             await ogg_to_wav(ogg_path, wav_path)
@@ -414,7 +434,7 @@ async def on_voice(m: Message):
         await m.reply("Пустая расшифровка — повтори, пожалуйста.")
         return
 
-    # Дальше — тот же пайплайн, что и для текста
+    # Общий пайплайн
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
 
