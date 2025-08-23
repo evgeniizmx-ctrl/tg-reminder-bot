@@ -1,28 +1,30 @@
+# bot.py
 import os
 import re
 import asyncio
 import json
+import tempfile
 from datetime import datetime, timedelta
 import pytz
-import tempfile
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ====== LLM client (OpenAI-style) ======
+# ===== OpenAI SDK =====
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # для парсинга текста
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")  # для распознавания аудио
 
-# ========= ENV / BASE TZ (fallback) =========
+# ===== ENV / TZ =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_TZ_NAME = os.getenv("APP_TZ", "Europe/Moscow")  # дефолт для тех, кто не настроил TZ
+BASE_TZ_NAME = os.getenv("APP_TZ", "Europe/Moscow")  # дефолт до выбора пользователем
 BASE_TZ = pytz.timezone(BASE_TZ_NAME)
 
 if not BOT_TOKEN:
@@ -30,21 +32,17 @@ if not BOT_TOKEN:
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
-
-# Основной роутер и роутер для войсов подключим ниже
 router = Router()
 dp.include_router(router)
 
-# Планировщик: передаём в задачи aware-время в TZ пользователя
 scheduler = AsyncIOScheduler(timezone=BASE_TZ)
 
-# ====== In-memory (MVP) ======
-REMINDERS: list[dict] = []           # {"user_id", "text", "remind_dt", "repeat"}
-PENDING: dict[int, dict] = {}        # уточнение: {"description", "candidates":[iso,...]}
-USER_TZS: dict[int, str] = {}        # user_id -> IANA ("Europe/Moscow") или "UTC+<minutes>"
+# ===== In-memory storage (MVP) =====
+REMINDERS: list[dict] = []           # {"user_id","text","remind_dt","repeat"}
+PENDING: dict[int, dict] = {}        # {"description","candidates":[iso,...]}
+USER_TZS: dict[int, str] = {}        # user_id -> IANA name or "UTC+<minutes>"
 
-# ========= TZ helpers =========
-# Топ русских часовых поясов (город → IANA, offset)
+# ===== TZ helpers =====
 RU_TZ_CHOICES = [
     ("Калининград (+2)",  "Europe/Kaliningrad",  2),
     ("Москва (+3)",       "Europe/Moscow",       3),
@@ -63,38 +61,32 @@ def tz_kb() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="Ввести смещение (+/-часы)", callback_data="settz|ASK_OFFSET")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# Разрешаем: +03:00, +3:00, +3, 3, 03, -5, -05:30 (знак опционален, если нет — считаем «+»)
 OFFSET_FLEX_RX = re.compile(r"^[+-]?\s*(\d{1,2})(?::\s*([0-5]\d))?$")
 
 def parse_user_tz_string(s: str):
-    """Пробуем распознать IANA или гибкий ввод смещения. Возвращаем pytz tzinfo или None."""
     s = (s or "").strip()
     # IANA?
     try:
         return pytz.timezone(s)
     except Exception:
         pass
-    # Гибкое смещение
+    # +HH[:MM] (знак опционален, по умолчанию '+')
     m = OFFSET_FLEX_RX.match(s)
     if not m:
         return None
-    sign = +1
-    if s.strip().startswith("-"):
-        sign = -1
+    sign = -1 if s.strip().startswith("-") else +1
     hh = int(m.group(1))
     mm = int(m.group(2) or 0)
     if hh > 23:
         return None
-    minutes = sign * (hh * 60 + mm)
-    return pytz.FixedOffset(minutes)
+    return pytz.FixedOffset(sign * (hh * 60 + mm))
 
 def get_user_tz(uid: int):
     name = USER_TZS.get(uid)
     if not name:
         return BASE_TZ
-    if name.startswith("UTC+"):  # "UTC+<minutes>"
-        minutes = int(name[4:])
-        return pytz.FixedOffset(minutes)
+    if name.startswith("UTC+"):
+        return pytz.FixedOffset(int(name[4:]))
     return pytz.timezone(name)
 
 def store_user_tz(uid: int, tzobj):
@@ -105,7 +97,7 @@ def store_user_tz(uid: int, tzobj):
         ofs_min = int(tzobj.utcoffset(datetime.utcnow()).total_seconds() // 60)
         USER_TZS[uid] = f"UTC+{ofs_min}"
 
-# ========= Common helpers =========
+# ===== Common helpers =====
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s or "", flags=re.UNICODE).strip()
 
@@ -151,7 +143,7 @@ async def send_reminder(uid: int, text: str):
     except Exception as e:
         print("send_reminder error:", e)
 
-# ========= LLM PARSER =========
+# ===== LLM parser =====
 SYSTEM_PROMPT = """Ты — интеллектуальный парсер напоминаний на русском языке.
 Возвращай строго JSON:
 {
@@ -162,8 +154,8 @@ SYSTEM_PROMPT = """Ты — интеллектуальный парсер нап
   "clarify_type": "time|date|both|none",
   "reason": "строка"
 }
-Понимай разговорные формы; если часы двусмысленны — верни два кандидата (например, 06:00 и 18:00).
-Если только дата — попроси время. Если только время — ставь ближайшее будущее. Описание очисти от вводных слов.
+Понимай разговорные формы; двусмысленные часы -> два кандидата (06:00 и 18:00).
+Если только дата — попроси время. Если только время — поставь на ближайшее будущее. Описание очисти от вводных слов.
 """
 
 def build_user_prompt(uid: int, text: str) -> str:
@@ -202,7 +194,7 @@ async def ai_parse(uid: int, text: str) -> dict:
         print("ai_parse error:", e)
         return {"ok": False, "description": clean_desc(text), "datetimes": [], "need_clarification": True, "clarify_type": "time", "reason": "LLM error"}
 
-# ========= Onboarding TZ =========
+# ===== Onboarding TZ =====
 def need_tz(uid: int) -> bool:
     return uid not in USER_TZS
 
@@ -213,7 +205,7 @@ async def ask_tz(m: Message):
         reply_markup=tz_kb()
     )
 
-# ========= COMMANDS =========
+# ===== Commands =====
 @router.message(Command("start"))
 async def cmd_start(m: Message):
     if need_tz(m.from_user.id):
@@ -252,13 +244,12 @@ async def cmd_cancel(m: Message):
     else:
         await m.reply("Нечего отменять.")
 
-# ========= MAIN TEXT HANDLER =========
+# ===== Text handler =====
 @router.message(F.text)
 async def on_text(m: Message):
     uid = m.from_user.id
     text = norm(m.text)
 
-    # Если TZ не задан — воспринимаем ввод как TZ (IANA или смещение)
     if need_tz(uid):
         tz_obj = parse_user_tz_string(text)
         if tz_obj:
@@ -268,7 +259,6 @@ async def on_text(m: Message):
         await ask_tz(m)
         return
 
-    # Этап уточнения (ждём время)
     if uid in PENDING:
         st = PENDING[uid]
         enriched = f"{text}. Контекст: {st.get('description','')}"
@@ -292,7 +282,6 @@ async def on_text(m: Message):
         await m.reply("Нужно уточнить время. Примеры: 10, 10:30, 1710.")
         return
 
-    # Новое сообщение → в LLM
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
 
@@ -322,7 +311,7 @@ async def on_text(m: Message):
 
     await m.reply("Не понял. Скажи, когда напомнить (например: «завтра в 19 отчёт»).")
 
-# ========= CALLBACKS =========
+# ===== Callbacks =====
 @router.callback_query(F.data.startswith("settz|"))
 async def cb_settz(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -359,22 +348,31 @@ async def cb_time(cb: CallbackQuery):
         await cb.message.answer(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
     await cb.answer("Установлено ✅")
 
-# ========= VOICE via OpenAI Whisper API (облако) =========
+# ===== VOICE (OGG -> WAV -> Whisper API) =====
 voice_router = Router()
 dp.include_router(voice_router)
 
-# Инициализируем клиента один раз
 oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if OpenAI else None
 
-async def transcribe_file(path: str, lang: str = "ru") -> str:
-    """Отправляет файл в OpenAI Whisper API и возвращает текст."""
+async def ogg_to_wav(src_ogg: str, dst_wav: str):
+    """Конвертирует OGG/OPUS → WAV (mono, 16kHz) через ffmpeg."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", src_ogg, "-ac", "1", "-ar", "16000", dst_wav,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.STDOUT
+    )
+    await proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError("ffmpeg convert failed")
+
+async def transcribe_wav(path: str, lang: str = "ru") -> str:
+    """Отправляет WAV в OpenAI Whisper и возвращает текст."""
     if not oa_client:
         raise RuntimeError("OpenAI client not initialized")
     loop = asyncio.get_running_loop()
     def _run():
         with open(path, "rb") as f:
             r = oa_client.audio.transcriptions.create(
-                model="whisper-1",
+                model=WHISPER_MODEL,
                 file=f,
                 language=lang
             )
@@ -384,22 +382,29 @@ async def transcribe_file(path: str, lang: str = "ru") -> str:
 @voice_router.message(F.voice)
 async def on_voice(m: Message):
     uid = m.from_user.id
-    # если TZ ещё не задан — сначала онбординг
     if need_tz(uid):
         await ask_tz(m)
         return
 
-    # 1) скачать voice во временный файл (OGG/OPUS)
     tg_file = await m.bot.get_file(m.voice.file_id)
     with tempfile.TemporaryDirectory() as tmpd:
         ogg_path = f"{tmpd}/in.ogg"
+        wav_path = f"{tmpd}/in.wav"
         await m.bot.download_file(tg_file.file_path, ogg_path)
+
+        # OGG -> WAV
+        try:
+            await ogg_to_wav(ogg_path, wav_path)
+        except Exception as e:
+            print("FFmpeg error:", e)
+            await m.reply("Не смог обработать аудио (конвертация). Проверь ffmpeg и попробуй ещё раз.")
+            return
 
         await m.chat.do("typing")
 
-        # 2) отправить в Whisper API
+        # WAV -> Whisper
         try:
-            text = await transcribe_file(ogg_path, lang="ru")
+            text = await transcribe_wav(wav_path, lang="ru")
         except Exception as e:
             print("Whisper API error:", e)
             await m.reply("Не смог распознать голос 😕 Попробуй ещё раз.")
@@ -409,7 +414,7 @@ async def on_voice(m: Message):
         await m.reply("Пустая расшифровка — повтори, пожалуйста.")
         return
 
-    # 3) дальше — твой существующий пайплайн (как для текста)
+    # Дальше — тот же пайплайн, что и для текста
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
 
@@ -439,7 +444,7 @@ async def on_voice(m: Message):
 
     await m.reply("Не понял из голосового. Скажи, когда напомнить (например: «завтра в 19 отчёт»).")
 
-# ========= RUN =========
+# ===== RUN =====
 async def main():
     scheduler.start()
     await dp.start_polling(bot)
