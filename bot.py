@@ -5,6 +5,7 @@ import json
 import shutil
 import tempfile
 import asyncio
+import platform
 from datetime import datetime, timedelta
 import pytz
 
@@ -49,34 +50,47 @@ USER_TZS: dict[int, str] = {}          # user_id -> IANA | "UTC+<minutes>"
 
 # ========= FFmpeg path resolve + smoke =========
 def resolve_ffmpeg_path() -> str:
-    # 1) ENV приоритет (Railway: /usr/bin/ffmpeg)
+    """
+    Ищем рабочий ffmpeg:
+    1) если FFMPEG_PATH задан и существует — используем его (иначе игнорируем);
+    2) which ffmpeg (в Railway/Nixpacks обычно /nix/store/.../bin/ffmpeg);
+    3) стандартные пути.
+    """
+    candidates = []
     env = os.getenv("FFMPEG_PATH")
     if env:
-        return os.path.realpath(env)
-    # 2) which ffmpeg
+        candidates.append(env)
+
     found = shutil.which("ffmpeg")
     if found:
-        return os.path.realpath(found)
-    # 3) понятная ошибка — просим поставить ffmpeg
+        candidates.append(found)
+
+    candidates += ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+
+    for p in candidates:
+        if p and os.path.exists(p) and os.access(p, os.X_OK):
+            return os.path.realpath(p)
+
     raise FileNotFoundError(
-        "ffmpeg not found. Установи ffmpeg на сервер или задай FFMPEG_PATH (например /usr/bin/ffmpeg)."
+        "ffmpeg not found. Установи ffmpeg (Railway: NIXPACKS_PKGS=ffmpeg) "
+        "или добавь его в PATH."
     )
 
 FFMPEG_PATH = resolve_ffmpeg_path()
 print(f"[init] Using ffmpeg at: {FFMPEG_PATH}")
 
 async def _smoke_ffmpeg():
-    if not os.path.exists(FFMPEG_PATH):
-        raise FileNotFoundError(f"ffmpeg not found at {FFMPEG_PATH}")
-    if not os.access(FFMPEG_PATH, os.X_OK):
-        raise PermissionError(f"ffmpeg is not executable at {FFMPEG_PATH}")
+    """Пробный запуск ffmpeg -version; если не вышло — падаем с понятной ошибкой."""
     proc = await asyncio.create_subprocess_exec(
         FFMPEG_PATH, "-version",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     out, err = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg smoke failed (code={proc.returncode})\n{(err or b'').decode(errors='ignore')}")
+        raise RuntimeError(
+            f"ffmpeg smoke failed (code={proc.returncode})\n"
+            f"{(err or b'').decode(errors='ignore')[:400]}"
+        )
     print("[init] ffmpeg ok:", (out or b"").decode(errors="ignore").splitlines()[0])
 
 # ========= TZ helpers =========
@@ -274,6 +288,31 @@ async def cmd_cancel(m: Message):
     else:
         await m.reply("Нечего отменять.")
 
+@router.message(Command("ping"))
+async def cmd_ping(m: Message):
+    await m.answer("pong ✅")
+
+@router.message(Command("debug"))
+async def cmd_debug(m: Message):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            FFMPEG_PATH, "-version",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        out, err = await proc.communicate()
+        ff_line = (out or b"").decode(errors="ignore").splitlines()[0] if proc.returncode == 0 else (err or b"").decode(errors="ignore")[:120]
+    except Exception as e:
+        ff_line = f"error: {e}"
+
+    await m.answer(
+        "🔎 DEBUG\n"
+        f"TZ(default): {BASE_TZ.zone}\n"
+        f"FFMPEG_PATH: {FFMPEG_PATH}\n"
+        f"ffmpeg: {ff_line}\n"
+        f"OPENAI_API_KEY: {'set' if OPENAI_API_KEY else 'MISSING'}\n"
+        f"Python: {platform.python_version()}"
+    )
+
 # ========= Текст =========
 @router.message(F.text)
 async def on_text(m: Message):
@@ -462,8 +501,9 @@ async def on_audio(m: Message):
 
 # ========= RUN =========
 async def main():
-    await _smoke_ffmpeg()   # проверим ffmpeg до запуска бота (Railway: /usr/bin/ffmpeg)
+    await _smoke_ffmpeg()   # проверим ffmpeg до запуска бота
     scheduler.start()
+    print("✅ bot is polling")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
