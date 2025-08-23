@@ -34,7 +34,6 @@ def clean_desc(s: str) -> str:
     return s.strip() or "Напоминание"
 
 def fmt_dt(dt: datetime) -> str:
-    # ЕДИНЫЙ формат отображения времени
     return f"{dt.strftime('%d.%m')} в {dt.strftime('%H:%M')} ({APP_TZ})"
 
 async def send_reminder(uid: int, text: str):
@@ -122,23 +121,28 @@ RX_TMR = re.compile(r"\bзавтра\b", re.I)
 RX_ATMR = re.compile(r"\bпослезавтра\b", re.I)
 RX_IN_N_DAYS = re.compile(r"\bчерез\s+(\d+)\s*(дн(?:я|ей)?|день|дн\.?)\b", re.I)
 
-# «сегодня/завтра/послезавтра … в HH[:MM] [меридиан]» (поддерживает «час/часов»)
+# «сегодня/завтра/послезавтра … в HH[:MM] [меридиан]»
 RX_DAY_WORD_TIME = re.compile(
     r"\b(сегодня|завтра|послезавтра)\b.*?\bв\s*(\d{1,2})"
     r"(?:(?::(\d{2}))|\s*час(?:ов|а)?)?"
     r"(?:\s*(утра|дн[её]м|дня|вечера|ночью|ночи))?\b",
     re.I | re.DOTALL
 )
-
-# «сегодня/завтра/послезавтра» + часть суток (без числа) → дефолт-время
+# «сегодня/завтра/послезавтра» + часть суток (без числа)
 RX_DAY_WORD_ONLY = re.compile(
     r"\b(сегодня|завтра|послезавтра)\b.*?\b(утром|дн[её]м|дня|вечером|ночью|ночи)\b",
     re.I | re.DOTALL
 )
 
+# «в HH[:MM]»
 RX_ONLY_TIME = re.compile(r"\bв\s*(\d{1,2})(?::(\d{2}))?\b", re.I)
+# «HH[:MM] утром/вечером …» — БЕЗ «в»
+RX_BARE_TIME_WITH_MER = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(утром|дн[её]м|дня|вечером|ночью|ночи)\b", re.I)
+
+# «в HH часов»
 RX_EXACT_HOUR = re.compile(r"\bв\s*(\d{1,2})\s*час(ов|а)?\b", re.I)
 
+# даты
 RX_DOT_DATE = re.compile(
     r"\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?"
     r"(?:\s*в\s*(\d{1,2})(?::(\d{2}))?(?:\s*(утра|дн[её]м|дня|вечера|ночью|ночи))?)?",
@@ -156,6 +160,7 @@ RX_DAY_OF_MONTH = re.compile(
 )
 
 RX_ANY_MER = re.compile(r"\b(утром|дн[её]м|дня|вечером|ночью|ночи)\b", re.I)
+RX_TODAY = re.compile(r"\bсегодня\b", re.I)
 
 # --------- HELPERS ---------
 def hour_is_unambiguous(h: int) -> bool:
@@ -164,9 +169,9 @@ def hour_is_unambiguous(h: int) -> bool:
 def part_of_day_defaults(word: str) -> int:
     w = word.lower()
     if w.startswith("утр"):   return 9
-    if w.startswith("дн"):    return 13   # днём/днем/дня
+    if w.startswith("дн"):    return 13
     if w.startswith("веч"):   return 19
-    return 1  # ночью/ночи
+    return 1  # ночь
 
 def apply_meridian(h: int, mer: str | None) -> int:
     if not mer: return h
@@ -272,11 +277,31 @@ def parse_dayword_time(text: str):
     return None
 
 def parse_only_time(text: str):
-    s = norm(text); m = RX_ONLY_TIME.search(s)
-    if not m: return None
+    """
+    Обрабатывает время без даты:
+    - 'в HH[:MM]'
+    - 'HH[:MM] утром/вечером/...' (без 'в')
+    Учитывает 'сегодня' для выбора ближайшего сегодняшнего слота.
+    """
+    s = norm(text)
     now = datetime.now(tz).replace(second=0, microsecond=0)
+
+    # bare time with meridian (без 'в'): "10 утра"
+    mb = RX_BARE_TIME_WITH_MER.search(s)
+    if mb:
+        h = int(mb.group(1)); mm = int(mb.group(2) or 0); mer = mb.group(3)
+        dt = now.replace(hour=apply_meridian(h, mer) % 24, minute=mm)
+        if dt <= now: dt += timedelta(days=1)
+        rest = (s[:mb.start()] + s[mb.end():]).strip(" ,.-")
+        return ("ok", dt, rest)
+
+    # classic: "в 10[:30]"
+    m = RX_ONLY_TIME.search(s)
+    if not m:
+        return None
     h = int(m.group(1)); mm = int(m.group(2) or 0)
 
+    # если указана часть суток где-то в тексте
     mer_m = RX_ANY_MER.search(s)
     if mer_m:
         mer = mer_m.group(1)
@@ -285,12 +310,28 @@ def parse_only_time(text: str):
         rest = (s[:m.start()] + s[m.end():]).strip(" ,.-")
         return ("ok", dt, rest)
 
+    # если 'сегодня' и двусмысленный час — выбираем ближайший СЕГОДНЯ
+    if RX_TODAY.search(s) and not hour_is_unambiguous(h):
+        dt1 = now.replace(hour=h % 24, minute=mm)
+        dt2 = now.replace(hour=(h + 12) % 24, minute=mm)
+        candidates = [dt for dt in (dt1, dt2) if dt >= now and dt.date() == now.date()]
+        if candidates:
+            dt = min(candidates)
+            rest = (s[:m.start()] + s[m.end():]).strip(" ,.-")
+            return ("ok", dt, rest)
+        # если сегодня уже никак — завтра в тот же час
+        dt = (now + timedelta(days=1)).replace(hour=h % 24, minute=mm)
+        rest = (s[:m.start()] + s[m.end():]).strip(" ,.-")
+        return ("ok", dt, rest)
+
+    # однозначный 24-часовой час
     if hour_is_unambiguous(h):
         dt = now.replace(hour=h % 24, minute=mm)
         if dt <= now: dt += timedelta(days=1)
         rest = (s[:m.start()] + s[m.end():]).strip(" ,.-")
         return ("ok", dt, rest)
 
+    # двусмысленный без 'сегодня' — предложим выбор
     v1 = now.replace(hour=h % 24, minute=mm)
     v2 = now.replace(hour=(h + 12) % 24, minute=mm)
     if v1 <= now: v1 += timedelta(days=1)
@@ -410,7 +451,7 @@ async def cmd_start(m: Message):
         "Привет! Я бот-напоминалка.\n"
         "Понимаю: «24 мая в 19», «1 числа в 7», «через 30 минут/час», "
         "«завтра в 6», «в 17 часов», «в 21», «24.05 21:30», "
-        "«завтра вечером», «24 мая утром», «в 7 вечером».\n"
+        "«завтра вечером», «24 мая утром», «в 7 вечером», «10 утра».\n"
         "Если время 13–23 или 00 — считаю его точным и не спрашиваю уточнений.\n"
         "/list — список, /ping — проверка, /cancel — отменить уточнение."
     )
@@ -480,7 +521,7 @@ async def on_text(m: Message):
             plan(REMINDERS[-1])
             await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
             return
-        # если дошли сюда — PENDING очищен, продолжим как новое сообщение
+        # PENDING очищен — продолжаем как новое сообщение
 
     # 1) относительное
     r = parse_relative(text)
@@ -546,7 +587,7 @@ async def on_text(m: Message):
         await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
         return
 
-    # 6) «в HH[:MM]»
+    # 6) «в HH[:MM]» / «HH[:MM] утром …»
     r = parse_only_time(text)
     if r:
         tag = r[0]
@@ -561,7 +602,7 @@ async def on_text(m: Message):
         await m.reply(f"Уточните, во сколько напомнить «{desc}»?", reply_markup=kb_variants(variants))
         return
 
-    await m.reply("Не понял дату/время. Примеры: «24.05 19:00», «24 мая вечером», «завтра в 7 утра», «в 17 часов», «через 30 минут».")
+    await m.reply("Не понял дату/время. Примеры: «24.05 19:00», «24 мая вечером», «завтра в 7 утра», «в 17 часов», «через 30 минут», «10 утра».")
 
 # --------- CALLBACK ---------
 @dp.callback_query(F.data.startswith("time|"))
