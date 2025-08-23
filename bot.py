@@ -27,8 +27,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-# PENDING[user_id] = {"description": str, "repeat": "none|daily|weekly",
-#                     "variants": [datetime,...], "base_date": date}
 PENDING: dict[int, dict] = {}
 REMINDERS: list[dict] = []
 
@@ -70,7 +68,6 @@ def _mk_dt(base_d: date, hh: int, mm: int) -> datetime:
     return tz.localize(datetime(base_d.year, base_d.month, base_d.day, hh % 24, mm % 60))
 
 def _order_by_soonest(variants: list[datetime]) -> list[datetime]:
-    """Возвращает варианты в порядке ближайшего наступления."""
     return sorted(variants, key=lambda dt: dt)
 
 def _variants_keyboard(variants: list[datetime]) -> InlineKeyboardMarkup:
@@ -82,7 +79,6 @@ def _variants_keyboard(variants: list[datetime]) -> InlineKeyboardMarkup:
     ])
 
 # ===================== ПАРСЕРЫ =====================
-# «через …»
 REL_NUM_PATTERNS = [
     (r"(через|спустя)\s+(\d+)\s*(секунд(?:у|ы)?|сек\.?)\b", "seconds"),
     (r"(через|спустя)\s+(\d+)\s*(минут(?:у|ы)?|мин\.?)\b", "minutes"),
@@ -132,7 +128,6 @@ def parse_relative_phrase(raw_text: str):
 
     return None
 
-# «в это же время»
 SAME_TIME_RX = re.compile(r"\bв это же время\b", re.I | re.UNICODE)
 TOMORROW_RX = re.compile(r"\bзавтра\b", re.I | re.UNICODE)
 AFTER_TOMORROW_RX = re.compile(r"\bпослезавтра\b", re.I | re.UNICODE)
@@ -160,7 +155,6 @@ def parse_same_time_phrase(raw_text: str):
     remainder = remainder.strip(" ,.-")
     return target, remainder
 
-# «сегодня/завтра/послезавтра … в HH[:MM]»
 DAYTIME_RX = re.compile(
     r"\b(сегодня|завтра|послезавтра)\b.*?\bв\s*(\d{1,2})(?::(\d{2}))?(?:\s*(утра|дня|вечера|ночи))?\b",
     re.IGNORECASE | re.UNICODE | re.DOTALL
@@ -188,19 +182,16 @@ def parse_daytime_phrase(raw_text: str):
         target = base.replace(hour=h % 24, minute=minute % 60)
         return ("ok", target, remainder)
 
-    # двусмысленно → два кандидата
     dt1 = base.replace(hour=hour_raw % 24, minute=minute % 60)
     h2 = 0 if hour_raw == 12 else (hour_raw + 12) % 24
     dt2 = base.replace(hour=h2, minute=minute % 60)
 
-    # если база — сегодня, переносим прошедшие варианты на завтра, чтобы порядок был "ближайшие"
     if base.date() == now.date():
         if dt1 <= now: dt1 = dt1 + timedelta(days=1)
         if dt2 <= now: dt2 = dt2 + timedelta(days=1)
 
     return ("amb", remainder, _order_by_soonest([dt1, dt2]))
 
-# «в HH[:MM]»
 ONLYTIME_RX = re.compile(r"\bв\s*(\d{1,2})(?::(\d{2}))?\b", re.I | re.UNICODE)
 
 def parse_onlytime_phrase(raw_text: str):
@@ -231,7 +222,6 @@ def parse_onlytime_phrase(raw_text: str):
     remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
     return ("amb", remainder, _order_by_soonest(cand))
 
-# «только дата без времени» (числом)
 DATE_DOT_RX = re.compile(r"\b(\d{1,2})[.\-\/](\d{1,2})(?:[.\-\/](\d{2,4}))?\b(?!.*\bв\s*\d)", re.IGNORECASE | re.UNICODE)
 DATE_NUM_RX = re.compile(r"(?:\bна\s+)?\b(\d{1,2})\b(?:\s*числа)?\b", re.IGNORECASE | re.UNICODE)
 
@@ -255,7 +245,6 @@ def nearest_future_day(day: int, now: datetime) -> date:
 
 def parse_numeric_date_only(raw_text: str):
     s = normalize_spaces(raw_text)
-    # если есть «в \d» — это про время, не дата
     if re.search(r"\bв\s*\d", s, re.IGNORECASE):
         return None
 
@@ -303,15 +292,14 @@ async def gpt_parse(text: str) -> dict:
         print("GPT parse fail:", e)
         return {"description": text, "event_time": "", "remind_time": "",
                 "repeat": "none", "needs_clarification": True,
-                "clarification_question": "Уточните дату и время (например, 25.08 14:25)."}
+                "clarification_question": "Уточните дату и время."}
 
 # ===================== КОМАНДЫ =====================
 @dp.message(Command("start"))
 async def start(message: Message):
     await message.answer(
         "Привет! Я бот-напоминалка.\n"
-        "Понимаю: «Свадьба 25» (спрошу время), «Свадьба в 6» (кнопки 06:00/18:00 — ближайшее первым),\n"
-        "«в 10», «в 17 часов», «через 3 минуты», «завтра в 5», «послезавтра встреча».\n"
+        "Понимаю: «Свадьба 25», «Свадьба в 6», «в 10», «через 3 минуты», «завтра в 5».\n"
         "Голос/скрин — можно. /list — список, /ping — проверка."
     )
 
@@ -326,10 +314,6 @@ async def list_cmd(message: Message):
     if not items:
         await message.answer("Пока нет напоминаний (в этой сессии).")
         return
-    lines = [f"• {r['text']} — {r['remind_dt'].strftime('%d.%m %H:%M')} ({TZ})"
-             + (f" [{r['repeat']}]" if r['repeat'] != 'none' else "")
-             for r in _order_by_soonest(items and [i["remind_dt"] for i in items]) or []]
-    # простой вывод без сортировки по списку объектов:
     items_sorted = sorted(items, key=lambda r: r["remind_dt"])
     lines = [f"• {r['text']} — {r['remind_dt'].strftime('%d.%m %H:%M')} ({TZ})"
              + (f" [{r['repeat']}]" if r['repeat'] != 'none' else "")
@@ -343,7 +327,6 @@ async def on_any_text(message: Message):
     text_raw = message.text or ""
     text = normalize_spaces(text_raw)
 
-    # ожидаем уточнение
     if uid in PENDING:
         st = PENDING[uid]
 
@@ -355,7 +338,7 @@ async def on_any_text(message: Message):
             m = re.search(r"(?:^|\bв\s*)(\d{1,2})(?::(\d{2}))?\s*(утра|дня|вечера|ночи)?\b",
                           text, re.IGNORECASE)
             if not m:
-                await message.reply("Во сколько? Например: 6, 18, 6:30, «6 утра» или «6 вечера».")
+                await message.reply("Во сколько?")
                 return
             hour = int(m.group(1)); minute = int(m.group(2) or 0)
             mer = (m.group(3) or "").lower()
@@ -369,236 +352,3 @@ async def on_any_text(message: Message):
                 desc = st.get("description", "Напоминание")
                 PENDING.pop(uid, None)
                 REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-                schedule_one(REMINDERS[-1])
-                await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-                return
-
-            if hour == 18 and minute == 0:
-                dt = _mk_dt(base_d, 18, 0)
-                desc = st.get("description", "Напоминание")
-                PENDING.pop(uid, None)
-                REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-                schedule_one(REMINDERS[-1])
-                await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-                return
-
-            v1 = _mk_dt(base_d, hour, minute)
-            v2 = _mk_dt(base_d, (hour + 12) % 24, minute)
-            PENDING[uid]["variants"] = _order_by_soonest([v1, v2])
-            await message.reply("Уточните время:", reply_markup=_variants_keyboard([v1, v2]))
-            return
-
-        # обычные парсеры
-        for parser in (parse_daytime_phrase, parse_onlytime_phrase):
-            pack = parser(text)
-            if pack:
-                tag = pack[0]
-                if tag == "amb":
-                    _, remainder, variants = pack
-                    desc = clean_description(remainder or st.get("description", text))
-                    PENDING[uid] = {"description": desc, "variants": _order_by_soonest(variants), "repeat": "none"}
-                    await message.reply(f"Уточните, во сколько напомнить «{desc}»?",
-                                        reply_markup=_variants_keyboard(variants))
-                    return
-                else:
-                    _, dt, remainder = pack
-                    desc = clean_description(remainder or st.get("description", text))
-                    PENDING.pop(uid, None)
-                    REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": st.get("repeat","none")})
-                    schedule_one(REMINDERS[-1])
-                    await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-                    return
-
-        rel = parse_relative_phrase(text)
-        if rel:
-            dt, remainder = rel
-            desc = clean_description(remainder or st.get("description", text))
-            PENDING.pop(uid, None)
-            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": st.get("repeat","none")})
-            schedule_one(REMINDERS[-1])
-            await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-            return
-
-        same = parse_same_time_phrase(text)
-        if same:
-            dt, remainder = same
-            desc = clean_description(remainder or st.get("description", text))
-            PENDING.pop(uid, None)
-            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": st.get("repeat","none")})
-            schedule_one(REMINDERS[-1])
-            await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-            return
-
-        dt = as_local_iso(text)
-        if dt:
-            desc = clean_description(st.get("description", text))
-            PENDING.pop(uid, None)
-            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": st.get("repeat","none")})
-            schedule_one(REMINDERS[-1])
-            await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-            return
-
-        await message.reply("Не понял время. Например: 6, 18, 6:30, «6 утра» или «6 вечера».")
-        return
-
-    # 1) сначала «только день» (словами/числом)
-    day_only_words = re.search(r"\b(сегодня|завтра|послезавтра)\b(?!.*\bв\s*\d)", text, re.IGNORECASE)
-    if day_only_words:
-        word = day_only_words.group(1).lower()
-        now = datetime.now(tz)
-        base = now.date() if word == "сегодня" else (now + timedelta(days=1 if word == "завтра" else 2)).date()
-        desc = clean_description(re.sub(r"\b(сегодня|завтра|послезавтра)\b", "", text, flags=re.IGNORECASE))
-        PENDING[uid] = {"description": desc, "base_date": base, "repeat": "none"}
-        await message.reply(f"Ок, {base.strftime('%d.%m')}. Во сколько напомнить? (например: 6, 18, 6:30)")
-        return
-
-    def parse_numeric_date_only(s: str):
-        # если есть «в \d» — это про время
-        if re.search(r"\bв\s*\d", s, re.IGNORECASE):
-            return None
-        m = DATE_DOT_RX.search(s)
-        if m:
-            dd = int(m.group(1)); mm = int(m.group(2)); yy = m.group(3)
-            now = datetime.now(tz)
-            yyyy = (int(yy) + 2000) if yy and int(yy) < 100 else (int(yy) if yy else now.year)
-            try:
-                base = date(yyyy, mm, dd)
-            except ValueError:
-                return None
-            desc = clean_description(DATE_DOT_RX.sub("", s))
-            return ("day", base, desc)
-        m2 = DATE_NUM_RX.search(s)
-        if m2:
-            dd = int(m2.group(1))
-            now = datetime.now(tz)
-            base = nearest_future_day(dd, now)
-            desc = clean_description(DATE_NUM_RX.sub("", s))
-            return ("day", base, desc)
-        return None
-
-    DATE_DOT_RX = re.compile(r"\b(\d{1,2})[.\-\/](\d{1,2})(?:[.\-\/](\d{2,4}))?\b(?!.*\bв\s*\d)", re.IGNORECASE | re.UNICODE)
-    DATE_NUM_RX = re.compile(r"(?:\bна\s+)?\b(\d{1,2})\b(?:\s*числа)?\b", re.IGNORECASE | re.UNICODE)
-    def nearest_future_day(day: int, now: datetime) -> date:
-        y, m = now.year, now.month
-        try:
-            candidate = date(y, m, day)
-        except ValueError:
-            m2 = m + 1 if m < 12 else 1
-            y2 = y if m < 12 else y + 1
-            return date(y2, m2, min(day, 28))
-        if candidate <= now.date():
-            m2 = m + 1 if m < 12 else 1
-            y2 = y if m < 12 else y + 1
-            for dcap in (31, 30, 29, 28):
-                try:
-                    return date(y2, m2, min(day, dcap))
-                except ValueError:
-                    continue
-        return candidate
-
-    day_only_num = parse_numeric_date_only(text)
-    if day_only_num:
-        _, base, desc = day_only_num
-        PENDING[uid] = {"description": desc, "base_date": base, "repeat": "none"}
-        await message.reply(f"Ок, {base.strftime('%d.%m')}. Во сколько напомнить? (например: 6, 18, 6:30)")
-        return
-
-    # 2) затем «день+время», «только время», «через…», «в это же время»
-    for parser in (parse_daytime_phrase, parse_onlytime_phrase):
-        pack = parser(text)
-        if pack:
-            tag = pack[0]
-            if tag == "amb":
-                _, remainder, variants = pack
-                desc = clean_description(remainder or text)
-                PENDING[uid] = {"description": desc, "variants": _order_by_soonest(variants), "repeat": "none"}
-                await message.reply(f"Уточните, во сколько напомнить «{desc}»?",
-                                    reply_markup=_variants_keyboard(variants))
-                return
-            else:
-                _, dt, remainder = pack
-                desc = clean_description(remainder or text)
-                REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-                schedule_one(REMINDERS[-1])
-                await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-                return
-
-    rel = parse_relative_phrase(text)
-    if rel:
-        dt, remainder = rel
-        desc = clean_description(remainder or text)
-        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-        schedule_one(REMINDERS[-1])
-        await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-        return
-
-    same = parse_same_time_phrase(text)
-    if same:
-        dt, remainder = same
-        desc = clean_description(remainder or text)
-        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-        schedule_one(REMINDERS[-1])
-        await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-        return
-
-    # fallback: GPT
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    plan = await gpt_parse(text)
-    desc = clean_description(plan.get("description") or "Напоминание")
-    repeat = (plan.get("repeat") or "none").lower()
-    remind_iso = plan.get("remind_time") or plan.get("event_time")
-    remind_dt = as_local_iso(remind_iso)
-
-    if plan.get("needs_clarification") or not remind_dt:
-        PENDING[uid] = {"description": desc, "repeat": "none"}
-        await message.reply(plan.get("clarification_question") or
-                            "Уточните дату/время (например, 25.08 14:25).")
-        return
-
-    REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": remind_dt,
-                      "repeat": "none" if repeat not in ("daily","weekly") else repeat})
-    schedule_one(REMINDERS[-1])
-    await message.reply(f"Готово. Напомню: «{desc}» в {remind_dt.strftime('%d.%m %H:%M')} ({TZ})")
-
-# ===================== CALLBACK: выбор времени =====================
-@dp.callback_query(F.data.startswith("time|"))
-async def on_time_choice(cb: CallbackQuery):
-    uid = cb.from_user.id
-    if uid not in PENDING or not PENDING[uid].get("variants"):
-        await cb.answer("Нет активного уточнения")
-        return
-    try:
-        iso = cb.data.split("|", 1)[1]
-        dt = datetime.fromisoformat(iso)
-        dt = tz.localize(dt) if dt.tzinfo is None else dt.astimezone(tz)
-    except Exception as e:
-        print("time| parse error:", e)
-        await cb.answer("Ошибка выбора времени")
-        return
-
-    desc = PENDING[uid].get("description", "Напоминание")
-    PENDING.pop(uid, None)
-
-    REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-    schedule_one(REMINDERS[-1])
-
-    try:
-        await cb.message.edit_text(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-    except Exception:
-        await cb.message.answer(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
-    await cb.answer("Установлено ✅")
-
-# ===================== ЗАПУСК =====================
-async def main():
-    scheduler.start()
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        import traceback, time
-        print("FATAL:", e)
-        traceback.print_exc()
-        time.sleep(10)
-        raise
