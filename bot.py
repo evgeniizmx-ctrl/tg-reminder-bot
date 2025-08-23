@@ -1,10 +1,4 @@
 import os
-# --- диагностика окружения ---
-print("ENV CHECK:",
-      "BOT_TOKEN set:", bool(os.getenv("BOT_TOKEN")),
-      "OPENAI_API_KEY set:", bool(os.getenv("OPENAI_API_KEY")),
-      "OCR_SPACE_API_KEY set:", bool(os.getenv("OCR_SPACE_API_KEY")))
-# --- конец диагностики ---
 import io
 import json
 import asyncio
@@ -18,8 +12,14 @@ from aiogram.enums import ChatAction
 
 import httpx
 from dateutil import parser as dateparser
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# ===================== Диагностика окружения =====================
+print("ENV CHECK:",
+      "BOT_TOKEN set:", bool(os.getenv("BOT_TOKEN")),
+      "OPENAI_API_KEY set:", bool(os.getenv("OPENAI_API_KEY")),
+      "OCR_SPACE_API_KEY set:", bool(os.getenv("OCR_SPACE_API_KEY")))
+# ================================================================
 
 # --------- КЛЮЧИ/НАСТРОЙКИ ---------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -29,9 +29,19 @@ OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY")
 TZ = os.getenv("APP_TZ", "Europe/Moscow")
 tz = pytz.timezone(TZ)
 
-# --------- ИНИЦИАЛИЗАЦИЯ ---------
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+# --------- ИНИЦИАЛИЗАЦИЯ (с метками и ловлей ошибок) ---------
+print("STEP: creating Bot/Dispatcher...")
+try:
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    print("STEP: Bot/Dispatcher OK")
+except Exception as e:
+    import traceback, time
+    print("BOOT ERROR:", e)
+    traceback.print_exc()
+    time.sleep(120)
+    raise
+
 scheduler = AsyncIOScheduler(timezone=TZ)
 
 # Храним черновики и напоминания в памяти (MVP)
@@ -138,8 +148,8 @@ async def start(message: Message):
         "Привет! Я бот-напоминалка.\n"
         "• Пиши: «Запись к стоматологу сегодня 14:25»\n"
         "• Или пришли голосовое/скрин — я распознаю.\n"
-        "• Команда /ping — проверка, жив ли бот.\n"
-        "• Команда /list — показать созданные напоминания (сессии)."
+        "• /ping — проверка, жив ли бот.\n"
+        "• /list — список напоминаний (в текущей сессии)."
     )
 
 @dp.message(Command("ping"))
@@ -155,8 +165,10 @@ async def list_cmd(message: Message):
         return
     lines = []
     for r in items:
-        lines.append(f"• {r['text']} — {r['remind_dt'].strftime('%d.%m %H:%M')} ({TZ}) "
-                     + (f"[{r['repeat']}]" if r['repeat']!='none' else ""))
+        lines.append(
+            f"• {r['text']} — {r['remind_dt'].strftime('%d.%m %H:%M')} ({TZ}) "
+            + (f"[{r['repeat']}]" if r['repeat']!='none' else "")
+        )
     await message.answer("\n".join(lines))
 
 # --------- ЕДИНЫЙ обработчик текста (новое/уточнение) ---------
@@ -165,7 +177,7 @@ async def on_any_text(message: Message):
     uid = message.from_user.id
     text = message.text.strip()
 
-    # Если ждём уточнение времени — обрабатываем прямо здесь
+    # Если ждём уточнение
     if uid in PENDING:
         dt = as_local_iso(text)
         if not dt:
@@ -178,7 +190,7 @@ async def on_any_text(message: Message):
         await message.reply(f"Принял. Напомню: «{reminder['text']}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
         return
 
-    # Иначе — обычное новое сообщение
+    # Новая задача
     await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     plan = await gpt_parse(text)
 
@@ -230,4 +242,28 @@ async def on_image(message: Message):
     file = await bot.get_file(file_id)
     buf = await bot.download_file(file.file_path)
     buf.seek(0)
-    text = await ocr_sp_
+    text = await ocr_space_image(buf.read())
+    if not text:
+        await message.reply("Не удалось прочитать текст на изображении.")
+        return
+    # Переиспользуем общий путь
+    await on_any_text(Message.model_construct(**{**message.model_dump(), "text": text}))
+
+# --------- ЗАПУСК (с метками) ---------
+async def main():
+    print("STEP: starting scheduler...")
+    scheduler.start()
+    print("STEP: scheduler started")
+    print("STEP: start polling...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        print("STEP: asyncio.run(main())")
+        asyncio.run(main())
+    except Exception as e:
+        import traceback, time
+        print("FATAL:", e)
+        traceback.print_exc()
+        time.sleep(120)
+        raise
