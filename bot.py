@@ -168,17 +168,17 @@ def parse_same_time_phrase(raw_text: str):
     print(f"[SAME] +{days}d → {target}")
     return target, remainder
 
-# ---------- «СЕГОДНЯ/ЗАВТРА/ПОСЛЕЗАВТРА В HH[:MM] (утра/дня/вечера/ночи)» ----------
+# ---------- «СЕГОДНЯ/ЗАВТРА/ПОСЛЕЗАВТРА … В HH[:MM] (утра/дня/вечера/ночи)» ----------
+# допускаем ЛЮБОЙ текст между «завтра» и «в 5»: «завтра свадьба в 5»
 DAYTIME_RX = re.compile(
-    r"\b(сегодня|завтра|послезавтра)\s*в\s*(\d{1,2})(?::(\d{2}))?(?:\s*(утра|дня|вечера|ночи))?\b",
-    re.IGNORECASE | re.UNICODE
+    r"\b(сегодня|завтра|послезавтра)\b.*?\bв\s*(\d{1,2})(?::(\d{2}))?(?:\s*(утра|дня|вечера|ночи))?\b",
+    re.IGNORECASE | re.UNICODE | re.DOTALL
 )
 
 def parse_daytime_phrase(raw_text: str):
     """
-    Если без 'утра/вечера/ночи' — двусмысленно → вернём варианты (утро и вечер).
     Возвращает:
-      ("amb", remainder, [dt1, dt2])  — двусмысленно
+      ("amb", remainder, [dt1, dt2])  — двусмысленно (предложить кнопки)
       ("ok", dt, remainder)           — точное время
       None                            — не совпало
     """
@@ -200,8 +200,8 @@ def parse_daytime_phrase(raw_text: str):
     else:
         base = now + timedelta(days=2)
 
-    def clamp(h, m):
-        return max(0, min(h, 23)), max(0, min(m, 59))
+    def clamp(h, mm):
+        return max(0, min(h, 23)), max(0, min(mm, 59))
 
     remainder = (s[:m.start()] + s[m.end():]).strip(" ,.-")
 
@@ -217,14 +217,12 @@ def parse_daytime_phrase(raw_text: str):
         print(f"[DAYTIME] exact {day_word} {h:02d}:{minute2:02d} → {target}")
         return ("ok", target, remainder)
 
-    # без уточнения — предлагаем 2 кнопки: утром и вечером
-    # вариант 1: утро (как есть)
-    h1, m1 = clamp(hour_raw, minute)
+    # без уточнения — предлагаем 2 кнопки (утро/вечер)
+    h1, m1 = clamp(hour_raw, minute)  # утро
     dt1 = base.replace(hour=h1, minute=m1)
-    # вариант 2: вечер (hour + 12) — для 12 → 12 оставим как 12 (днём), а как альтернативу дадим 00:00?
-    # Проще и понятнее: если 1..11 → +12; если 12 → 12 и 00:00.
+
     if hour_raw == 12:
-        h2 = 0
+        h2 = 0  # альтернатива для «12» — 00:00
     else:
         h2 = (hour_raw + 12) % 24
     h2, m2 = clamp(h2, minute)
@@ -299,7 +297,7 @@ async def start(message: Message):
     await message.answer(
         "Привет! Я бот-напоминалка.\n"
         "• Пиши: «Запись к стоматологу сегодня 14:25», «напомни через 3 минуты помыться», "
-        "«завтра в 5 позвонить» (если двусмысленно — предложу кнопки)\n"
+        "«завтра свадьба в 5» — если двусмысленно, предложу кнопки.\n"
         "• Пришли голосовое/скрин — я распознаю.\n"
         "• /ping — проверка, жив ли бот.\n"
         "• /list — список напоминаний (в текущей сессии)."
@@ -333,12 +331,12 @@ async def on_any_text(message: Message):
 
     # 1) если ждём уточнение
     if uid in PENDING:
-        # если ждём выбор из вариантов (кнопки уже были) — подскажем нажать кнопку
+        # если уже ждём выбор из вариантов — просим нажать кнопку
         if PENDING[uid].get("variants"):
             await message.reply("Нажмите одну из кнопок ниже, чтобы выбрать время ⬇️")
             return
 
-        # иначе пробуем понять время из текста
+        # пытаемся понять время
         pack = parse_daytime_phrase(text)
         if pack:
             tag = pack[0]
@@ -347,9 +345,8 @@ async def on_any_text(message: Message):
                 desc = clean_description(remainder or text)
                 PENDING[uid] = {"description": desc, "variants": variants, "repeat": "none"}
                 kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text=dt.strftime("%d.%m %H:%M"),
-                        callback_data=f"time|{dt.isoformat()}")]
+                    [InlineKeyboardButton(text=dt.strftime("%d.%m %H:%M"),
+                                          callback_data=f"time|{dt.isoformat()}")]
                     for dt in variants
                 ])
                 await message.reply(f"Уточните, во сколько напомнить «{desc}»?", reply_markup=kb)
@@ -368,7 +365,6 @@ async def on_any_text(message: Message):
         if rel:
             dt, remainder = rel
             draft = PENDING.pop(uid)
-            # если есть новое описание — считаем новой задачей
             desc = clean_description(remainder or draft.get("description","Напоминание"))
             reminder = {"user_id": uid, "text": desc, "remind_dt": dt, "repeat": draft.get("repeat","none")}
             REMINDERS.append(reminder)
@@ -387,7 +383,6 @@ async def on_any_text(message: Message):
             await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
             return
 
-        # ещё попытка — свободный парс
         dt = as_local_iso(text)
         if dt:
             draft = PENDING.pop(uid)
@@ -398,7 +393,7 @@ async def on_any_text(message: Message):
             await message.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
             return
 
-        await message.reply("Не понял время. Пример: «завтра в 5», «через минуту» или «25.08 14:25».")
+        await message.reply("Не понял время. Пример: «завтра свадьба в 5», «через минуту» или «25.08 14:25».")
         return
 
     # 2) новая фраза — порядок: daytime → relative → same-time → GPT
@@ -410,9 +405,8 @@ async def on_any_text(message: Message):
             desc = clean_description(remainder or text)
             PENDING[uid] = {"description": desc, "variants": variants, "repeat": "none"}
             kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text=dt.strftime("%d.%m %H:%M"),
-                    callback_data=f"time|{dt.isoformat()}")]
+                [InlineKeyboardButton(text=dt.strftime("%d.%m %H:%M"),
+                                      callback_data=f"time|{dt.isoformat()}")]
                 for dt in variants
             ])
             await message.reply(f"Уточните, во сколько напомнить «{desc}»?", reply_markup=kb)
@@ -493,11 +487,10 @@ async def on_time_choice(cb: CallbackQuery):
     REMINDERS.append(reminder)
     schedule_one(reminder)
 
-    # заменим сообщение с кнопками на подтверждение
     try:
-        await cb.message.edit_text(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%м %H:%M')} ({TZ})")
+        await cb.message.edit_text(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
     except Exception:
-        await cb.message.answer(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%м %H:%M')} ({TZ})")
+        await cb.message.answer(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({TZ})")
     await cb.answer("Установлено ✅")
 
 # ---- войсы ----
