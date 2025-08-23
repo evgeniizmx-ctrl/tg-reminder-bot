@@ -33,6 +33,10 @@ def clean_desc(s: str) -> str:
     s = re.sub(r"^(о|про|насч[её]т)\s+", "", s, flags=re.I)
     return s.strip() or "Напоминание"
 
+def fmt_dt(dt: datetime) -> str:
+    # ЕДИНЫЙ формат отображения времени
+    return f"{dt.strftime('%d.%m')} в {dt.strftime('%H:%M')} ({APP_TZ})"
+
 async def send_reminder(uid: int, text: str):
     try:
         await bot.send_message(uid, f"🔔 Напоминание: {text}")
@@ -151,46 +155,36 @@ RX_DAY_OF_MONTH = re.compile(
     re.I
 )
 
-# поиск части суток где угодно
 RX_ANY_MER = re.compile(r"\b(утром|дн[её]м|дня|вечером|ночью|ночи)\b", re.I)
 
 # --------- HELPERS ---------
 def hour_is_unambiguous(h: int) -> bool:
-    """13..23 или 0 — считаем однозначным 24-часовым временем."""
-    return h >= 13 or h == 0
+    return h >= 13 or h == 0  # 13..23 или 00
 
 def part_of_day_defaults(word: str) -> int:
-    """
-    дефолтные часы для части суток:
-    утром → 9, днём → 13, вечером → 19, ночью → 1
-    """
     w = word.lower()
     if w.startswith("утр"):   return 9
     if w.startswith("дн"):    return 13   # днём/днем/дня
     if w.startswith("веч"):   return 19
-    return 1  # ночь/ночью/ночи
+    return 1  # ночью/ночи
 
 def apply_meridian(h: int, mer: str | None) -> int:
     if not mer: return h
     mer = mer.lower()
-    if mer.startswith("дн"):      # днём/днем/дня
-        return h + 12 if h < 12 else h
-    if mer.startswith("веч"):     # вечером
-        return h + 12 if h < 12 else h
-    if mer.startswith("ноч"):     # ночью/ночи
-        return 0 if h == 12 else h  # «12 ночи» → 0:00
+    if mer.startswith("дн"):   return h + 12 if h < 12 else h
+    if mer.startswith("веч"):  return h + 12 if h < 12 else h
+    if mer.startswith("ноч"):  return 0 if h == 12 else h
     return h  # утром — без сдвига
 
 def text_looks_like_new_request(s: str) -> bool:
-    """Новая фраза, с которой можно выйти из режима уточнения."""
     s = norm(s).lower()
     if re.search(r"\bчерез\b", s): return True
     if re.search(r"\b(сегодня|завтра|послезавтра)\b", s): return True
     if re.search(r"\b\d{1,2}[./-]\d{1,2}([./-]\d{2,4})?", s): return True
-    if re.search(r"\b\d{1,2}\s+[а-яё]+", s): return True  # «24 мая», «1 числа»
+    if re.search(r"\b\d{1,2}\s+[а-яё]+", s): return True
     if re.search(r"\bв\s*\d{1,2}\s*час(ов|а)?\b", s): return True
     if re.search(r"\bв\s*\d{1,2}(?::\d{2})?\s*(утром|дн[её]м|дня|вечером|ночью|ночи)\b", s): return True
-    if re.search(r"\bв\s*(?:1[3-9]|2[0-3]|00)\b", s): return True  # 13..23|00
+    if re.search(r"\bв\s*(?:1[3-9]|2[0-3]|00)\b", s): return True
     return False
 
 # --------- PARSERS ---------
@@ -236,7 +230,6 @@ def parse_same_time(text: str):
 def parse_dayword_time(text: str):
     s = norm(text); now = datetime.now(tz).replace(second=0, microsecond=0)
 
-    # Вариант: «сегодня/завтра/послезавтра в HH[:MM] [меридиан]»
     m = RX_DAY_WORD_TIME.search(s)
     if m:
         word = m.group(1).lower()
@@ -264,7 +257,6 @@ def parse_dayword_time(text: str):
         rest = (s[:m.start()] + s[m.end():]).strip(" ,.-")
         return ("amb", rest, soonest([v1, v2]))
 
-    # Вариант: «сегодня/завтра/послезавтра утром/днём/вечером/ночью» (без числа)
     m2 = RX_DAY_WORD_ONLY.search(s)
     if m2:
         word = m2.group(1).lower()
@@ -285,7 +277,6 @@ def parse_only_time(text: str):
     now = datetime.now(tz).replace(second=0, microsecond=0)
     h = int(m.group(1)); mm = int(m.group(2) or 0)
 
-    # если где-то в тексте есть часть суток — используем её
     mer_m = RX_ANY_MER.search(s)
     if mer_m:
         mer = mer_m.group(1)
@@ -330,7 +321,6 @@ def parse_dot_date(text: str):
         return None
     rest = RX_DOT_DATE.sub("", s, count=1).strip(" ,.-")
 
-    # если нет времени, но есть часть суток у всей фразы — ставим дефолт
     if not hh:
         mer_m = RX_ANY_MER.search(s)
         if mer_m:
@@ -446,7 +436,7 @@ async def cmd_list(m: Message):
         await m.answer("Пока нет напоминаний (в этой сессии).")
         return
     items = sorted(items, key=lambda r: r["remind_dt"])
-    lines = [f"• {r['text']} — {r['remind_dt'].strftime('%d.%m %H:%M')} ({APP_TZ})" for r in items]
+    lines = [f"• {r['text']} — {fmt_dt(r['remind_dt'])}" for r in items]
     await m.answer("\n".join(lines))
 
 # --------- MAIN HANDLER ---------
@@ -472,7 +462,6 @@ async def on_text(m: Message):
         elif st.get("base_date"):
             mt = re.search(r"(?:^|\bв\s*)(\d{1,2})(?::(\d{2}))?\s*(утром|дн[её]м|дня|вечером|ночью|ночи)?\b", text, re.I)
             if not mt:
-                # попробуем «утром/вечером» без числа
                 mer_m = RX_ANY_MER.search(text)
                 if mer_m:
                     h = part_of_day_defaults(mer_m.group(1)); minute = 0
@@ -489,18 +478,17 @@ async def on_text(m: Message):
             PENDING.pop(uid, None)
             REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
             plan(REMINDERS[-1])
-            await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
+            await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
             return
         # если дошли сюда — PENDING очищен, продолжим как новое сообщение
 
-    # ПОРЯДОК ВАЖЕН:
     # 1) относительное
     r = parse_relative(text)
     if r:
         dt, rest = r; desc = clean_desc(rest or text)
         REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
         plan(REMINDERS[-1])
-        await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
+        await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
         return
 
     # 2) в это же время …
@@ -509,7 +497,7 @@ async def on_text(m: Message):
         dt, rest = r; desc = clean_desc(rest or text)
         REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
         plan(REMINDERS[-1])
-        await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
+        await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
         return
 
     # 3) сегодня/завтра/послезавтра …
@@ -520,7 +508,7 @@ async def on_text(m: Message):
             _, dt, rest = r; desc = clean_desc(rest or text)
             REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
             plan(REMINDERS[-1])
-            await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%м %H:%M')} ({APP_TZ})")
+            await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
             return
         _, rest, variants = r
         desc = clean_desc(rest or text)
@@ -528,7 +516,7 @@ async def on_text(m: Message):
         await m.reply(f"Уточните, во сколько напомнить «{desc}»?", reply_markup=kb_variants(variants))
         return
 
-    # 4) конкретные даты (точно/амбиг/день с частью суток)
+    # 4) конкретные даты
     for parser in (parse_dot_date, parse_month_date, parse_day_of_month):
         r = parser(text)
         if r:
@@ -537,7 +525,7 @@ async def on_text(m: Message):
                 _, dt, rest = r; desc = clean_desc(rest or text)
                 REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
                 plan(REMINDERS[-1])
-                await m.reply(f"Готово. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
+                await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt(dt)}")
                 return
             if tag == "amb":
                 _, rest, variants = r; desc = clean_desc(rest or text)
@@ -549,13 +537,13 @@ async def on_text(m: Message):
             await m.reply(f"Окей, {base.strftime('%d.%m')}. В какое время?")
             return
 
-    # 5) «в HH часов» — однозначно
+    # 5) «в HH часов»
     r = parse_exact_hour(text)
     if r:
         dt, rest = r; desc = clean_desc(rest or text)
         REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
         plan(REMINDERS[-1])
-        await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
+        await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
         return
 
     # 6) «в HH[:MM]»
@@ -566,7 +554,7 @@ async def on_text(m: Message):
             _, dt, rest = r; desc = clean_desc(rest or text)
             REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
             plan(REMINDERS[-1])
-            await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
+            await m.reply(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
             return
         _, rest, variants = r; desc = clean_desc(rest or text)
         PENDING[uid] = {"description": desc, "variants": variants, "repeat":"none"}
@@ -594,9 +582,9 @@ async def choose_time(cb: CallbackQuery):
     REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
     plan(REMINDERS[-1])
     try:
-        await cb.message.edit_text(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
+        await cb.message.edit_text(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
     except Exception:
-        await cb.message.answer(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
+        await cb.message.answer(f"Принял. Напомню: «{desc}» {fmt_dt(dt)}")
     await cb.answer("Установлено ✅")
 
 # --------- RUN ---------
