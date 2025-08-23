@@ -72,13 +72,49 @@ def _order_by_soonest(variants: list[datetime]) -> list[datetime]:
 # Человеко-читаемая подпись для кнопок: «сегодня/завтра/ДД.ММ в H[:MM] утра/дня/вечера/ночи»
 def _human_label_for_variant(dt: datetime) -> str:
     now = datetime.now(tz)
-    dword = None
     if dt.date() == now.date():
-        dword = "сегодня"
+        dword = "Сегодня"
     elif dt.date() == (now + timedelta(days=1)).date():
-        dword = "завтра"
+        dword = "Завтра"
     else:
         dword = dt.strftime("%d.%m")
+
+    h = dt.hour
+    m = dt.minute
+    if 0 <= h <= 4:
+        mer = "ночи"
+    elif 5 <= h <= 11:
+        mer = "утра"
+    elif 12 <= h <= 16:
+        mer = "дня"
+    else:
+        mer = "вечера"
+
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+
+    tpart = f"{h12}:{m:02d}" if m else f"{h12}"
+    return f"{dword} в {tpart} {mer}"
+
+
+    h = dt.hour
+    m = dt.minute
+    if 0 <= h <= 4:
+        mer = "ночи"
+    elif 5 <= h <= 11:
+        mer = "утра"
+    elif 12 <= h <= 16:
+        mer = "дня"
+    else:
+        mer = "вечера"
+
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+
+    tpart = f"{h12}:{m:02d}" if m else f"{h12}"
+    return f"{dword} в {tpart} {mer}"
 
     h = dt.hour
     m = dt.minute
