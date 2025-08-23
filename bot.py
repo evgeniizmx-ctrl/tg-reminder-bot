@@ -22,8 +22,8 @@ scheduler = AsyncIOScheduler(timezone=APP_TZ)
 # PENDING[user_id] = {
 #   "description": str,
 #   "repeat": "none",
-#   "variants": [datetime],        # двусмысленности
-#   "base_date": date              # ждём только время
+#   "variants": [datetime],        # если нужно выбрать из двух
+#   "base_date": date              # если ждём только время
 # }
 PENDING: dict[int, dict] = {}
 REMINDERS: list[dict] = []
@@ -77,7 +77,8 @@ def human_label(dt: datetime) -> str:
         mer = "вечера"
 
     h12 = h % 12
-    if h12 == 0: h12 = 12
+    if h12 == 0:
+        h12 = 12
     t = f"{h12}:{m:02d}" if m else f"{h12}"
     return f"{dword} в {t} {mer}"
 
@@ -90,35 +91,31 @@ def kb_variants(dts: list[datetime]) -> InlineKeyboardMarkup:
 
 # ================== РУССКИЕ МЕСЯЦЫ ==================
 MONTHS = {
-    # родительный -> номер
+    # родительный
     "января":1, "февраля":2, "марта":3, "апреля":4, "мая":5, "июня":6,
     "июля":7, "августа":8, "сентября":9, "октября":10, "ноября":11, "декабря":12,
-    # именительный/винительный — народ часто так пишет
+    # часто пишут в именительном
     "январь":1,"февраль":2,"март":3,"апрель":4,"май":5,"июнь":6,"июль":7,
     "август":8,"сентябрь":9,"октябрь":10,"ноябрь":11,"декабрь":12,
 }
 
 def nearest_future_day(day: int, now: datetime) -> date:
     y, m = now.year, now.month
-    # сначала попытка в текущем месяце
     try:
         cand = date(y, m, day)
         if cand > now.date():
             return cand
     except ValueError:
         pass
-    # иначе — следующий месяц
     if m == 12:
         y2, m2 = y + 1, 1
     else:
         y2, m2 = y, m + 1
-    # ограничим переполнение
     for dcap in (31, 30, 29, 28):
         try:
             return date(y2, m2, min(day, dcap))
         except ValueError:
             continue
-    # fallback
     return date(y2, m2, 28)
 
 # ================== ПАРСЕРЫ ==================
@@ -241,7 +238,6 @@ def parse_dayword_time(text: str):
     # двусмысленно: 7 -> 07:00 или 19:00
     v1 = mk_dt(base, h % 24, mm)
     v2 = mk_dt(base, (h + 12) % 24, mm)
-    # если речь про сегодня, и время прошло — на завтра
     if base == now.date():
         if v1 <= now: v1 = v1 + timedelta(days=1)
         if v2 <= now: v2 = v2 + timedelta(days=1)
@@ -287,14 +283,22 @@ def parse_dot_date(text: str):
     except ValueError:
         return None
 
+    rest = RX_DOT_DATE.sub("", s, count=1).strip(" ,.-")
+
     if hh:
-        h = apply_meridian(int(hh), mer)
+        h = int(hh)
         minute = int(minu or 0)
-        dt = mk_dt(base, h, minute)
-        rest = RX_DOT_DATE.sub("", s, count=1).strip(" ,.-")
-        return ("ok", dt, rest)
+        if mer:
+            # однозначно
+            h = apply_meridian(h, mer)
+            dt = mk_dt(base, h, minute)
+            return ("ok", dt, rest)
+        else:
+            # двусмысленно -> две кнопки на ЭТУ дату
+            dt1 = mk_dt(base, h % 24, minute)
+            dt2 = mk_dt(base, (h + 12) % 24, minute)
+            return ("amb", rest, soonest([dt1, dt2]))
     else:
-        rest = RX_DOT_DATE.sub("", s, count=1).strip(" ,.-")
         return ("day", base, rest)
 
 def parse_month_date(text: str):
@@ -302,12 +306,16 @@ def parse_month_date(text: str):
     m = RX_MONTH_DATE.search(s)
     if not m:
         return None
+
     dd = int(m.group(1))
     mon = m.group(2).lower()
     if mon not in MONTHS:
         return None
     mm = MONTHS[mon]
-    hh = m.group(3); minu = m.group(4); mer = m.group(5)
+
+    hh = m.group(3)
+    minu = m.group(4)
+    mer = (m.group(5) or "").lower() if m.group(5) else None
 
     now = datetime.now(tz)
     yyyy = now.year
@@ -315,21 +323,26 @@ def parse_month_date(text: str):
         base = date(yyyy, mm, dd)
     except ValueError:
         return None
-    # если дата уже прошла — следующий год
     if base < now.date():
         try:
             base = date(yyyy + 1, mm, dd)
         except ValueError:
             return None
 
+    rest = RX_MONTH_DATE.sub("", s, count=1).strip(" ,.-")
+
     if hh:
-        h = apply_meridian(int(hh), mer)
+        h = int(hh)
         minute = int(minu or 0)
-        dt = mk_dt(base, h, minute)
-        rest = RX_MONTH_DATE.sub("", s, count=1).strip(" ,.-")
-        return ("ok", dt, rest)
+        if mer:
+            h = apply_meridian(h, mer)
+            dt = mk_dt(base, h, minute)
+            return ("ok", dt, rest)
+        else:
+            dt1 = mk_dt(base, h % 24, minute)
+            dt2 = mk_dt(base, (h + 12) % 24, minute)
+            return ("amb", rest, soonest([dt1, dt2]))
     else:
-        rest = RX_MONTH_DATE.sub("", s, count=1).strip(" ,.-")
         return ("day", base, rest)
 
 def parse_day_of_month(text: str):
@@ -337,20 +350,29 @@ def parse_day_of_month(text: str):
     m = RX_DAY_OF_MONTH.search(s)
     if not m:
         return None
+
     dd = int(m.group(1))
-    hh = m.group(2); minu = m.group(3); mer = m.group(4)
+    hh = m.group(2)
+    minu = m.group(3)
+    mer = (m.group(4) or "").lower() if m.group(4) else None
 
     now = datetime.now(tz)
     base = nearest_future_day(dd, now)
 
+    rest = RX_DAY_OF_MONTH.sub("", s, count=1).strip(" ,.-")
+
     if hh:
-        h = apply_meridian(int(hh), mer)
+        h = int(hh)
         minute = int(minu or 0)
-        dt = mk_dt(base, h, minute)
-        rest = RX_DAY_OF_MONTH.sub("", s, count=1).strip(" ,.-")
-        return ("ok", dt, rest)
+        if mer:
+            h = apply_meridian(h, mer)
+            dt = mk_dt(base, h, minute)
+            return ("ok", dt, rest)
+        else:
+            dt1 = mk_dt(base, h % 24, minute)
+            dt2 = mk_dt(base, (h + 12) % 24, minute)
+            return ("amb", rest, soonest([dt1, dt2]))
     else:
-        rest = RX_DAY_OF_MONTH.sub("", s, count=1).strip(" ,.-")
         return ("day", base, rest)
 
 # ================== КОМАНДЫ ==================
@@ -384,14 +406,13 @@ async def on_text(m: Message):
     uid = m.from_user.id
     text = norm(m.text)
 
-    # --- если ждём уточнение ---
+    # если ждём уточнение
     if uid in PENDING:
         st = PENDING[uid]
         if st.get("variants"):
             await m.reply("Нажмите кнопку ниже ⬇️")
             return
         if st.get("base_date"):
-            # ждём только время
             mt = re.search(r"(?:^|\bв\s*)(\d{1,2})(?::(\d{2}))?\s*(утра|дня|вечера|ночи)?\b", text, re.I)
             if not mt:
                 await m.reply("Во сколько?")
@@ -405,10 +426,9 @@ async def on_text(m: Message):
             plan(REMINDERS[-1])
             await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
             return
-        # если почему-то попали сюда — сброс
         PENDING.pop(uid, None)
 
-    # --- «через …» ---
+    # «через …»
     r = parse_relative(text)
     if r:
         dt, rest = r
@@ -418,7 +438,7 @@ async def on_text(m: Message):
         await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
         return
 
-    # --- «в это же время …» ---
+    # «в это же время …»
     r = parse_same_time(text)
     if r:
         dt, rest = r
@@ -428,7 +448,7 @@ async def on_text(m: Message):
         await m.reply(f"Принял. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
         return
 
-    # --- «сегодня/завтра/послезавтра в …» ---
+    # «сегодня/завтра/послезавтра в …»
     r = parse_dayword_time(text)
     if r:
         tag = r[0]
@@ -447,7 +467,7 @@ async def on_text(m: Message):
                           reply_markup=kb_variants(variants))
             return
 
-    # --- только время «в 7[:30] …» ---
+    # только время «в 7[:30] …»
     r = parse_only_time(text)
     if r:
         tag = r[0]
@@ -466,7 +486,7 @@ async def on_text(m: Message):
                           reply_markup=kb_variants(variants))
             return
 
-    # --- дата через точки «DD.MM[.YYYY] [в HH[:MM] …]» ---
+    # дата через точки «DD.MM[.YYYY] [в HH[:MM] …]»
     r = parse_dot_date(text)
     if r:
         tag = r[0]
@@ -477,6 +497,13 @@ async def on_text(m: Message):
             plan(REMINDERS[-1])
             await m.reply(f"Готово. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
             return
+        elif tag == "amb":
+            _, rest, variants = r
+            desc = clean_desc(rest or text)
+            PENDING[uid] = {"description": desc, "variants": variants, "repeat":"none"}
+            await m.reply(f"Уточните, во сколько напомнить «{desc}»?",
+                          reply_markup=kb_variants(variants))
+            return
         else:
             _, base, rest = r
             desc = clean_desc(rest or text)
@@ -484,7 +511,7 @@ async def on_text(m: Message):
             await m.reply(f"Окей, {base.strftime('%d.%m')}. В какое время?")
             return
 
-    # --- «DD месяца [в HH[:MM] …]» ---
+    # «DD месяца [в HH[:MM] …]»
     r = parse_month_date(text)
     if r:
         tag = r[0]
@@ -495,6 +522,13 @@ async def on_text(m: Message):
             plan(REMINDERS[-1])
             await m.reply(f"Готово. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
             return
+        elif tag == "amb":
+            _, rest, variants = r
+            desc = clean_desc(rest or text)
+            PENDING[uid] = {"description": desc, "variants": variants, "repeat":"none"}
+            await m.reply(f"Уточните, во сколько напомнить «{desc}»?",
+                          reply_markup=kb_variants(variants))
+            return
         else:
             _, base, rest = r
             desc = clean_desc(rest or text)
@@ -502,7 +536,7 @@ async def on_text(m: Message):
             await m.reply(f"Окей, {base.strftime('%d.%m')}. В какое время?")
             return
 
-    # --- «N числа [в HH[:MM] …]» ---
+    # «N числа [в HH[:MM] …]»
     r = parse_day_of_month(text)
     if r:
         tag = r[0]
@@ -513,6 +547,13 @@ async def on_text(m: Message):
             plan(REMINDERS[-1])
             await m.reply(f"Готово. Напомню: «{desc}» в {dt.strftime('%d.%m %H:%M')} ({APP_TZ})")
             return
+        elif tag == "amb":
+            _, rest, variants = r
+            desc = clean_desc(rest or text)
+            PENDING[uid] = {"description": desc, "variants": variants, "repeat":"none"}
+            await m.reply(f"Уточните, во сколько напомнить «{desc}»?",
+                          reply_markup=kb_variants(variants))
+            return
         else:
             _, base, rest = r
             desc = clean_desc(rest or text)
@@ -520,9 +561,7 @@ async def on_text(m: Message):
             await m.reply(f"Окей, {base.strftime('%d.%m')}. В какое время?")
             return
 
-    # --- ничего не распознали ---
     await m.reply("Не понял дату/время. Примеры: «24.05 19:00», «24 мая в 19», «1 числа в 7», «через 30 минут», «завтра в 6».")
-
 # ================== КНОПКИ ==================
 @dp.callback_query(F.data.startswith("time|"))
 async def choose_time(cb: CallbackQuery):
