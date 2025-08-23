@@ -20,44 +20,59 @@ except Exception:
     OpenAI = None
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")   # для парсинга текста
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")   # STT
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")   # парсер текста
+WHISPER_MODEL  = os.getenv("WHISPER_MODEL", "whisper-1")    # STT
 
 # ========= Telegram / TZ =========
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_TZ_NAME = os.getenv("APP_TZ", "Europe/Moscow")       # фолбэк до выбора пользователем
-BASE_TZ = pytz.timezone(BASE_TZ_NAME)
+BOT_TOKEN    = os.getenv("BOT_TOKEN")
+BASE_TZ_NAME = os.getenv("APP_TZ", "Europe/Moscow")
+BASE_TZ      = pytz.timezone(BASE_TZ_NAME)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
 bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
-
+dp  = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# планировщик — будем передавать aware-время
 scheduler = AsyncIOScheduler(timezone=BASE_TZ)
 
 # ========= In-memory (MVP) =========
 REMINDERS: list[dict] = []             # {"user_id","text","remind_dt","repeat"}
 PENDING: dict[int, dict] = {}          # {"description","candidates":[iso,...]}
-USER_TZS: dict[int, str] = {}          # user_id -> IANA или "UTC+<minutes>"
+USER_TZS: dict[int, str] = {}          # user_id -> IANA | "UTC+<minutes>"
 
-# ========= FFmpeg path resolve =========
+# ========= FFmpeg path resolve + smoke =========
 def resolve_ffmpeg_path() -> str:
+    # 1) ENV приоритет
     env = os.getenv("FFMPEG_PATH")
-    if env and os.path.exists(env):
-        return env
+    if env:
+        return os.path.realpath(env)
+    # 2) which ffmpeg
     found = shutil.which("ffmpeg")
     if found:
-        return found
-    # brew default on Apple Silicon
-    return "/opt/homebrew/bin/ffmpeg"
+        return os.path.realpath(found)
+    # 3) типичный brew-путь (realpath на случай симлинка)
+    return os.path.realpath("/opt/homebrew/bin/ffmpeg")
 
 FFMPEG_PATH = resolve_ffmpeg_path()
 print(f"[init] Using ffmpeg at: {FFMPEG_PATH}")
+
+async def _smoke_ffmpeg():
+    if not os.path.exists(FFMPEG_PATH):
+        raise FileNotFoundError(f"ffmpeg not found at {FFMPEG_PATH}")
+    if not os.access(FFMPEG_PATH, os.X_OK):
+        raise PermissionError(f"ffmpeg is not executable at {FFMPEG_PATH}")
+
+    proc = await asyncio.create_subprocess_exec(
+        FFMPEG_PATH, "-version",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg smoke failed (code={proc.returncode})\n{(err or b'').decode(errors='ignore')}")
+    print("[init] ffmpeg ok:", (out or b"").decode(errors="ignore").splitlines()[0])
 
 # ========= TZ helpers =========
 RU_TZ_CHOICES = [
@@ -87,7 +102,7 @@ def parse_user_tz_string(s: str):
         return pytz.timezone(s)
     except Exception:
         pass
-    # +HH[:MM] (знак по умолчанию '+')
+    # +HH[:MM]
     m = OFFSET_FLEX_RX.match(s)
     if not m:
         return None
@@ -134,7 +149,7 @@ def clean_desc(s: str) -> str:
     return s.strip() or "Напоминание"
 
 def fmt_dt_local(dt: datetime) -> str:
-    return f"{dt.strftime('%d.%m')} в {dt.strftime('%H:%M')}"  # без TZ
+    return f"{dt.strftime('%d.%m')} в {dt.strftime('%H:%M')}"
 
 def as_local_for(uid: int, dt_iso: str) -> datetime:
     user_tz = get_user_tz(uid)
@@ -169,7 +184,7 @@ async def send_reminder(uid: int, text: str):
     except Exception as e:
         print("send_reminder error:", e)
 
-# ========= LLM parser (text → JSON) =========
+# ========= LLM parser =========
 SYSTEM_PROMPT = """Ты — интеллектуальный парсер напоминаний на русском языке.
 Возвращай строго JSON:
 {
@@ -323,22 +338,14 @@ async def cb_time(cb: CallbackQuery):
 # ========= VOICE / AUDIO (Whisper) =========
 voice_router = Router()
 dp.include_router(voice_router)
-
 oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if OpenAI else None
 
 async def ogg_to_wav(src_ogg: str, dst_wav: str) -> None:
-    """
-    Конвертация OGG/OPUS -> WAV 16 kHz mono.
-    Логируем stderr, чтобы видеть реальную причину сбоя.
-    """
+    """OGG/OPUS -> WAV 16kHz mono с подробным stderr."""
     proc = await asyncio.create_subprocess_exec(
-        FFMPEG_PATH,
-        "-nostdin", "-loglevel", "error",
-        "-y", "-i", src_ogg,
-        "-ac", "1", "-ar", "16000",
-        dst_wav,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        FFMPEG_PATH, "-nostdin", "-loglevel", "error",
+        "-y", "-i", src_ogg, "-ac", "1", "-ar", "16000", dst_wav,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     out, err = await proc.communicate()
     if proc.returncode != 0:
@@ -351,9 +358,7 @@ async def transcribe_file_to_text(path: str, lang: str = "ru") -> str:
     def _run():
         with open(path, "rb") as f:
             r = oa_client.audio.transcriptions.create(
-                model=WHISPER_MODEL,
-                file=f,
-                language=lang
+                model=WHISPER_MODEL, file=f, language=lang
             )
         return (r.text or "").strip()
     return await loop.run_in_executor(None, _run)
@@ -369,7 +374,7 @@ async def on_voice(m: Message):
         ogg_path = f"{tmpd}/in.ogg"
         wav_path = f"{tmpd}/in.wav"
 
-        # aiogram v3: правильная загрузка файла
+        # aiogram v3 загрузка
         await m.bot.download(tg_file, destination=ogg_path)
 
         size = os.path.getsize(ogg_path)
@@ -412,10 +417,7 @@ async def on_voice(m: Message):
 
 @voice_router.message(F.audio)
 async def on_audio(m: Message):
-    """
-    Альтернатива: обычные аудиофайлы (mp3/m4a/webm) — без конвертации.
-    Удобно для проверки канала до Whisper.
-    """
+    """Обычные аудио (mp3/m4a/webm) — без ffmpeg, для проверки канала до Whisper."""
     uid = m.from_user.id
     if need_tz(uid):
         await ask_tz(m); return
@@ -454,6 +456,7 @@ async def on_audio(m: Message):
 
 # ========= RUN =========
 async def main():
+    await _smoke_ffmpeg()   # проверим ffmpeg до запуска бота
     scheduler.start()
     await dp.start_polling(bot)
 
