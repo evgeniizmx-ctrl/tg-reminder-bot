@@ -18,8 +18,9 @@ from telegram.ext import (
 )
 from openai import OpenAI
 
-# ============ Logging & env ============
-
+# =====================
+# Logging & env
+# =====================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 def _extract_token(raw: str | None) -> str:
@@ -58,8 +59,9 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ============ Time helpers ============
-
+# =====================
+# Time helpers
+# =====================
 def tz_from_offset(off: str) -> timezone:
     off = off.strip()
     if re.fullmatch(r"[+-]\d{1,2}$", off):
@@ -95,8 +97,9 @@ def bump_to_future(iso_when: str) -> str:
     except Exception:
         return iso_when
 
-# ============ DB (SQLite) ============
-
+# =====================
+# DB (SQLite)
+# =====================
 class DB:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -187,8 +190,9 @@ class DB:
 
 db = DB(DB_PATH)
 
-# ============ Prompts ============
-
+# =====================
+# Prompts
+# =====================
 class PromptPack(BaseModel):
     system: str
     fewshot: List[dict] = []
@@ -217,8 +221,9 @@ except Exception as e:
         fewshot: list = []
     PROMPTS = _PP(system="Fallback system prompt", fewshot=[])
 
-# ============ LLM schema ============
-
+# =====================
+# LLM schema
+# =====================
 class ReminderOption(BaseModel):
     iso_datetime: str
     label: str
@@ -233,8 +238,9 @@ class LLMResult(BaseModel):
     need_confirmation: bool = False
     options: List[ReminderOption] = []
 
-# ============ OpenAI ============
-
+# =====================
+# OpenAI
+# =====================
 async def transcribe_voice(file_bytes: bytes, filename: str = "audio.ogg") -> str:
     f = io.BytesIO(file_bytes)
     f.name = filename if filename.endswith(".ogg") else (filename + ".ogg")
@@ -267,8 +273,9 @@ async def call_llm(text: str, user_tz: str) -> LLMResult:
         logging.exception("LLM JSON parse failed: %s\nRaw: %s", e, raw)
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
-# ============ Local relative-time parser (fixed) ============
-
+# =====================
+# Local relative-time parser
+# =====================
 REL_MIN  = re.compile(r"через\s+(?:минуту|1\s*мин(?:\.|ут)?)\b", re.I)
 REL_NSEC = re.compile(r"через\s+(\d+)\s*сек(?:унд|унды|ун|)?\b", re.I)
 REL_NMIN = re.compile(r"через\s+(\d+)\s*мин(?:ут|ы)?\b", re.I)
@@ -277,47 +284,38 @@ REL_NH   = re.compile(r"через\s+(\d+)\s*час(?:а|ов)?\b", re.I)
 REL_ND   = re.compile(r"через\s+(\d+)\s*д(ень|ня|ней)?\b", re.I)
 REL_WEEK = re.compile(r"через\s+недел(?:ю|ю)\b", re.I)
 
-def _clean_title(text: str) -> str:
-    t = text.strip()
+# служебные слова/фразы для фолбэк-очистки заголовка
+RX_JUNK = [
+    re.compile(r"\b(сегодня|завтра|послезавтра)\b", re.I),
+    re.compile(r"\b(утра|утром|вечером|днём|ночи|ночью)\b", re.I),
+    re.compile(r"\b(в|во)\s+\d{1,2}(:\d{2})?\b", re.I),
+    re.compile(r"\bчерез\s+\d+\s*(минут|мин|час(а|ов)?|д(ень|ня|ней)?)\b", re.I),
+    re.compile(r"\bчерез\s+полчаса\b", re.I),
+    re.compile(r"\bв\s+(понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)\b", re.I),
+    re.compile(r"[.,:;–—-]\s*$"),
+]
+
+def extract_title_fallback(text: str) -> str:
+    t = text
+    # выкидываем слова «напомни» и пр.
     t = re.sub(r"\b(напомни(ть)?|пожалуйста)\b", "", t, flags=re.I)
+    # убираем все служебные временные конструкции
+    for rx in RX_JUNK:
+        t = rx.sub("", t)
+    # убираем относительные «через …»
     for rx in (REL_MIN, REL_NSEC, REL_NMIN, REL_HALF, REL_NH, REL_ND, REL_WEEK):
         t = rx.sub("", t)
-    t = re.sub(r"\s{2,}", " ", t).strip(",. :")
-    return t or text or "Напоминание"
+    t = re.sub(r"\s{2,}", " ", t).strip(" ,.:;–—-")
+    # нормализуем «Падел» с маленькой
+    return t or "Напоминание"
 
-def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
-    tz = tz_from_offset(user_tz)
-    now = datetime.now(tz).replace(microsecond=0)
+def _clean_title_for_relative(text: str) -> str:
+    t = extract_title_fallback(text)
+    return t or "Напоминание"
 
-    m = REL_NSEC.search(text)
-    if m:
-        return (now + timedelta(seconds=int(m.group(1)))).isoformat()
-
-    m = REL_NMIN.search(text)
-    if m:
-        return (now + timedelta(minutes=int(m.group(1)))).isoformat()
-
-    if REL_HALF.search(text):
-        return (now + timedelta(minutes=30)).isoformat()
-
-    m = REL_NH.search(text)
-    if m:
-        return (now + timedelta(hours=int(m.group(1)))).isoformat()
-
-    m = REL_ND.search(text)
-    if m:
-        return (now + timedelta(days=int(m.group(1)))).isoformat()
-
-    if REL_WEEK.search(text):
-        return (now + timedelta(days=7)).isoformat()
-
-    if REL_MIN.search(text):
-        return (now + timedelta(minutes=1)).isoformat()
-
-    return None
-
-# ============ UI & keyboards ============
-
+# =====================
+# UI
+# =====================
 MENU_BTN_LIST = "📝 Список напоминаний"
 MENU_BTN_SETTINGS = "⚙️ Настройки"
 
@@ -335,8 +333,7 @@ def list_keyboard(items: List[sqlite3.Row], page: int, total_pages: int) -> Inli
     for r in items:
         rid = r["id"]
         rows.append([
-            InlineKeyboardButton("Через 10 мин", callback_data=f"lsn|10m|{rid}|p{page}"),
-            InlineKeyboardButton("Удалить", callback_data=f"ldel|{rid}|p{page}")
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"ldel|{rid}|p{page}")
         ])
     nav = []
     if page > 1:
@@ -355,8 +352,9 @@ def render_list_text(items: List[sqlite3.Row], page: int, total_pages: int) -> s
         lines.append(f"• {fmt_dt(r['due_at'])} — «{r['title']}»")
     return "\n".join(lines)
 
-# ============ Scheduling ============
-
+# =====================
+# Scheduling
+# =====================
 def cancel_job_if_exists(app: Application, rid: str):
     jobs = app.bot_data.setdefault("jobs", {})
     job = jobs.pop(rid, None)
@@ -405,8 +403,9 @@ def schedule_all_on_start(app: Application):
             pass
         schedule_job_for(app, r)
 
-# ============ TZ selection + Reply menu ============
-
+# =====================
+# TZ selection + Reply menu
+# =====================
 TZ_OPTIONS = [
     ("Калининград (+2)", "+02:00"),
     ("Москва (+3)", "+03:00"),
@@ -468,8 +467,9 @@ async def handle_tz_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Неверный формат. Введите, например: +3, +03:00 или -4:30")
 
-# ============ Reply-menu buttons handler ============
-
+# =====================
+# Reply-menu buttons handler
+# =====================
 async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text == MENU_BTN_LIST:
@@ -478,10 +478,10 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text == MENU_BTN_SETTINGS:
         await update.message.reply_text("Раздел «Настройки» в разработке.")
         return
-    # если это не наши кнопки — ничего не делаем (сообщение пойдёт в другой хэндлер)
 
-# ============ Core ============
-
+# =====================
+# Core
+# =====================
 async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PROMPTS
     try:
@@ -500,19 +500,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tz = context.user_data.get("tz", DEFAULT_TZ)
     text = update.message.text.strip()
 
+    # локальные "через N..."
     iso = try_parse_relative_local(text, user_tz)
     if iso:
-        title = _clean_title(text)
+        title = _clean_title_for_relative(text)
         iso = bump_to_future(iso)
         rid = db.add(update.effective_chat.id, title, user_tz, iso, origin=None)
         await update.message.reply_text(_ack_text(title, iso))
         schedule_job_for(context.application, db.get(rid))
         return
 
+    # LLM
     result = await call_llm(text, user_tz)
     if result.intent == "create_reminder" and result.fixed_datetime:
         iso = bump_to_future(result.fixed_datetime)
-        title = result.title or result.text_original or "Напоминание"
+        raw_title = (result.title or result.text_original or "").strip()
+        title = raw_title if (raw_title and not raw_title.lower().startswith("напоминан")) else extract_title_fallback(text)
         rid = db.add(update.effective_chat.id, title, user_tz, iso, origin=json.dumps(result.model_dump()))
         await update.message.reply_text(_ack_text(title, iso))
         schedule_job_for(context.application, db.get(rid))
@@ -533,7 +536,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     iso = try_parse_relative_local(text, user_tz)
     if iso:
-        title = _clean_title(text)
+        title = _clean_title_for_relative(text)
         iso = bump_to_future(iso)
         rid = db.add(update.effective_chat.id, title, user_tz, iso, origin=None)
         await update.message.reply_text(_ack_text(title, iso))
@@ -543,7 +546,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await call_llm(text, user_tz)
     if result.intent == "create_reminder" and result.fixed_datetime:
         iso = bump_to_future(result.fixed_datetime)
-        title = result.title or result.text_original or "Напоминание"
+        raw_title = (result.title or result.text_original or "").strip()
+        title = raw_title if (raw_title and not raw_title.lower().startswith("напоминан")) else extract_title_fallback(text)
         rid = db.add(update.effective_chat.id, title, user_tz, iso, origin=json.dumps(result.model_dump()))
         await update.message.reply_text(_ack_text(title, iso))
         schedule_job_for(context.application, db.get(rid))
@@ -556,8 +560,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Не понял. Скажи, например: «завтра в 15 позвонить маме».")
 
-# ============ List / Pagination ============
-
+# =====================
+# List / Pagination
+# =====================
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await render_list_page(update, context, page=1)
 
@@ -578,8 +583,9 @@ async def render_list_page(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
         q = update_or_query.callback_query
         await q.edit_message_text(text, reply_markup=kb)
 
-# ============ Callbacks ============
-
+# =====================
+# Callbacks
+# =====================
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data or ""
@@ -589,7 +595,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("pick|"):
             _, iso = data.split("|", 1)
             iso = bump_to_future(iso)
-            title = "Напоминание"
+            title = extract_title_fallback("Напоминание")
             user_tz = context.user_data.get("tz", DEFAULT_TZ)
             rid = db.add(query.message.chat_id, title, user_tz, iso)
             await query.edit_message_text(f"📅 Окей, напомню «{title}» {fmt_dt(iso)}")
@@ -633,26 +639,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await render_list_page(update, context, page=int(p))
             return
 
-        if data.startswith("lsn|"):
-            _, delta, rid, ptag = data.split("|", 3)
-            page = int(ptag.lstrip("p")) if ptag.startswith("p") else 1
-            row = db.get(rid)
-            if row and row["status"] == "active":
-                user_tz = row["tz"]
-                tz = tz_from_offset(user_tz)
-                now = datetime.now(tz)
-                if delta.endswith("m"):
-                    new_iso = (now + timedelta(minutes=int(delta[:-1]))).replace(microsecond=0).isoformat()
-                elif delta.endswith("h"):
-                    new_iso = (now + timedelta(hours=int(delta[:-1]))).replace(microsecond=0).isoformat()
-                else:
-                    new_iso = (now + timedelta(minutes=10)).replace(microsecond=0).isoformat()
-                db.update_due(rid, new_iso)
-                cancel_job_if_exists(context.application, rid)
-                schedule_job_for(context.application, db.get(rid))
-            await render_list_page(update, context, page=page)
-            return
-
         if data.startswith("ldel|"):
             _, rid, ptag = data.split("|", 2)
             page = int(ptag.lstrip("p")) if ptag.startswith("p") else 1
@@ -660,6 +646,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if row:
                 db.set_status(rid, "canceled")
                 cancel_job_if_exists(context.application, rid)
+            # обновим список на той же странице
             await render_list_page(update, context, page=page)
             return
 
@@ -670,17 +657,19 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# ============ Commands ============
-
+# =====================
+# Commands
+# =====================
 async def cmd_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_list(update, context)
 
-# ============ Main ============
-
+# =====================
+# Main
+# =====================
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # Schedule on start
+    # schedule on start
     schedule_all_on_start(app)
 
     # TZ + start
@@ -688,21 +677,21 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_tz_choice, pattern="^tz"))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^[+-]"), handle_tz_manual))
 
-    # Reply-menu handler — ТОЛЬКО на две кнопки
+    # reply-menu: только две кнопки
     menu_filter = (
         filters.Regex(f"^{re.escape(MENU_BTN_LIST)}$") |
         filters.Regex(f"^{re.escape(MENU_BTN_SETTINGS)}$")
     )
     app.add_handler(MessageHandler(menu_filter, handle_menu_buttons))
 
-    # Core
+    # core
     app.add_handler(CommandHandler("reload", reload_prompts))
     app.add_handler(CommandHandler("list", cmd_list_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(handle_callbacks, pattern="^(pick|snz|done|lp|lsn|ldel)"))
+    # callbacks
+    app.add_handler(CallbackQueryHandler(handle_callbacks, pattern="^(pick|snz|done|lp|ldel)"))
 
     async def on_error(update, context):
         logging.exception("PTB error: %s | update=%r", context.error, update)
