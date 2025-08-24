@@ -19,27 +19,42 @@ from openai import OpenAI
 # =====================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ENV
-TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+# -------- Token extraction & validation --------
+def _extract_token(raw: str | None) -> str:
+    if not raw:
+        return ""
+    raw = raw.strip()
+    # убрать невидимые символы/кавычки
+    raw = raw.replace("\u200b", "").replace("\u200c", "").replace("\uFEFF", "")
+    raw = raw.strip(" '\"")
+    # вытащить первый токен по паттерну
+    m = re.search(r"[0-9]+:[A-Za-z0-9_-]{30,}", raw)
+    return m.group(0) if m else raw
+
+RAW_TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+RAW_BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+TOKEN = _extract_token(RAW_TELEGRAM_TOKEN) or _extract_token(RAW_BOT_TOKEN)
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 PROMPTS_PATH = os.getenv("PROMPTS_PATH", "prompts.yaml")
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TRANSCRIBE_MODEL = os.getenv("ASR_MODEL", "whisper-1")
 
 def _valid_token(t: str) -> bool:
-    # Формат телеграм-токена: <digits>:<35+ [A-Za-z0-9_-]>
     return bool(re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", t))
 
+logging.info(
+    "Env debug: TELEGRAM_TOKEN=%r BOT_TOKEN=%r | picked=%r",
+    RAW_TELEGRAM_TOKEN, RAW_BOT_TOKEN, TOKEN
+)
+
 if not TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is not set")
+    raise RuntimeError("TELEGRAM_TOKEN / BOT_TOKEN not set (empty)")
 if not _valid_token(TOKEN):
-    raise RuntimeError("TELEGRAM_TOKEN looks invalid (format mismatch)")
+    raise RuntimeError(f"TELEGRAM_TOKEN invalid format → {TOKEN!r} (must be 123456789:AAAA...)")
+
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
-
-logging.info("Boot: env OK, starting prompts load…")
-logging.info("Env: TELEGRAM_TOKEN len=%d prefix=%s***",
-             len(TOKEN), TOKEN.split(':', 1)[0] if ':' in TOKEN else 'NO_COLON')
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -51,21 +66,15 @@ class PromptPack(BaseModel):
     fewshot: List[dict] = []
 
 def load_prompts() -> PromptPack:
-    # 1) Явный файл
     with open(PROMPTS_PATH, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
-
-    # 2) Нормальный формат
     if "system" in raw:
         return PromptPack(system=raw["system"], fewshot=raw.get("fewshot", []))
-
-    # 3) Попытка авто-конверсии альтернативных схем
     if "parse" in raw and isinstance(raw["parse"], dict):
         sys_txt = raw["parse"].get("system") or raw["parse"].get("instruction")
         shots = raw["parse"].get("fewshot") or raw.get("examples") or []
         if sys_txt:
             return PromptPack(system=sys_txt, fewshot=shots)
-
     raise ValueError("prompts.yaml должен содержать ключи 'system' и (опционально) 'fewshot'.")
 
 try:
@@ -78,15 +87,14 @@ except Exception as e:
     class _PP(BaseModel):
         system: str
         fewshot: list = []
-    PROMPTS = _PP(system="Ты помощник-напоминалка. Всегда отвечай валидным JSON по схеме. "
-                         "Если не уверен — intent='ask_clarification'.", fewshot=[])
+    PROMPTS = _PP(system="Fallback system prompt", fewshot=[])
 
 # =====================
 # Output schema from LLM
 # =====================
 class ReminderOption(BaseModel):
-    iso_datetime: str  # RFC3339
-    label: str         # подпись кнопки
+    iso_datetime: str
+    label: str
 
 class LLMResult(BaseModel):
     intent: str = Field(description="'create_reminder' | 'ask_clarification' | 'chat'")
@@ -102,10 +110,6 @@ class LLMResult(BaseModel):
 # Helpers
 # =====================
 async def transcribe_voice(file_bytes: bytes, filename: str = "audio.ogg") -> str:
-    """
-    Передаём в OpenAI Whisper .ogg/Opus напрямую.
-    ВАЖНО: у BytesIO должно быть корректное имя с расширением.
-    """
     f = io.BytesIO(file_bytes)
     f.name = filename if filename.endswith(".ogg") else (filename + ".ogg")
     resp = client.audio.transcriptions.create(
@@ -113,7 +117,6 @@ async def transcribe_voice(file_bytes: bytes, filename: str = "audio.ogg") -> st
         file=f,
         response_format="text"
     )
-    # SDK v1 возвращает строку для response_format="text"
     return resp
 
 async def call_llm(text: str) -> LLMResult:
@@ -132,7 +135,6 @@ async def call_llm(text: str) -> LLMResult:
         return LLMResult(**data)
     except (json.JSONDecodeError, ValidationError) as e:
         logging.exception("LLM JSON parse failed: %s\nRaw: %s", e, raw)
-        # fallback: попросим уточнение
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
 def build_time_keyboard(options: List[ReminderOption]) -> InlineKeyboardMarkup:
