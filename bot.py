@@ -24,7 +24,7 @@ except Exception:
     RateLimitError = APIStatusError = BadRequestError = Exception  # заглушки
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")       # NLU-парсер
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")              # NLU-парсер
 WHISPER_MODEL  = os.getenv("WHISPER_MODEL", "gpt-4o-mini-transcribe")  # STT
 
 # ========= Telegram / TZ =========
@@ -37,7 +37,6 @@ if not BOT_TOKEN:
 
 bot = Bot(BOT_TOKEN)
 dp  = Dispatcher()
-
 router = Router()
 voice_router = Router()
 dp.include_router(router)
@@ -50,9 +49,7 @@ REMINDERS: list[dict] = []
 PENDING: dict[int, dict] = {}
 USER_TZS: dict[int, str] = {}
 
-# ========= ffmpeg (устойчивое определение) =========
-FFMPEG_PATH: str | None = None
-
+# ========= ffmpeg =========
 def try_resolve_ffmpeg() -> str | None:
     env = os.getenv("FFMPEG_PATH")
     if env and os.path.exists(env) and os.access(env, os.X_OK):
@@ -114,12 +111,10 @@ def parse_user_tz_string(s: str):
     except Exception:
         pass
     m = OFFSET_FLEX_RX.match(s)
-    if not m:
-        return None
+    if not m: return None
     sign = -1 if s.strip().startswith("-") else +1
     hh = int(m.group(1)); mm = int(m.group(2) or 0)
-    if hh > 23:
-        return None
+    if hh > 23: return None
     return pytz.FixedOffset(sign * (hh * 60 + mm))
 
 def get_user_tz(uid: int):
@@ -174,12 +169,9 @@ def kb_variants_for(uid: int, dt_isos: list[str]) -> InlineKeyboardMarkup:
     dts = sorted(as_local_for(uid, x) for x in dt_isos)
     def label(dt: datetime) -> str:
         now = datetime.now(get_user_tz(uid))
-        if dt.date() == now.date():
-            d = "Сегодня"
-        elif dt.date() == (now + timedelta(days=1)).date():
-            d = "Завтра"
-        else:
-            d = dt.strftime("%d.%m")
+        if dt.date() == now.date(): d = "Сегодня"
+        elif dt.date() == (now + timedelta(days=1)).date(): d = "Завтра"
+        else: d = dt.strftime("%d.%m")
         return f"{d} в {dt.strftime('%H:%M')}"
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=label(dt), callback_data=f"time|{dt.isoformat()}")] for dt in dts]
@@ -207,12 +199,15 @@ SYSTEM_PROMPT = """Ты — интеллектуальный парсер нап
 }
 Правила:
 - Понимай разговорные формы и опечатки.
-- Если время указано как «в H» (H от 1 до 12) без слов «утром/днём/вечером/ночью»,
-  верни ДВА кандидата для того же дня: H:00 и (H+12):00.
-- Если в запросе только дата — попроси время (need_clarification=true, clarify_type="time").
-- Если только время — ставь на ближайшее будущее.
-- Описание очисти от вводных слов.
-- ISO8601 возвращай с таймзоной пользователя, из контекста 'user_tz'.
+- Если время задано как «H утра/дня/вечера/ночи» (или «H часа/часов дня/вечера/утра/ночи»),
+  возвращай ОДИН кандидат, сконвертированный по меридиану:
+  • утро/ночь → H:00 в 00:00–11:59 (12 = 00:00)
+  • день/вечер → (H+12):00 в 12:00–23:59.
+- Если время указано в 24-часовом формате («17:30», «1730», «08:05»),
+  возвращай ОДИН кандидат с именно этим временем.
+- Только если указано «в H» (H 1..12) БЕЗ слов утро/день/вечер/ночь — верни ДВА кандидата: H:00 и (H+12):00.
+- Если в запросе только дата — попроси время (need_clarification=true).
+ISO возвращай с таймзоной пользователя из контекста 'user_tz'.
 """
 
 def build_user_prompt(uid: int, text: str) -> str:
@@ -251,6 +246,58 @@ async def ai_parse(uid: int, text: str) -> dict:
         print("ai_parse error:", e)
         return {"ok": False, "description": clean_desc(text), "datetimes": [], "need_clarification": True, "clarify_type": "time", "reason": "LLM error"}
 
+# ========= Сжимаем двусмысленность (меридиан/24ч) =========
+MERIDIEM_RX = re.compile(
+    r"\b(?P<h>\d{1,2})\s*(?:час(?:а|ов)?)?\s*(?P<mer>утра|утром|дня|днём|днем|вечера|вечером|ночи|ночью)\b",
+    re.I | re.U
+)
+
+def _meridiem_target_hour(h: int, mer: str) -> int:
+    m = mer.lower()
+    if m.startswith("утр"):  # утром/утра
+        return 0 if h == 12 else h % 12
+    if m.startswith("дн"):   # дня/днём
+        return (h % 12) + 12
+    if m.startswith("веч"):  # вечера/вечером
+        return (h % 12) + 12
+    return 0 if h == 12 else h % 12  # ночь
+
+def collapse_by_meridiem(uid: int, text: str, dt_isos: list[str]) -> list[str]:
+    m = MERIDIEM_RX.search(text or "")
+    if not m or not dt_isos:
+        return dt_isos
+    try:
+        h = int(m.group("h"))
+    except Exception:
+        return dt_isos
+    target_h = _meridiem_target_hour(h, m.group("mer"))
+    for iso in dt_isos:
+        dt = as_local_for(uid, iso)
+        if dt.hour == target_h:
+            return [iso]
+    base = as_local_for(uid, dt_isos[0])
+    fixed = base.replace(hour=target_h, minute=0, second=0, microsecond=0)
+    return [fixed.isoformat()]
+
+COMPACT_24H_RX = re.compile(
+    r"(?<!\d)(?P<h>[01]?\d|2[0-3])(?:[:.\s]?(?P<m>[0-5]\d))\b",  # 1730, 17:30, 17.30, 8:05
+    re.I | re.U,
+)
+
+def collapse_by_24h(uid: int, text: str, dt_isos: list[str]) -> list[str]:
+    m = COMPACT_24H_RX.search(text or "")
+    if not m or not dt_isos:
+        return dt_isos
+    h = int(m.group("h"))
+    mm = int(m.group("m") or 0)
+    for iso in dt_isos:
+        dt = as_local_for(uid, iso)
+        if dt.hour == h and dt.minute == mm:
+            return [iso]
+    base = as_local_for(uid, dt_isos[0])
+    fixed = base.replace(hour=h, minute=mm, second=0, microsecond=0)
+    return [fixed.isoformat()]
+
 # ========= Команды =========
 @router.message(Command("start"))
 async def cmd_start(m: Message):
@@ -263,8 +310,7 @@ async def cmd_start(m: Message):
         )
 
 @router.message(Command("tz"))
-async def cmd_tz(m: Message):
-    await ask_tz(m)
+async def cmd_tz(m: Message): await ask_tz(m)
 
 @router.message(Command("list"))
 async def cmd_list(m: Message):
@@ -286,8 +332,7 @@ async def cmd_cancel(m: Message):
         await m.reply("Нечего отменять.")
 
 @router.message(Command("ping"))
-async def cmd_ping(m: Message):
-    await m.answer("pong ✅")
+async def cmd_ping(m: Message): await m.answer("pong ✅")
 
 @router.message(Command("debug"))
 async def cmd_debug(m: Message):
@@ -313,7 +358,7 @@ async def cmd_debug(m: Message):
         f"Python: {platform.python_version()}"
     )
 
-# ========= Текст (исправленный порядок логики) =========
+# ========= Текст (сначала «склейки», потом логика ≥2/==1) =========
 @router.message(F.text)
 async def on_text(m: Message):
     uid = m.from_user.id
@@ -331,13 +376,15 @@ async def on_text(m: Message):
     desc = clean_desc(data.get("description") or text)
     cands = data.get("datetimes", [])
 
-    # 1) если двусмысленно — сначала кнопки
+    # сначала «жёсткие» правила
+    cands = collapse_by_24h(uid, text, cands)
+    cands = collapse_by_meridiem(uid, text, cands)
+
     if data.get("ok") and len(cands) >= 2:
         PENDING[uid] = {"description": desc, "candidates": cands}
         await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
         return
 
-    # 2) если один кандидат — сразу ставим
     if data.get("ok") and len(cands) == 1:
         dt = as_local_for(uid, cands[0])
         REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
@@ -345,7 +392,6 @@ async def on_text(m: Message):
         await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
         return
 
-    # 3) если нужна конкретизация — спрашиваем
     if data.get("need_clarification", True):
         PENDING[uid] = {"description": desc}
         await m.reply(f"Окей, «{desc}». Уточни дату/время.")
@@ -353,7 +399,7 @@ async def on_text(m: Message):
 
     await m.reply("Не понял. Скажи, когда напомнить (например: «завтра в 19 отчёт»).")
 
-# ========= Callback'и (безопасно отрабатываем просрочку) =========
+# ========= Callback'и =========
 @router.callback_query(F.data.startswith("settz|"))
 async def cb_settz(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -367,32 +413,23 @@ async def cb_settz(cb: CallbackQuery):
         return
     tz_obj = parse_user_tz_string(payload)
     if tz_obj is None:
-        try:
-            await cb.answer("Не понял часовой пояс", show_alert=True)
-        except TelegramBadRequest:
-            pass
+        try: await cb.answer("Не понял часовой пояс", show_alert=True)
+        except TelegramBadRequest: pass
         return
     store_user_tz(uid, tz_obj)
-    try:
-        await cb.message.edit_text("Часовой пояс сохранён. Пиши напоминание ✍️")
+    try:    await cb.message.edit_text("Часовой пояс сохранён. Пиши напоминание ✍️")
     except TelegramBadRequest:
-        try:
-            await cb.message.answer("Часовой пояс сохранён. Пиши напоминание ✍️")
-        except TelegramBadRequest:
-            pass
-    try:
-        await cb.answer("OK")
-    except TelegramBadRequest:
-        pass
+        try: await cb.message.answer("Часовой пояс сохранён. Пиши напоминание ✍️")
+        except TelegramBadRequest: pass
+    try: await cb.answer("OK")
+    except TelegramBadRequest: pass
 
 @router.callback_query(F.data.startswith("time|"))
 async def cb_time(cb: CallbackQuery):
     uid = cb.from_user.id
     if uid not in PENDING or not PENDING[uid].get("candidates"):
-        try:
-            await cb.answer("Нет активного уточнения")
-        except TelegramBadRequest:
-            pass
+        try: await cb.answer("Нет активного уточнения")
+        except TelegramBadRequest: pass
         return
     iso = cb.data.split("|", 1)[1]
     dt = as_local_for(uid, iso)
@@ -401,24 +438,18 @@ async def cb_time(cb: CallbackQuery):
     REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
     plan(REMINDERS[-1])
 
-    try:
-        await cb.message.edit_text(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
+    try:    await cb.message.edit_text(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
     except TelegramBadRequest:
-        try:
-            await cb.message.answer(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
-        except TelegramBadRequest:
-            pass
-    try:
-        await cb.answer("Установлено ✅")
-    except TelegramBadRequest:
-        pass
+        try: await cb.message.answer(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
+        except TelegramBadRequest: pass
+    try: await cb.answer("Установлено ✅")
+    except TelegramBadRequest: pass
 
 # ========= Голос / Аудио (Whisper) =========
 oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if OpenAI else None
 
 async def ogg_to_wav(src_ogg: str, dst_wav: str) -> None:
-    if not FFMPEG_PATH:
-        raise RuntimeError("ffmpeg not available")
+    if not FFMPEG_PATH: raise RuntimeError("ffmpeg not available")
     proc = await asyncio.create_subprocess_exec(
         FFMPEG_PATH, "-nostdin", "-loglevel", "error",
         "-y", "-i", src_ogg, "-ac", "1", "-ar", "16000", dst_wav,
@@ -429,18 +460,13 @@ async def ogg_to_wav(src_ogg: str, dst_wav: str) -> None:
         raise RuntimeError(f"ffmpeg exit={proc.returncode}\n{(err or b'').decode(errors='ignore')[:800]}")
 
 async def transcribe_file_to_text(path: str, lang: str = "ru") -> str:
-    if not oa_client:
-        raise RuntimeError("OpenAI client not initialized")
+    if not oa_client: raise RuntimeError("OpenAI client not initialized")
     loop = asyncio.get_running_loop()
-
     def _run():
         with open(path, "rb") as f:
             return oa_client.audio.transcriptions.create(
-                model=WHISPER_MODEL,
-                file=f,
-                language=lang,
+                model=WHISPER_MODEL, file=f, language=lang
             )
-
     try:
         r = await loop.run_in_executor(None, _run)
         return (r.text or "").strip()
@@ -456,60 +482,39 @@ async def on_voice(m: Message):
     if not FFMPEG_PATH:
         await m.reply("Голосовые временно недоступны (ffmpeg не установлен на сервере). Текст — работает.")
         return
-
     uid = m.from_user.id
-    if need_tz(uid):
-        await ask_tz(m); return
+    if need_tz(uid): await ask_tz(m); return
 
-    tg_file = await m.bot.get_file(m.voice.file_id)
+    file = await m.bot.get_file(m.voice.file_id)
     with tempfile.TemporaryDirectory() as tmpd:
-        ogg_path = f"{tmpd}/in.ogg"
-        wav_path = f"{tmpd}/in.wav"
-        await m.bot.download(tg_file, destination=ogg_path)
-
-        size = os.path.getsize(ogg_path)
-        print(f"[voice] downloaded OGG size={size} bytes")
-        if size == 0:
-            await m.reply("Файл скачался пустым (0 байт). Отправь голосовое ещё раз."); return
-
-        try:
-            await ogg_to_wav(ogg_path, wav_path)
+        ogg_path = f"{tmpd}/in.ogg"; wav_path = f"{tmpd}/in.wav"
+        await m.bot.download(file, destination=ogg_path)
+        if os.path.getsize(ogg_path) == 0:
+            await m.reply("Файл скачался пустым. Отправь голосовое ещё раз."); return
+        try:    await ogg_to_wav(ogg_path, wav_path)
         except Exception as e:
-            err = str(e)
-            print("[FFMPEG ERROR]", err)
-            snippet = "\n".join(err.splitlines()[:4])
-            await m.reply("Не смог обработать аудио (конвертация).\n" + snippet)
-            return
-
+            await m.reply("Не смог обработать аудио (конвертация)."); return
         await m.chat.do("typing")
-        try:
-            text = await transcribe_file_to_text(wav_path, lang="ru")
+        try:    text = await transcribe_file_to_text(wav_path, lang="ru")
         except RuntimeError as e:
-            msg = str(e)
-            if msg == "QUOTA_EXCEEDED":
-                await m.reply("🎙️ Распознавание временно недоступно: исчерпана квота OpenAI для голосового распознавания. Текстовые напоминания работают.")
-            else:
-                await m.reply("Whisper не принял файл. Попробуй ещё раз позже.")
-            return
+            await m.reply("Whisper не принял файл или квота исчерпана."); return
 
     if not text:
         await m.reply("Пустая расшифровка — повтори, пожалуйста."); return
 
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
-    cands = data.get("datetimes", [])
+    cands = collapse_by_24h(uid, text, data.get("datetimes", []))
+    cands = collapse_by_meridiem(uid, text, cands)
 
     if data.get("ok") and len(cands) >= 2:
         PENDING[uid] = {"description": desc, "candidates": cands}
-        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
-        return
+        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands)); return
 
     if data.get("ok") and len(cands) == 1:
         dt = as_local_for(uid, cands[0])
-        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-        plan(REMINDERS[-1])
-        await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
-        return
+        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"}); plan(REMINDERS[-1])
+        await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}"); return
 
     await m.reply(f"Окей, «{desc}». Уточни дату и время.")
 
@@ -518,50 +523,36 @@ async def on_audio(m: Message):
     if not FFMPEG_PATH:
         await m.reply("Аудио временно недоступны (ffmpeg не установлен на сервере). Текст — работает.")
         return
-
     uid = m.from_user.id
-    if need_tz(uid):
-        await ask_tz(m); return
+    if need_tz(uid): await ask_tz(m); return
 
     file = await m.bot.get_file(m.audio.file_id)
     with tempfile.TemporaryDirectory() as tmpd:
         path = f"{tmpd}/{m.audio.file_unique_id}"
         await m.bot.download(file, destination=path)
-
-        size = os.path.getsize(path)
-        print(f"[audio] downloaded size={size} bytes")
-        if size == 0:
-            await m.reply("Аудио скачалось пустым (0 байт)."); return
-
+        if os.path.getsize(path) == 0:
+            await m.reply("Аудио скачалось пустым."); return
         await m.chat.do("typing")
-        try:
-            text = await transcribe_file_to_text(path, lang="ru")
+        try:    text = await transcribe_file_to_text(path, lang="ru")
         except RuntimeError as e:
-            msg = str(e)
-            if msg == "QUOTA_EXCEEDED":
-                await m.reply("🎙️ Распознавание временно недоступно: исчерпана квота OpenAI для голосового распознавания. Текстовые напоминания работают.")
-            else:
-                await m.reply("Whisper не принял файл. Попробуй ещё раз позже.")
-            return
+            await m.reply("Whisper не принял файл или квота исчерпана."); return
 
     if not text:
         await m.reply("Пустая расшифровка."); return
 
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
-    cands = data.get("datetimes", [])
+    cands = collapse_by_24h(uid, text, data.get("datetimes", []))
+    cands = collapse_by_meridiem(uid, text, cands)
 
     if data.get("ok") and len(cands) >= 2:
         PENDING[uid] = {"description": desc, "candidates": cands}
-        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
-        return
+        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands)); return
 
     if data.get("ok") and len(cands) == 1:
         dt = as_local_for(uid, cands[0])
-        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
-        plan(REMINDERS[-1])
-        await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
-        return
+        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"}); plan(REMINDERS[-1])
+        await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}"); return
 
     await m.reply(f"Окей, «{desc}». Уточни дату и время.")
 
@@ -573,7 +564,7 @@ async def main():
     await dp.start_polling(
         bot,
         allowed_updates=dp.resolve_used_update_types(),
-        drop_pending_updates=True,  # не берём старые апдейты при рестарте
+        drop_pending_updates=True,
     )
 
 if __name__ == "__main__":
