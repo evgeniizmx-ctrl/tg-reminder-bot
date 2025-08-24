@@ -58,9 +58,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Time helpers
 # =====================
 def tz_from_offset(off: str) -> timezone:
-    # "+03:00" / "-4:30" / "+3"
+    # allow "+3" / "+03:00" / "-4:30"
     off = off.strip()
-    if re.fullmatch(r"[+-]\d{1,2}$", off):  # "+3"
+    if re.fullmatch(r"[+-]\d{1,2}$", off):
         sign = off[0]
         hh = int(off[1:])
         off = f"{sign}{hh:02d}:00"
@@ -96,6 +96,52 @@ async def schedule_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, ti
         logging.info("Scheduled reminder at %s for chat %s", when.isoformat(), chat_id)
     except Exception as e:
         logging.exception("schedule_reminder failed: %s", e)
+
+# ---- Local relative-time parser ("через ...") ----
+REL_MIN = re.compile(r"через\s+(?:минуту|1\s*мин(?:ут)?)(?:\b|$)", re.I)
+REL_NMIN = re.compile(r"через\s+(\d+)\s*мин(?:ут|ы)?(?:\b|$)", re.I)
+REL_HALF = re.compile(r"через\s+полчаса(?:\b|$)", re.I)
+REL_NH = re.compile(r"через\s+(\d+)\s*час(?:а|ов)?(?:\b|$)", re.I)
+REL_ND = re.compile(r"через\s+(\d+)\s*д(ень|ня|ней)?(?:\b|$)", re.I)
+REL_WEEK = re.compile(r"через\s+недел(?:ю|ю)(?:\b|$)", re.I)
+
+def _clean_title(text: str) -> str:
+    t = re.sub(r"\b(напомни(ть)?|пожалуйста)\b", "", text, flags=re.I).strip()
+    for rx in (REL_MIN, REL_NMIN, REL_HALF, REL_NH, REL_ND, REL_WEEK):
+        t = rx.sub("", t).strip()
+    return t or "Напоминание"
+
+def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
+    """Вернёт ISO-строку, если нашли «через …», иначе None."""
+    tz = tz_from_offset(user_tz)
+    now = datetime.now(tz).replace(microsecond=0)
+    if REL_MIN.search(text):
+        return (now + timedelta(minutes=1)).isoformat()
+    m = REL_NMIN.search(text)
+    if m:
+        return (now + timedelta(minutes=int(m.group(1)))).isoformat()
+    if REL_HALF.search(text):
+        return (now + timedelta(minutes=30)).isoformat()
+    m = REL_NH.search(text)
+    if m:
+        return (now + timedelta(hours=int(m.group(1)))).isoformat()
+    m = REL_ND.search(text)
+    if m:
+        return (now + timedelta(days=int(m.group(1)))).isoformat()
+    if REL_WEEK.search(text):
+        return (now + timedelta(days=7)).isoformat()
+    return None
+
+def bump_to_future(iso_when: str) -> str:
+    """Если время в прошлом — подними до ближайшего будущего (+2с)."""
+    try:
+        when = datetime.fromisoformat(iso_when)
+        now = datetime.now(when.tzinfo)
+        if when <= now:
+            when = now + timedelta(seconds=2)
+        return when.replace(microsecond=0).isoformat()
+    except Exception:
+        return iso_when
 
 # =====================
 # Prompt store
@@ -243,7 +289,7 @@ async def handle_tz_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Неверный формат. Введите, например: +3, +03:00 или -4:30")
 
 # =====================
-# Handlers (core)
+# Core handlers
 # =====================
 async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PROMPTS
@@ -259,7 +305,20 @@ async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tz = context.user_data.get("tz", DEFAULT_TZ)
     text = update.message.text.strip()
+
+    # Локальный быстрый путь для "через ..."
+    iso = try_parse_relative_local(text, user_tz)
+    if iso:
+        title = _clean_title(text)
+        iso = bump_to_future(iso)
+        await update.message.reply_text(f"Окей, напомню {fmt_dt(iso)}")
+        await schedule_reminder(context, update.effective_chat.id, title, iso)
+        return
+
+    # Иначе — LLM
     result = await call_llm(text, user_tz)
+    if result.fixed_datetime:
+        result.fixed_datetime = bump_to_future(result.fixed_datetime)
     await route_llm_result(update, context, result, user_tz)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -267,7 +326,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.voice.get_file()
     file_bytes = await file.download_as_bytearray()
     text = await transcribe_voice(file_bytes, filename="telegram_voice.ogg")
+
+    iso = try_parse_relative_local(text, user_tz)
+    if iso:
+        title = _clean_title(text)
+        iso = bump_to_future(iso)
+        await update.message.reply_text(f"Окей, напомню {fmt_dt(iso)}")
+        await schedule_reminder(context, update.effective_chat.id, title, iso)
+        return
+
     result = await call_llm(text, user_tz)
+    if result.fixed_datetime:
+        result.fixed_datetime = bump_to_future(result.fixed_datetime)
     await route_llm_result(update, context, result, user_tz)
 
 async def route_llm_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: LLMResult, user_tz: str):
@@ -293,6 +363,7 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, iso = data.split("::", 1)
         else:
             iso = data
+        iso = bump_to_future(iso)
         await query.edit_message_text(f"Окей, напомню {fmt_dt(iso)}")
         await schedule_reminder(context, query.message.chat_id, "Напоминание", iso)
     except Exception as e:
