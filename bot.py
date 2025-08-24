@@ -5,7 +5,7 @@ import json
 import yaml
 import logging
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel, Field, ValidationError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -37,6 +37,7 @@ OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 PROMPTS_PATH = os.getenv("PROMPTS_PATH", "prompts.yaml")
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TRANSCRIBE_MODEL = os.getenv("ASR_MODEL", "whisper-1")
+DEFAULT_TZ = os.getenv("DEFAULT_TZ", "+03:00")
 
 def _valid_token(t: str) -> bool:
     return bool(re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", t))
@@ -52,6 +53,49 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# =====================
+# Time helpers
+# =====================
+def tz_from_offset(off: str) -> timezone:
+    # "+03:00" / "-4:30" / "+3"
+    off = off.strip()
+    if re.fullmatch(r"[+-]\d{1,2}$", off):  # "+3"
+        sign = off[0]
+        hh = int(off[1:])
+        off = f"{sign}{hh:02d}:00"
+    m = re.fullmatch(r"([+-])(\d{2}):?(\d{2})?", off)
+    if not m:
+        return timezone.utc
+    sign, hh, mm = m.group(1), m.group(2), m.group(3) or "00"
+    delta = timedelta(hours=int(hh), minutes=int(mm))
+    if sign == "-":
+        delta = -delta
+    return timezone(delta)
+
+def now_iso_for_tz(tz_str: str) -> str:
+    tz = tz_from_offset(tz_str)
+    return datetime.now(tz).replace(microsecond=0).isoformat()
+
+def fmt_dt(iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso)
+        return dt.strftime("%d.%m в %H:%M")
+    except Exception:
+        return iso
+
+async def schedule_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, title: str, iso_when: str):
+    try:
+        when = datetime.fromisoformat(iso_when)
+        now = datetime.now(when.tzinfo)
+        if when <= now:
+            when = now + timedelta(seconds=2)
+        async def _fire(ctx: ContextTypes.DEFAULT_TYPE):
+            await ctx.bot.send_message(chat_id=chat_id, text=f"🔔 {title or 'Напоминание'}")
+        context.job_queue.run_once(_fire, when=when)
+        logging.info("Scheduled reminder at %s for chat %s", when.isoformat(), chat_id)
+    except Exception as e:
+        logging.exception("schedule_reminder failed: %s", e)
 
 # =====================
 # Prompt store
@@ -102,16 +146,8 @@ class LLMResult(BaseModel):
     options: List[ReminderOption] = []
 
 # =====================
-# Helpers
+# OpenAI calls
 # =====================
-def fmt_dt(iso: str) -> str:
-    try:
-        # fromisoformat принимает "+03:00"; если придёт Z — можно расширить
-        dt = datetime.fromisoformat(iso)
-        return dt.strftime("%d.%m в %H:%M")
-    except Exception:
-        return iso
-
 async def transcribe_voice(file_bytes: bytes, filename: str = "audio.ogg") -> str:
     f = io.BytesIO(file_bytes)
     f.name = filename if filename.endswith(".ogg") else (filename + ".ogg")
@@ -122,8 +158,12 @@ async def transcribe_voice(file_bytes: bytes, filename: str = "audio.ogg") -> st
     )
     return resp
 
-async def call_llm(text: str) -> LLMResult:
-    messages = [{"role": "system", "content": PROMPTS.system}] + PROMPTS.fewshot + [
+async def call_llm(text: str, user_tz: str) -> LLMResult:
+    now = now_iso_for_tz(user_tz)
+    messages = [
+        {"role": "system", "content": f"NOW_ISO={now}  TZ_DEFAULT={user_tz}"},
+        {"role": "system", "content": PROMPTS.system},
+        *PROMPTS.fewshot,
         {"role": "user", "content": text}
     ]
     resp = client.chat.completions.create(
@@ -141,19 +181,70 @@ async def call_llm(text: str) -> LLMResult:
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
 def build_time_keyboard(options: List[ReminderOption]) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(opt.label, callback_data=f"pick|{opt.iso_datetime}")
-        for opt in options
-    ]
+    buttons = [InlineKeyboardButton(opt.label, callback_data=f"pick|{opt.iso_datetime}") for opt in options]
     rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(rows)
 
 # =====================
-# Handlers
+# Timezone selection UI
 # =====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Я тут. Напиши что и когда напомнить.")
+TZ_OPTIONS = [
+    ("Калининград (+2)", "+02:00"),
+    ("Москва (+3)", "+03:00"),
+    ("Самара (+4)", "+04:00"),
+    ("Екатеринбург (+5)", "+05:00"),
+    ("Омск (+6)", "+06:00"),
+    ("Новосибирск (+7)", "+07:00"),
+    ("Иркутск (+8)", "+08:00"),
+    ("Якутск (+9)", "+09:00"),
+    ("Хабаровск (+10)", "+10:00"),
+]
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buttons = [[InlineKeyboardButton(label, callback_data=f"tz|{offset}")]
+               for label, offset in TZ_OPTIONS]
+    buttons.append([InlineKeyboardButton("Другой", callback_data="tz|other")])
+    kb = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(
+        "Для начала укажи свой часовой пояс.\n"
+        "Выбери из списка или нажми «Другой», чтобы ввести вручную.\n\n"
+        "Пример: +11 или -4:30",
+        reply_markup=kb
+    )
+
+async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "tz|other":
+        context.user_data["tz_waiting"] = True
+        await query.edit_message_text(
+            "Введите свой часовой пояс от UTC в цифрах.\n"
+            "Например: +3, +03:00 или -4:30"
+        )
+        return
+    _, offset = data.split("|", 1)
+    context.user_data["tz"] = offset
+    await query.edit_message_text(f"Часовой пояс установлен: UTC{offset}\nТеперь напиши что и когда напомнить.")
+
+async def handle_tz_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("tz_waiting"):
+        return
+    tz = update.message.text.strip()
+    if re.fullmatch(r"[+-]\d{1,2}(:\d{2})?", tz):
+        if re.fullmatch(r"[+-]\d{1,2}$", tz):
+            sign = tz[0]
+            hh = int(tz[1:])
+            tz = f"{sign}{hh:02d}:00"
+        context.user_data["tz"] = tz
+        context.user_data["tz_waiting"] = False
+        await update.message.reply_text(f"Часовой пояс установлен: UTC{tz}\nТеперь напиши что и когда напомнить.")
+    else:
+        await update.message.reply_text("Неверный формат. Введите, например: +3, +03:00 или -4:30")
+
+# =====================
+# Handlers (core)
+# =====================
 async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PROMPTS
     try:
@@ -166,20 +257,24 @@ async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка перезагрузки: {e}")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_tz = context.user_data.get("tz", DEFAULT_TZ)
     text = update.message.text.strip()
-    result = await call_llm(text)
-    await route_llm_result(update, context, result)
+    result = await call_llm(text, user_tz)
+    await route_llm_result(update, context, result, user_tz)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_tz = context.user_data.get("tz", DEFAULT_TZ)
     file = await update.message.voice.get_file()
     file_bytes = await file.download_as_bytearray()
     text = await transcribe_voice(file_bytes, filename="telegram_voice.ogg")
-    result = await call_llm(text)
-    await route_llm_result(update, context, result)
+    result = await call_llm(text, user_tz)
+    await route_llm_result(update, context, result, user_tz)
 
-async def route_llm_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: LLMResult):
+async def route_llm_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: LLMResult, user_tz: str):
+    chat_id = update.effective_chat.id
     if result.intent == "create_reminder" and result.fixed_datetime:
         await update.message.reply_text(f"Окей, напомню {fmt_dt(result.fixed_datetime)}")
+        await schedule_reminder(context, chat_id, result.title or result.text_original or "Напоминание", result.fixed_datetime)
     elif result.intent == "ask_clarification" and result.options:
         kb = build_time_keyboard(result.options)
         await update.message.reply_text("Уточни:", reply_markup=kb)
@@ -191,7 +286,7 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     try:
         logging.info("CallbackQuery data=%r", data)
-        await query.answer()  # убрать спиннер
+        await query.answer()
         if "|" in data:
             _, iso = data.split("|", 1)
         elif "::" in data:
@@ -199,7 +294,7 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             iso = data
         await query.edit_message_text(f"Окей, напомню {fmt_dt(iso)}")
-        # TODO: здесь — сохранение и постановка планировки
+        await schedule_reminder(context, query.message.chat_id, "Напоминание", iso)
     except Exception as e:
         logging.exception("handle_pick failed: %s", e)
         try:
@@ -214,11 +309,16 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
+    # TZ selection
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_tz_choice, pattern="^tz"))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^[+-]"), handle_tz_manual))
+
+    # Core
     app.add_handler(CommandHandler("reload", reload_prompts))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(CallbackQueryHandler(handle_pick))  # ловим все callback_query
+    app.add_handler(CallbackQueryHandler(handle_pick))  # кнопки времени
 
     async def on_error(update, context):
         logging.exception("PTB error: %s | update=%r", context.error, update)
