@@ -4,6 +4,7 @@ import re
 import json
 import yaml
 import logging
+import secrets
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 
@@ -84,21 +85,8 @@ def fmt_dt(iso: str) -> str:
     except Exception:
         return iso
 
-async def schedule_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, title: str, iso_when: str):
-    try:
-        when = datetime.fromisoformat(iso_when)
-        now = datetime.now(when.tzinfo)
-        if when <= now:
-            when = now + timedelta(seconds=2)
-        async def _fire(ctx: ContextTypes.DEFAULT_TYPE):
-            await ctx.bot.send_message(chat_id=chat_id, text=f"🔔 {title or 'Напоминание'}")
-        context.job_queue.run_once(_fire, when=when)
-        logging.info("Scheduled reminder at %s for chat %s", when.isoformat(), chat_id)
-    except Exception as e:
-        logging.exception("schedule_reminder failed: %s", e)
-
 def bump_to_future(iso_when: str) -> str:
-    """Если время в прошлом — подними до ближайшего будущего (+2c)."""
+    """Если время в прошлом — поднять до ближайшего будущего (+2с)."""
     try:
         when = datetime.fromisoformat(iso_when)
         now = datetime.now(when.tzinfo)
@@ -108,7 +96,52 @@ def bump_to_future(iso_when: str) -> str:
     except Exception:
         return iso_when
 
-# ---- Local relative-time parser ("через ...") ----
+# =====================
+# Reminder fire + snooze/done keyboard
+# =====================
+def fire_kb(reminder_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Отложить 10 мин", callback_data=f"snz|10m|{reminder_id}"),
+            InlineKeyboardButton("Отложить 1 час", callback_data=f"snz|1h|{reminder_id}")
+        ],
+        [InlineKeyboardButton("Выполнено", callback_data=f"done|{reminder_id}")]
+    ])
+
+async def schedule_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, title: str, iso_when: str):
+    """Поставить одноразовое напоминание через JobQueue."""
+    try:
+        when = datetime.fromisoformat(iso_when)
+        now = datetime.now(when.tzinfo)
+        if when <= now:
+            when = now + timedelta(seconds=2)
+
+        async def _fire(ctx: ContextTypes.DEFAULT_TYPE):
+            # сгенерируем короткий id и запомним в bot_data (in-memory)
+            rid = secrets.token_urlsafe(6)
+            ctx.application.bot_data.setdefault("reminder_map", {})[rid] = {
+                "chat_id": chat_id,
+                "title": title
+            }
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=f"🔔 «{title or 'Напоминание'}»",
+                reply_markup=fire_kb(rid)
+            )
+
+        context.job_queue.run_once(_fire, when=when)
+        logging.info("Scheduled reminder at %s for chat %s", when.isoformat(), chat_id)
+    except Exception as e:
+        logging.exception("schedule_reminder failed: %s", e)
+
+def extract_title_from_message(text: str | None) -> str:
+    t = (text or "Напоминание").replace("🔔", "").replace("✅", "").replace("⏸", "").strip()
+    t = t.strip("«»\"' ").strip()
+    return t or "Напоминание"
+
+# =====================
+# Local relative-time parser ("через ...")
+# =====================
 REL_MIN    = re.compile(r"через\s+(?:минуту|1\s*мин(?:ут)?)(?:\b|$)", re.I)
 REL_NSEC   = re.compile(r"через\s+(\d+)\s*сек(?:унд|унды|ун|)?(?:\b|$)", re.I)
 REL_NMIN   = re.compile(r"через\s+(\d+)\s*мин(?:ут|ы)?(?:\b|$)", re.I)
@@ -121,14 +154,13 @@ def _clean_title(text: str) -> str:
     """
     Аккуратно чистим исходный текст:
     - убираем 'напомни', 'пожалуйста'
-    - вырезаем только сами относительные конструкции 'через ...'
+    - вырезаем только относительные конструкции 'через ...'
     Остальное сохраняем (например, 'про').
     """
     t = text.strip()
     t = re.sub(r"\b(напомни(ть)?|пожалуйста)\b", "", t, flags=re.I)
     for rx in (REL_MIN, REL_NSEC, REL_NMIN, REL_HALF, REL_NH, REL_ND, REL_WEEK):
         t = rx.sub("", t)
-    # зачистка хвостовых знаков
     t = re.sub(r"\s{2,}", " ", t).strip(",. :")
     return t or text or "Напоминание"
 
@@ -315,20 +347,21 @@ async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("/reload error")
         await update.message.reply_text(f"Ошибка перезагрузки: {e}")
 
+def _ack_text(title: str, iso: str) -> str:
+    return f"Окей, напомню «{title}» {fmt_dt(iso)}"
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tz = context.user_data.get("tz", DEFAULT_TZ)
     text = update.message.text.strip()
 
-    # Локальный быстрый путь для "через ..."
     iso = try_parse_relative_local(text, user_tz)
     if iso:
         title = _clean_title(text)
         iso = bump_to_future(iso)
-        await update.message.reply_text(f"Окей, напомню «{title}» {fmt_dt(iso)}")
+        await update.message.reply_text(_ack_text(title, iso))
         await schedule_reminder(context, update.effective_chat.id, title, iso)
         return
 
-    # Иначе — LLM
     result = await call_llm(text, user_tz)
     if result.fixed_datetime:
         result.fixed_datetime = bump_to_future(result.fixed_datetime)
@@ -344,7 +377,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if iso:
         title = _clean_title(text)
         iso = bump_to_future(iso)
-        await update.message.reply_text(f"Окей, напомню «{title}» {fmt_dt(iso)}")
+        await update.message.reply_text(_ack_text(title, iso))
         await schedule_reminder(context, update.effective_chat.id, title, iso)
         return
 
@@ -357,7 +390,7 @@ async def route_llm_result(update: Update, context: ContextTypes.DEFAULT_TYPE, r
     chat_id = update.effective_chat.id
     if result.intent == "create_reminder" and result.fixed_datetime:
         title = result.title or result.text_original or "Напоминание"
-        await update.message.reply_text(f"Окей, напомню «{title}» {fmt_dt(result.fixed_datetime)}")
+        await update.message.reply_text(_ack_text(title, result.fixed_datetime))
         await schedule_reminder(context, chat_id, title, result.fixed_datetime)
     elif result.intent == "ask_clarification" and result.options:
         kb = build_time_keyboard(result.options)
@@ -365,29 +398,63 @@ async def route_llm_result(update: Update, context: ContextTypes.DEFAULT_TYPE, r
     else:
         await update.message.reply_text("Не понял. Скажи, например: «завтра в 15 позвонить маме».")
 
-async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =====================
+# Callback handlers: pick time / snooze / done
+# =====================
+async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data or ""
     try:
-        logging.info("CallbackQuery data=%r", data)
         await query.answer()
-        if "|" in data:
+
+        if data.startswith("pick|"):
             _, iso = data.split("|", 1)
-        elif "::" in data:
-            _, iso = data.split("::", 1)
-        else:
-            iso = data
-        iso = bump_to_future(iso)
-        title = "Напоминание"
-        await query.edit_message_text(f"Окей, напомню «{title}» {fmt_dt(iso)}")
-        await schedule_reminder(context, query.message.chat_id, title, iso)
+            iso = bump_to_future(iso)
+            title = "Напоминание"
+            await query.edit_message_text(_ack_text(title, iso))
+            await schedule_reminder(context, query.message.chat_id, title, iso)
+            return
+
+        if data.startswith("snz|"):
+            # snz|10m|rid   или snz|1h|rid
+            _, delta, rid = data.split("|", 2)
+            info = context.application.bot_data.get("reminder_map", {}).get(rid)
+            title = (info or {}).get("title") or extract_title_from_message(query.message.text)
+            chat_id = (info or {}).get("chat_id") or query.message.chat_id
+
+            user_tz = context.user_data.get("tz", DEFAULT_TZ)
+            tz = tz_from_offset(user_tz)
+            now = datetime.now(tz)
+
+            if delta.endswith("m"):
+                minutes = int(delta[:-1])
+                new_iso = (now + timedelta(minutes=minutes)).replace(microsecond=0).isoformat()
+            elif delta.endswith("h"):
+                hours = int(delta[:-1])
+                new_iso = (now + timedelta(hours=hours)).replace(microsecond=0).isoformat()
+            else:
+                new_iso = (now + timedelta(minutes=10)).replace(microsecond=0).isoformat()
+
+            await query.edit_message_text(f"⏸ Отложено «{title}» до {fmt_dt(new_iso)}")
+            await schedule_reminder(context, chat_id, title, new_iso)
+            return
+
+        if data.startswith("done|"):
+            _, rid = data.split("|", 1)
+            info = context.application.bot_data.get("reminder_map", {}).get(rid)
+            title = (info or {}).get("title") or extract_title_from_message(query.message.text)
+            await query.edit_message_text(f"✅ Выполнено: «{title}»")
+            # можно удалить из карты
+            if info:
+                context.application.bot_data["reminder_map"].pop(rid, None)
+            return
+
     except Exception as e:
-        logging.exception("handle_pick failed: %s", e)
+        logging.exception("handle_callbacks failed: %s", e)
         try:
-            chat_id = (query.message.chat_id if query.message else update.effective_chat.id)
-            await context.bot.send_message(chat_id=chat_id, text=f"Окей, напомню «Напоминание» {fmt_dt(locals().get('iso','?'))}")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="Что-то пошло не так.")
         except Exception:
-            logging.exception("fallback send_message failed")
+            pass
 
 # =====================
 # Main
@@ -404,7 +471,9 @@ def main():
     app.add_handler(CommandHandler("reload", reload_prompts))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(CallbackQueryHandler(handle_pick))  # кнопки времени
+
+    # Callbacks for time pick / snooze / done
+    app.add_handler(CallbackQueryHandler(handle_callbacks, pattern="^(pick|snz|done)"))
 
     async def on_error(update, context):
         logging.exception("PTB error: %s | update=%r", context.error, update)
