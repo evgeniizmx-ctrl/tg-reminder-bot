@@ -10,7 +10,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel, Field, ValidationError
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.constants import UpdateType
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -115,8 +115,8 @@ class DB:
             title TEXT NOT NULL,
             note TEXT,
             tz TEXT NOT NULL,
-            due_at TEXT,
-            rrule TEXT,
+            due_at TEXT,                 -- ISO with offset
+            rrule TEXT,                  -- iCal RRULE (nullable)
             status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','done','canceled')),
             last_msg_id INTEGER,
             created_at TEXT NOT NULL,
@@ -296,7 +296,7 @@ def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
     tz = tz_from_offset(user_tz)
     now = datetime.now(tz).replace(microsecond=0)
 
-    # ВАЖНО: сначала N минут/сек/часов/дней → затем одиночные формы
+    # сначала N → потом одиночные формы
     m = REL_NSEC.search(text)
     if m:
         return (now + timedelta(seconds=int(m.group(1)))).isoformat()
@@ -319,15 +319,17 @@ def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
     if REL_WEEK.search(text):
         return (now + timedelta(days=7)).isoformat()
 
-    # «через минуту» / «через 1 мин»
     if REL_MIN.search(text):
         return (now + timedelta(minutes=1)).isoformat()
 
     return None
 
 # =====================
-# UI bits
+# UI bits (Reply menu constants)
 # =====================
+MENU_BTN_LIST = "📝 Список напоминаний"
+MENU_BTN_SETTINGS = "⚙️ Настройки"
+
 def fire_kb(reminder_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -414,7 +416,7 @@ def schedule_all_on_start(app: Application):
         schedule_job_for(app, r)
 
 # =====================
-# TZ selection UI
+# TZ selection UI + Reply menu on start
 # =====================
 TZ_OPTIONS = [
     ("Калининград (+2)", "+02:00"),
@@ -429,15 +431,26 @@ TZ_OPTIONS = [
 ]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buttons = [[InlineKeyboardButton(label, callback_data=f"tz|{offset}")]
-               for label, offset in TZ_OPTIONS]
-    buttons.append([InlineKeyboardButton("Другой", callback_data="tz|other")])
-    kb = InlineKeyboardMarkup(buttons)
+    # 1) inline-клавиатура выбора TZ
+    tz_buttons = [[InlineKeyboardButton(label, callback_data=f"tz|{offset}")]
+                  for label, offset in TZ_OPTIONS]
+    tz_buttons.append([InlineKeyboardButton("Другой", callback_data="tz|other")])
+    tz_kb = InlineKeyboardMarkup(tz_buttons)
     await update.message.reply_text(
         "Для начала укажи свой часовой пояс.\n"
         "Выбери из списка или нажми «Другой», чтобы ввести вручную.\n\n"
         "Пример: +11 или -4:30",
-        reply_markup=kb
+        reply_markup=tz_kb
+    )
+    # 2) reply-меню снизу (покажем отдельным сообщением, чтобы закрепилось)
+    reply_kb = ReplyKeyboardMarkup(
+        [[MENU_BTN_LIST, MENU_BTN_SETTINGS]],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+    await update.message.reply_text(
+        "Кнопки меню снизу активированы. Можешь нажать или просто написать задачу 👇",
+        reply_markup=reply_kb
     )
 
 async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -467,6 +480,20 @@ async def handle_tz_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Часовой пояс установлен: UTC{tz}\nТеперь напиши что и когда напомнить.")
     else:
         await update.message.reply_text("Неверный формат. Введите, например: +3, +03:00 или -4:30")
+
+# =====================
+# Menu buttons handler (ReplyKeyboard)
+# =====================
+async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text == MENU_BTN_LIST:
+        await cmd_list(update, context)
+        return
+    if text == MENU_BTN_SETTINGS:
+        await update.message.reply_text("Раздел «Настройки» в разработке.")
+        return
+    # если это не наши кнопки — пропускаем дальше
+    return
 
 # =====================
 # Core Handlers
@@ -676,10 +703,13 @@ def main():
     # schedule everything on start
     schedule_all_on_start(app)
 
-    # TZ selection
+    # TZ + reply-menu
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_tz_choice, pattern="^tz"))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^[+-]"), handle_tz_manual))
+
+    # menu buttons handler — ставим ПЕРЕД общим текстовым
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_buttons))
 
     # Core
     app.add_handler(CommandHandler("reload", reload_prompts))
