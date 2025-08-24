@@ -18,9 +18,8 @@ from telegram.ext import (
 )
 from openai import OpenAI
 
-# =====================
-# Config & Logging
-# =====================
+# ============ Logging & env ============
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 def _extract_token(raw: str | None) -> str:
@@ -59,9 +58,8 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =====================
-# Time helpers
-# =====================
+# ============ Time helpers ============
+
 def tz_from_offset(off: str) -> timezone:
     off = off.strip()
     if re.fullmatch(r"[+-]\d{1,2}$", off):
@@ -97,9 +95,8 @@ def bump_to_future(iso_when: str) -> str:
     except Exception:
         return iso_when
 
-# =====================
-# DB Layer (SQLite)
-# =====================
+# ============ DB (SQLite) ============
+
 class DB:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -115,8 +112,8 @@ class DB:
             title TEXT NOT NULL,
             note TEXT,
             tz TEXT NOT NULL,
-            due_at TEXT,                 -- ISO with offset
-            rrule TEXT,                  -- iCal RRULE (nullable)
+            due_at TEXT,
+            rrule TEXT,
             status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','done','canceled')),
             last_msg_id INTEGER,
             created_at TEXT NOT NULL,
@@ -190,9 +187,8 @@ class DB:
 
 db = DB(DB_PATH)
 
-# =====================
-# Prompt store
-# =====================
+# ============ Prompts ============
+
 class PromptPack(BaseModel):
     system: str
     fewshot: List[dict] = []
@@ -221,9 +217,8 @@ except Exception as e:
         fewshot: list = []
     PROMPTS = _PP(system="Fallback system prompt", fewshot=[])
 
-# =====================
-# LLM schema
-# =====================
+# ============ LLM schema ============
+
 class ReminderOption(BaseModel):
     iso_datetime: str
     label: str
@@ -238,9 +233,8 @@ class LLMResult(BaseModel):
     need_confirmation: bool = False
     options: List[ReminderOption] = []
 
-# =====================
-# OpenAI
-# =====================
+# ============ OpenAI ============
+
 async def transcribe_voice(file_bytes: bytes, filename: str = "audio.ogg") -> str:
     f = io.BytesIO(file_bytes)
     f.name = filename if filename.endswith(".ogg") else (filename + ".ogg")
@@ -273,9 +267,8 @@ async def call_llm(text: str, user_tz: str) -> LLMResult:
         logging.exception("LLM JSON parse failed: %s\nRaw: %s", e, raw)
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
-# =====================
-# Local relative-time parser (fixed order)
-# =====================
+# ============ Local relative-time parser (fixed) ============
+
 REL_MIN  = re.compile(r"через\s+(?:минуту|1\s*мин(?:\.|ут)?)\b", re.I)
 REL_NSEC = re.compile(r"через\s+(\d+)\s*сек(?:унд|унды|ун|)?\b", re.I)
 REL_NMIN = re.compile(r"через\s+(\d+)\s*мин(?:ут|ы)?\b", re.I)
@@ -296,7 +289,6 @@ def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
     tz = tz_from_offset(user_tz)
     now = datetime.now(tz).replace(microsecond=0)
 
-    # сначала N → потом одиночные формы
     m = REL_NSEC.search(text)
     if m:
         return (now + timedelta(seconds=int(m.group(1)))).isoformat()
@@ -324,9 +316,8 @@ def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
 
     return None
 
-# =====================
-# UI bits (Reply menu constants)
-# =====================
+# ============ UI & keyboards ============
+
 MENU_BTN_LIST = "📝 Список напоминаний"
 MENU_BTN_SETTINGS = "⚙️ Настройки"
 
@@ -364,9 +355,8 @@ def render_list_text(items: List[sqlite3.Row], page: int, total_pages: int) -> s
         lines.append(f"• {fmt_dt(r['due_at'])} — «{r['title']}»")
     return "\n".join(lines)
 
-# =====================
-# Scheduling
-# =====================
+# ============ Scheduling ============
+
 def cancel_job_if_exists(app: Application, rid: str):
     jobs = app.bot_data.setdefault("jobs", {})
     job = jobs.pop(rid, None)
@@ -415,9 +405,8 @@ def schedule_all_on_start(app: Application):
             pass
         schedule_job_for(app, r)
 
-# =====================
-# TZ selection UI + Reply menu on start
-# =====================
+# ============ TZ selection + Reply menu ============
+
 TZ_OPTIONS = [
     ("Калининград (+2)", "+02:00"),
     ("Москва (+3)", "+03:00"),
@@ -431,7 +420,6 @@ TZ_OPTIONS = [
 ]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) inline-клавиатура выбора TZ
     tz_buttons = [[InlineKeyboardButton(label, callback_data=f"tz|{offset}")]
                   for label, offset in TZ_OPTIONS]
     tz_buttons.append([InlineKeyboardButton("Другой", callback_data="tz|other")])
@@ -442,7 +430,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Пример: +11 или -4:30",
         reply_markup=tz_kb
     )
-    # 2) reply-меню снизу (покажем отдельным сообщением, чтобы закрепилось)
     reply_kb = ReplyKeyboardMarkup(
         [[MENU_BTN_LIST, MENU_BTN_SETTINGS]],
         resize_keyboard=True,
@@ -481,9 +468,8 @@ async def handle_tz_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Неверный формат. Введите, например: +3, +03:00 или -4:30")
 
-# =====================
-# Menu buttons handler (ReplyKeyboard)
-# =====================
+# ============ Reply-menu buttons handler ============
+
 async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if text == MENU_BTN_LIST:
@@ -492,12 +478,10 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     if text == MENU_BTN_SETTINGS:
         await update.message.reply_text("Раздел «Настройки» в разработке.")
         return
-    # если это не наши кнопки — пропускаем дальше
-    return
+    # если это не наши кнопки — ничего не делаем (сообщение пойдёт в другой хэндлер)
 
-# =====================
-# Core Handlers
-# =====================
+# ============ Core ============
+
 async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PROMPTS
     try:
@@ -572,9 +556,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Не понял. Скажи, например: «завтра в 15 позвонить маме».")
 
-# =====================
-# List / Pagination
-# =====================
+# ============ List / Pagination ============
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await render_list_page(update, context, page=1)
 
@@ -595,9 +578,8 @@ async def render_list_page(update_or_query, context: ContextTypes.DEFAULT_TYPE, 
         q = update_or_query.callback_query
         await q.edit_message_text(text, reply_markup=kb)
 
-# =====================
-# Callbacks
-# =====================
+# ============ Callbacks ============
+
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data or ""
@@ -610,7 +592,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = "Напоминание"
             user_tz = context.user_data.get("tz", DEFAULT_TZ)
             rid = db.add(query.message.chat_id, title, user_tz, iso)
-            await query.edit_message_text(_ack_text(title, iso))
+            await query.edit_message_text(f"📅 Окей, напомню «{title}» {fmt_dt(iso)}")
             schedule_job_for(context.application, db.get(rid))
             return
 
@@ -688,30 +670,30 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# =====================
-# Commands
-# =====================
+# ============ Commands ============
+
 async def cmd_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_list(update, context)
 
-# =====================
-# Main
-# =====================
+# ============ Main ============
+
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # schedule everything on start
+    # Schedule on start
     schedule_all_on_start(app)
 
-    # TZ + reply-menu
+    # TZ + start
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_tz_choice, pattern="^tz"))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^[+-]"), handle_tz_manual))
 
-    # menu buttons handler — ставим ПЕРЕД общим текстовым
-    from re import escape
-menu_filter = filters.Regex(f"^{escape(MENU_BTN_LIST)}$") | filters.Regex(f"^{escape(MENU_BTN_SETTINGS)}$")
-app.add_handler(MessageHandler(menu_filter, handle_menu_buttons))
+    # Reply-menu handler — ТОЛЬКО на две кнопки
+    menu_filter = (
+        filters.Regex(f"^{re.escape(MENU_BTN_LIST)}$") |
+        filters.Regex(f"^{re.escape(MENU_BTN_SETTINGS)}$")
+    )
+    app.add_handler(MessageHandler(menu_filter, handle_menu_buttons))
 
     # Core
     app.add_handler(CommandHandler("reload", reload_prompts))
