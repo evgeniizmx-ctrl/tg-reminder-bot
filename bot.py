@@ -274,7 +274,7 @@ async def call_llm(text: str, user_tz: str) -> LLMResult:
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
 # =====================
-# Local relative-time parser
+# Local relative-time parser (и ФУНКЦИЯ, которой не хватало)
 # =====================
 REL_MIN  = re.compile(r"через\s+(?:минуту|1\s*мин(?:\.|ут)?)\b", re.I)
 REL_NSEC = re.compile(r"через\s+(\d+)\s*сек(?:унд|унды|ун|)?\b", re.I)
@@ -283,6 +283,38 @@ REL_HALF = re.compile(r"через\s+полчаса\b", re.I)
 REL_NH   = re.compile(r"через\s+(\d+)\s*час(?:а|ов)?\b", re.I)
 REL_ND   = re.compile(r"через\s+(\d+)\s*д(ень|ня|ней)?\b", re.I)
 REL_WEEK = re.compile(r"через\s+недел(?:ю|ю)\b", re.I)
+
+def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
+    """Парсим только «через …»: секунды, минуты, час(ы), дни, неделю, полчаса, «минуту»."""
+    tz = tz_from_offset(user_tz)
+    now = datetime.now(tz).replace(microsecond=0)
+
+    m = REL_NSEC.search(text)
+    if m:
+        return (now + timedelta(seconds=int(m.group(1)))).isoformat()
+
+    m = REL_NMIN.search(text)
+    if m:
+        return (now + timedelta(minutes=int(m.group(1)))).isoformat()
+
+    if REL_HALF.search(text):
+        return (now + timedelta(minutes=30)).isoformat()
+
+    m = REL_NH.search(text)
+    if m:
+        return (now + timedelta(hours=int(m.group(1)))).isoformat()
+
+    m = REL_ND.search(text)
+    if m:
+        return (now + timedelta(days=int(m.group(1)))).isoformat()
+
+    if REL_WEEK.search(text):
+        return (now + timedelta(days=7)).isoformat()
+
+    if REL_MIN.search(text):
+        return (now + timedelta(minutes=1)).isoformat()
+
+    return None
 
 # служебные слова/фразы для фолбэк-очистки заголовка
 RX_JUNK = [
@@ -297,16 +329,12 @@ RX_JUNK = [
 
 def extract_title_fallback(text: str) -> str:
     t = text
-    # выкидываем слова «напомни» и пр.
     t = re.sub(r"\b(напомни(ть)?|пожалуйста)\b", "", t, flags=re.I)
-    # убираем все служебные временные конструкции
     for rx in RX_JUNK:
         t = rx.sub("", t)
-    # убираем относительные «через …»
     for rx in (REL_MIN, REL_NSEC, REL_NMIN, REL_HALF, REL_NH, REL_ND, REL_WEEK):
         t = rx.sub("", t)
     t = re.sub(r"\s{2,}", " ", t).strip(" ,.:;–—-")
-    # нормализуем «Падел» с маленькой
     return t or "Напоминание"
 
 def _clean_title_for_relative(text: str) -> str:
@@ -332,9 +360,7 @@ def list_keyboard(items: List[sqlite3.Row], page: int, total_pages: int) -> Inli
     rows = []
     for r in items:
         rid = r["id"]
-        rows.append([
-            InlineKeyboardButton("🗑 Удалить", callback_data=f"ldel|{rid}|p{page}")
-        ])
+        rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"ldel|{rid}|p{page}")])
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("← Назад", callback_data=f"lp|{page-1}"))
@@ -646,7 +672,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if row:
                 db.set_status(rid, "canceled")
                 cancel_job_if_exists(context.application, rid)
-            # обновим список на той же странице
             await render_list_page(update, context, page=page)
             return
 
@@ -669,28 +694,23 @@ async def cmd_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # schedule on start
     schedule_all_on_start(app)
 
-    # TZ + start
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_tz_choice, pattern="^tz"))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^[+-]"), handle_tz_manual))
 
-    # reply-menu: только две кнопки
     menu_filter = (
         filters.Regex(f"^{re.escape(MENU_BTN_LIST)}$") |
         filters.Regex(f"^{re.escape(MENU_BTN_SETTINGS)}$")
     )
     app.add_handler(MessageHandler(menu_filter, handle_menu_buttons))
 
-    # core
     app.add_handler(CommandHandler("reload", reload_prompts))
     app.add_handler(CommandHandler("list", cmd_list_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    # callbacks
     app.add_handler(CallbackQueryHandler(handle_callbacks, pattern="^(pick|snz|done|lp|ldel)"))
 
     async def on_error(update, context):
