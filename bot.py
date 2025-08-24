@@ -709,7 +709,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^[+-]"), handle_tz_manual))
 
     # menu buttons handler — ставим ПЕРЕД общим текстовым
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_buttons))
+    from re import escape
+menu_filter = filters.Regex(f"^{escape(MENU_BTN_LIST)}$") | filters.Regex(f"^{escape(MENU_BTN_SETTINGS)}$")
+app.add_handler(MessageHandler(menu_filter, handle_menu_buttons))
 
     # Core
     app.add_handler(CommandHandler("reload", reload_prompts))
