@@ -5,6 +5,7 @@ import json
 import yaml
 import logging
 from typing import List, Optional
+from datetime import datetime
 
 from pydantic import BaseModel, Field, ValidationError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -103,6 +104,14 @@ class LLMResult(BaseModel):
 # =====================
 # Helpers
 # =====================
+def fmt_dt(iso: str) -> str:
+    try:
+        # fromisoformat принимает "+03:00"; если придёт Z — можно расширить
+        dt = datetime.fromisoformat(iso)
+        return dt.strftime("%d.%m в %H:%M")
+    except Exception:
+        return iso
+
 async def transcribe_voice(file_bytes: bytes, filename: str = "audio.ogg") -> str:
     f = io.BytesIO(file_bytes)
     f.name = filename if filename.endswith(".ogg") else (filename + ".ogg")
@@ -132,7 +141,10 @@ async def call_llm(text: str) -> LLMResult:
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
 def build_time_keyboard(options: List[ReminderOption]) -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(opt.label, callback_data=f"pick|{opt.iso_datetime}") for opt in options]
+    buttons = [
+        InlineKeyboardButton(opt.label, callback_data=f"pick|{opt.iso_datetime}")
+        for opt in options
+    ]
     rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(rows)
 
@@ -140,7 +152,7 @@ def build_time_keyboard(options: List[ReminderOption]) -> InlineKeyboardMarkup:
 # Handlers
 # =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Пришли текст или войс с задачей, а я поставлю напоминание.")
+    await update.message.reply_text("Я тут. Напиши что и когда напомнить.")
 
 async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global PROMPTS
@@ -167,14 +179,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def route_llm_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: LLMResult):
     if result.intent == "create_reminder" and result.fixed_datetime:
-        await update.message.reply_text(
-            f"Напоминание создано: {result.title or result.text_original}\n⏰ {result.fixed_datetime}"
-        )
+        await update.message.reply_text(f"Окей, напомню {fmt_dt(result.fixed_datetime)}")
     elif result.intent == "ask_clarification" and result.options:
         kb = build_time_keyboard(result.options)
-        await update.message.reply_text("Уточни время:", reply_markup=kb)
+        await update.message.reply_text("Уточни:", reply_markup=kb)
     else:
-        await update.message.reply_text("Я не понял, попробуй ещё раз.")
+        await update.message.reply_text("Не понял. Скажи, например: «завтра в 15 позвонить маме».")
 
 async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -188,14 +198,13 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, iso = data.split("::", 1)
         else:
             iso = data
-        await query.edit_message_text(f"Напоминание создано на {iso}")
-        # TODO: сохранить в БД и поставить планировщик
+        await query.edit_message_text(f"Окей, напомню {fmt_dt(iso)}")
+        # TODO: здесь — сохранение и постановка планировки
     except Exception as e:
         logging.exception("handle_pick failed: %s", e)
         try:
             chat_id = (query.message.chat_id if query.message else update.effective_chat.id)
-            await context.bot.send_message(chat_id=chat_id,
-                                           text=f"Напоминание создано на {locals().get('iso','?')}")
+            await context.bot.send_message(chat_id=chat_id, text=f"Окей, напомню {fmt_dt(locals().get('iso','?'))}")
         except Exception:
             logging.exception("fallback send_message failed")
 
