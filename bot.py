@@ -21,7 +21,7 @@ except Exception:
     OpenAI = None
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")   # для парсинга текста
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")   # парсер текста
 WHISPER_MODEL  = os.getenv("WHISPER_MODEL", "whisper-1")    # STT
 
 # ========= Telegram / TZ =========
@@ -48,39 +48,34 @@ REMINDERS: list[dict] = []             # {"user_id","text","remind_dt","repeat"}
 PENDING: dict[int, dict] = {}          # {"description","candidates":[iso,...]}
 USER_TZS: dict[int, str] = {}          # user_id -> IANA | "UTC+<minutes>"
 
-# ========= FFmpeg path resolve + smoke =========
-def resolve_ffmpeg_path() -> str:
-    """
-    Ищем рабочий ffmpeg:
-    1) если FFMPEG_PATH задан и существует — используем его (иначе игнорируем);
-    2) which ffmpeg (в Railway/Nixpacks обычно /nix/store/.../bin/ffmpeg);
-    3) стандартные пути.
-    """
-    candidates = []
+# ========= ffmpeg: мягкое определение (не падаем, если нет) =========
+FFMPEG_PATH: str | None = None  # если None — войсы отключены
+
+def try_resolve_ffmpeg() -> str | None:
+    # 1) ENV
     env = os.getenv("FFMPEG_PATH")
-    if env:
-        candidates.append(env)
-
+    if env and os.path.exists(env) and os.access(env, os.X_OK):
+        return os.path.realpath(env)
+    # 2) which ffmpeg
     found = shutil.which("ffmpeg")
-    if found:
-        candidates.append(found)
-
-    candidates += ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-
-    for p in candidates:
-        if p and os.path.exists(p) and os.access(p, os.X_OK):
+    if found and os.path.exists(found) and os.access(found, os.X_OK):
+        return os.path.realpath(found)
+    # 3) типовые пути
+    for p in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if os.path.exists(p) and os.access(p, os.X_OK):
             return os.path.realpath(p)
+    return None
 
-    raise FileNotFoundError(
-        "ffmpeg not found. Установи ffmpeg (Railway: NIXPACKS_PKGS=ffmpeg) "
-        "или добавь его в PATH."
-    )
-
-FFMPEG_PATH = resolve_ffmpeg_path()
-print(f"[init] Using ffmpeg at: {FFMPEG_PATH}")
+FFMPEG_PATH = try_resolve_ffmpeg()
+if FFMPEG_PATH:
+    print(f"[init] Using ffmpeg at: {FFMPEG_PATH}")
+else:
+    print("[init] ffmpeg not found — voice features disabled (text reminders still work).")
 
 async def _smoke_ffmpeg():
-    """Пробный запуск ffmpeg -version; если не вышло — падаем с понятной ошибкой."""
+    """Если ffmpeg есть — проверим -version; если нет — просто пропустим."""
+    if not FFMPEG_PATH:
+        return
     proc = await asyncio.create_subprocess_exec(
         FFMPEG_PATH, "-version",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -295,19 +290,22 @@ async def cmd_ping(m: Message):
 @router.message(Command("debug"))
 async def cmd_debug(m: Message):
     try:
-        proc = await asyncio.create_subprocess_exec(
-            FFMPEG_PATH, "-version",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        out, err = await proc.communicate()
-        ff_line = (out or b"").decode(errors="ignore").splitlines()[0] if proc.returncode == 0 else (err or b"").decode(errors="ignore")[:120]
+        if FFMPEG_PATH:
+            proc = await asyncio.create_subprocess_exec(
+                FFMPEG_PATH, "-version",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await proc.communicate()
+            ff_line = (out or b"").decode(errors="ignore").splitlines()[0] if proc.returncode == 0 else (err or b"").decode(errors="ignore")[:120]
+        else:
+            ff_line = "not found"
     except Exception as e:
         ff_line = f"error: {e}"
 
     await m.answer(
         "🔎 DEBUG\n"
         f"TZ(default): {BASE_TZ.zone}\n"
-        f"FFMPEG_PATH: {FFMPEG_PATH}\n"
+        f"FFMPEG_PATH: {FFMPEG_PATH or 'None'}\n"
         f"ffmpeg: {ff_line}\n"
         f"OPENAI_API_KEY: {'set' if OPENAI_API_KEY else 'MISSING'}\n"
         f"Python: {platform.python_version()}"
@@ -390,6 +388,8 @@ oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if OpenAI else None
 
 async def ogg_to_wav(src_ogg: str, dst_wav: str) -> None:
     """OGG/OPUS -> WAV 16kHz mono с подробным stderr."""
+    if not FFMPEG_PATH:
+        raise RuntimeError("ffmpeg not available")
     proc = await asyncio.create_subprocess_exec(
         FFMPEG_PATH, "-nostdin", "-loglevel", "error",
         "-y", "-i", src_ogg, "-ac", "1", "-ar", "16000", dst_wav,
@@ -413,6 +413,10 @@ async def transcribe_file_to_text(path: str, lang: str = "ru") -> str:
 
 @voice_router.message(F.voice)
 async def on_voice(m: Message):
+    if not FFMPEG_PATH:
+        await m.reply("Голосовые временно недоступны (ffmpeg не установлен на сервере). Текст — работает.")
+        return
+
     uid = m.from_user.id
     if need_tz(uid):
         await ask_tz(m); return
@@ -462,7 +466,10 @@ async def on_voice(m: Message):
 
 @voice_router.message(F.audio)
 async def on_audio(m: Message):
-    """Обычные аудио (mp3/m4a/webm) — без ffmpeg, для проверки канала до Whisper."""
+    if not FFMPEG_PATH:
+        await m.reply("Аудио временно недоступны (ffmpeg не установлен на сервере). Текст — работает.")
+        return
+
     uid = m.from_user.id
     if need_tz(uid):
         await ask_tz(m); return
@@ -501,9 +508,10 @@ async def on_audio(m: Message):
 
 # ========= RUN =========
 async def main():
-    await _smoke_ffmpeg()   # проверим ffmpeg до запуска бота
+    await _smoke_ffmpeg()   # если ffmpeg есть — проверим; если нет — просто идём дальше
     scheduler.start()
     print("✅ bot is polling")
     await dp.start_polling(bot)
+
 if __name__ == "__main__":
     asyncio.run(main())
