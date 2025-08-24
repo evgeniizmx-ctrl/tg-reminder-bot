@@ -8,6 +8,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import UpdateType
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -19,11 +20,15 @@ from openai import OpenAI
 # =====================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+# -------- Token extraction & validation --------
 def _extract_token(raw: str | None) -> str:
     if not raw:
         return ""
-    raw = raw.strip().replace("\u200b", "").replace("\u200c", "").replace("\uFEFF", "")
+    raw = raw.strip()
+    # убрать невидимые символы/кавычки
+    raw = raw.replace("\u200b", "").replace("\u200c", "").replace("\uFEFF", "")
     raw = raw.strip(" '\"")
+    # вытащить первый токен по паттерну
     m = re.search(r"[0-9]+:[A-Za-z0-9_-]{30,}", raw)
     return m.group(0) if m else raw
 
@@ -39,13 +44,15 @@ TRANSCRIBE_MODEL = os.getenv("ASR_MODEL", "whisper-1")
 def _valid_token(t: str) -> bool:
     return bool(re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", t))
 
-logging.info("Env debug: TELEGRAM_TOKEN=%r BOT_TOKEN=%r | picked=%r",
-             RAW_TELEGRAM_TOKEN, RAW_BOT_TOKEN, TOKEN)
+logging.info(
+    "Env debug: TELEGRAM_TOKEN=%r BOT_TOKEN=%r | picked=%r",
+    RAW_TELEGRAM_TOKEN, RAW_BOT_TOKEN, TOKEN
+)
 
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN / BOT_TOKEN not set (empty)")
 if not _valid_token(TOKEN):
-    raise RuntimeError(f"TELEGRAM_TOKEN invalid format → {TOKEN!r}")
+    raise RuntimeError(f"TELEGRAM_TOKEN invalid format → {TOKEN!r} (must be 123456789:AAAA...)")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 
@@ -133,8 +140,7 @@ async def call_llm(text: str) -> LLMResult:
 def build_time_keyboard(options: List[ReminderOption]) -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(opt.label, callback_data=f"pick|{opt.iso_datetime}")
-        for opt in options
-    ]
+    for opt in options]
     rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(rows)
 
@@ -183,7 +189,7 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     try:
         logging.info("CallbackQuery data=%r", data)
-        await query.answer()  # убираем "спиннер"
+        await query.answer()  # убрать спиннер
         if "|" in data:
             _, iso = data.split("|", 1)
         elif "::" in data:
@@ -191,6 +197,7 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             iso = data
         await query.edit_message_text(f"Напоминание создано на {iso}")
+        # TODO: здесь сохранить в БД и поставить планировщик
     except Exception as e:
         logging.exception("handle_pick failed: %s", e)
         try:
@@ -205,13 +212,24 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================
 def main():
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reload", reload_prompts))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(CallbackQueryHandler(handle_pick))  # без pattern
+    app.add_handler(CallbackQueryHandler(handle_pick))  # без pattern — ловим все callback_query
+
+    async def on_error(update, context):
+        logging.exception("PTB error: %s | update=%r", context.error, update)
+    app.add_error_handler(on_error)
+
     logging.info("Bot starting… polling enabled")
-    app.run_polling()
+    app.run_polling(
+        allowed_updates=UpdateType.ALL_TYPES,
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=10
+    )
 
 if __name__ == "__main__":
     main()
