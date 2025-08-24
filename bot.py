@@ -1,4 +1,4 @@
-# bot.py
+# bot.py — умный NLU + аккуратные описания, кнопки только при реальной двусмысленности
 import os
 import re
 import json
@@ -21,11 +21,11 @@ try:
     from openai import RateLimitError, APIStatusError, BadRequestError
 except Exception:
     OpenAI = None
-    RateLimitError = APIStatusError = BadRequestError = Exception  # заглушки
+    RateLimitError = APIStatusError = BadRequestError = Exception
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")              # NLU-парсер
-WHISPER_MODEL  = os.getenv("WHISPER_MODEL", "gpt-4o-mini-transcribe")  # STT
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+WHISPER_MODEL  = os.getenv("WHISPER_MODEL", "gpt-4o-mini-transcribe")
 
 # ========= Telegram / TZ =========
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
@@ -44,7 +44,7 @@ dp.include_router(voice_router)
 
 scheduler = AsyncIOScheduler(timezone=BASE_TZ)
 
-# ========= In-memory (MVP) =========
+# ========= In-memory =========
 REMINDERS: list[dict] = []
 PENDING: dict[int, dict] = {}
 USER_TZS: dict[int, str] = {}
@@ -147,12 +147,6 @@ async def ask_tz(m: Message):
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s or "", flags=re.UNICODE).strip()
 
-def clean_desc(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"^(напомни(те)?|пожалуйста)\b[\s,:-]*", "", s, flags=re.I)
-    s = re.sub(r"^(о|про|насч[её]т)\s+", "", s, flags=re.I)
-    return s.strip() or "Напоминание"
-
 def fmt_dt_local(dt: datetime) -> str:
     return f"{dt.strftime('%d.%m')} в {dt.strftime('%H:%M')}"
 
@@ -186,90 +180,123 @@ async def send_reminder(uid: int, text: str):
     except Exception as e:
         print("send_reminder error:", e)
 
-# ========= LLM-парсер =========
-SYSTEM_PROMPT = """Ты — интеллектуальный парсер напоминаний на русском языке.
-Возвращай строго JSON:
+# ========= LLM-парсер (умный) =========
+SYSTEM_PROMPT = """Ты — умный парсер напоминаний на русском. Верни строго JSON по схеме:
 {
   "ok": true|false,
-  "description": "строка",
-  "datetimes": ["ISO8601", ...],
-  "need_clarification": true|false,
+  "description": "string",           // краткое ДЕЛО без даты/времени/слов «сегодня/завтра» и без слова «Напоминание»
+  "datetimes": ["ISO8601", ...],     // 1 время — когда всё однозначно, РОВНО 2 времени — только если двусмысленно (например «в 4»)
+  "need_clarification": true|false,  // true если времени нет или дата/время неполные
   "clarify_type": "time|date|both|none",
-  "reason": "строка"
+  "reason": "string"                 // коротко почему нужна ясность
 }
-Правила:
-- Понимай разговорные формы и опечатки.
-- Если время задано как «H утра/дня/вечера/ночи» (или «H часа/часов дня/вечера/утра/ночи»),
-  возвращай ОДИН кандидат, сконвертированный по меридиану:
-  • утро/ночь → H:00 в 00:00–11:59 (12 = 00:00)
-  • день/вечер → (H+12):00 в 12:00–23:59.
-- Если время указано в 24-часовом формате («17:30», «1730», «08:05»),
-  возвращай ОДИН кандидат с именно этим временем.
-- Только если указано «в H» (H 1..12) БЕЗ слов утро/день/вечер/ночь — верни ДВА кандидата: H:00 и (H+12):00.
-- Если в запросе только дата — попроси время (need_clarification=true).
-ISO возвращай с таймзоной пользователя из контекста 'user_tz'.
+ВАЖНО:
+- Не добавляй фразы вроде «Напоминание на…». Описание — только смысл задачи (например: «падел с Никитой», «позвонить маме»).
+- Не пиши время/дату в description. Не переводись числа в слова: «11:30», а не «одиннадцать тридцать».
+- Понимай разговорные формы, ошибки («щавтра»=«завтра», «падел»=допустимо как есть), «через 20 минут», «полтретьего», «без пяти пять».
+- Если время с меридианом (утра/дня/вечера/ночи) — верни ОДНО время с соответствующим часом.
+- Если 24-часовой формат («17:30», «1730», «08:05») — верни ОДНО время ровно так.
+- Только «в H» (H 1..12) без меридиана — верни ДВА кандидата: H:00 и (H+12):00 одной даты.
+- Используй now_local и user_tz из пользователя, чтобы вычислить дату (например «завтра»).
 """
 
-def build_user_prompt(uid: int, text: str) -> str:
+FEW_SHOTS = [
+    {
+        "user_text": "завтра падел в 11:30",
+        "now_local": "2025-08-24 12:00:00",
+        "user_tz": "Europe/Moscow",
+        "expect": {
+            "ok": True, "description": "падел", "need_clarification": False,
+            "datetimes": ["2025-08-25T11:30:00+03:00"]
+        }
+    },
+    {
+        "user_text": "в 1730 щавтра падел",
+        "now_local": "2025-08-24 12:00:00",
+        "user_tz": "Europe/Moscow",
+        "expect": {
+            "ok": True, "description": "падел",
+            "datetimes": ["2025-08-25T17:30:00+03:00"]
+        }
+    },
+    {
+        "user_text": "завтра в 4 встреча",
+        "now_local": "2025-08-24 12:00:00",
+        "user_tz": "Europe/Moscow",
+        "expect": {
+            "ok": True, "description": "встреча",
+            "datetimes": ["2025-08-25T04:00:00+03:00","2025-08-25T16:00:00+03:00"]
+        }
+    },
+    {
+        "user_text": "через 20 минут кол",
+        "now_local": "2025-08-24 12:00:00",
+        "user_tz": "Europe/Moscow",
+        "expect": {
+            "ok": True, "description": "кол",
+            "datetimes": ["2025-08-24T12:20:00+03:00"]
+        }
+    }
+]
+
+def build_user_prompt(uid: int, text: str) -> list[dict]:
     tz = get_user_tz(uid)
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    return json.dumps({
-        "user_text": text,
-        "now_local": now,
-        "user_tz": getattr(tz, "zone", None) or f"UTC{tz.utcoffset(datetime.utcnow())}",
-        "locale": "ru-RU"
-    }, ensure_ascii=False)
+    base = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps({
+            "user_text": text,
+            "now_local": now,
+            "user_tz": getattr(tz, "zone", None) or "UTC",
+            "locale": "ru-RU"
+        }, ensure_ascii=False)}
+    ]
+    # мини few-shot для стабилизации поведения
+    for ex in FEW_SHOTS:
+        base.append({"role": "user", "content": json.dumps(ex, ensure_ascii=False)})
+        base.append({"role": "assistant", "content": json.dumps(ex["expect"], ensure_ascii=False)})
+    return base
 
 async def ai_parse(uid: int, text: str) -> dict:
     if not (OpenAI and OPENAI_API_KEY):
-        return {"ok": False, "description": clean_desc(text), "datetimes": [], "need_clarification": True, "clarify_type": "time", "reason": "LLM disabled"}
+        return {"ok": False, "description": text, "datetimes": [], "need_clarification": True, "clarify_type": "time", "reason": "LLM disabled"}
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
         rsp = await asyncio.to_thread(
             client.chat.completions.create,
             model=OPENAI_MODEL,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_user_prompt(uid, text)}
-            ],
+            temperature=0.1,
+            messages=build_user_prompt(uid, text),
             response_format={"type": "json_object"},
         )
         data = json.loads(rsp.choices[0].message.content)
         data.setdefault("ok", False)
-        data.setdefault("description", clean_desc(text))
+        data.setdefault("description", text)
         data.setdefault("datetimes", [])
         data.setdefault("need_clarification", not data.get("ok"))
         data.setdefault("clarify_type", "time" if not data.get("ok") else "none")
         return data
     except Exception as e:
         print("ai_parse error:", e)
-        return {"ok": False, "description": clean_desc(text), "datetimes": [], "need_clarification": True, "clarify_type": "time", "reason": "LLM error"}
+        return {"ok": False, "description": text, "datetimes": [], "need_clarification": True, "clarify_type": "time", "reason": "LLM error"}
 
-# ========= Сжимаем двусмысленность (меридиан/24ч) =========
+# ========= Сжатие двусмысленности (страховки) =========
 MERIDIEM_RX = re.compile(
     r"\b(?P<h>\d{1,2})\s*(?:час(?:а|ов)?)?\s*(?P<mer>утра|утром|дня|днём|днем|вечера|вечером|ночи|ночью)\b",
     re.I | re.U
 )
-
 def _meridiem_target_hour(h: int, mer: str) -> int:
     m = mer.lower()
-    if m.startswith("утр"):  # утром/утра
-        return 0 if h == 12 else h % 12
-    if m.startswith("дн"):   # дня/днём
-        return (h % 12) + 12
-    if m.startswith("веч"):  # вечера/вечером
-        return (h % 12) + 12
+    if m.startswith("утр"):  return 0 if h == 12 else h % 12
+    if m.startswith("дн"):   return (h % 12) + 12
+    if m.startswith("веч"):  return (h % 12) + 12
     return 0 if h == 12 else h % 12  # ночь
 
 def collapse_by_meridiem(uid: int, text: str, dt_isos: list[str]) -> list[str]:
     m = MERIDIEM_RX.search(text or "")
-    if not m or not dt_isos:
-        return dt_isos
-    try:
-        h = int(m.group("h"))
-    except Exception:
-        return dt_isos
+    if not m or not dt_isos: return dt_isos
+    try: h = int(m.group("h"))
+    except Exception: return dt_isos
     target_h = _meridiem_target_hour(h, m.group("mer"))
     for iso in dt_isos:
         dt = as_local_for(uid, iso)
@@ -280,16 +307,13 @@ def collapse_by_meridiem(uid: int, text: str, dt_isos: list[str]) -> list[str]:
     return [fixed.isoformat()]
 
 COMPACT_24H_RX = re.compile(
-    r"(?<!\d)(?P<h>[01]?\d|2[0-3])(?:[:.\s]?(?P<m>[0-5]\d))\b",  # 1730, 17:30, 17.30, 8:05
+    r"(?<!\d)(?P<h>[01]?\d|2[0-3])(?:[:.\s]?(?P<m>[0-5]\d))\b",
     re.I | re.U,
 )
-
 def collapse_by_24h(uid: int, text: str, dt_isos: list[str]) -> list[str]:
     m = COMPACT_24H_RX.search(text or "")
-    if not m or not dt_isos:
-        return dt_isos
-    h = int(m.group("h"))
-    mm = int(m.group("m") or 0)
+    if not m or not dt_isos: return dt_isos
+    h = int(m.group("h")); mm = int(m.group("m") or 0)
     for iso in dt_isos:
         dt = as_local_for(uid, iso)
         if dt.hour == h and dt.minute == mm:
@@ -305,7 +329,7 @@ async def cmd_start(m: Message):
         await ask_tz(m)
     else:
         await m.answer(
-            "Готов работать. Пиши: «завтра в полтретьего падел», «через 2 часа чай», «сегодня в 1710 отчёт».\n"
+            "Готов. Пиши: «завтра в 11:30 падел», «через 20 минут созвон», «завтра в 4».\n"
             "/tz — сменить пояс, /list — список, /cancel — отменить уточнение."
         )
 
@@ -358,7 +382,7 @@ async def cmd_debug(m: Message):
         f"Python: {platform.python_version()}"
     )
 
-# ========= Текст (сначала «склейки», потом логика ≥2/==1) =========
+# ========= Текст =========
 @router.message(F.text)
 async def on_text(m: Message):
     uid = m.from_user.id
@@ -373,10 +397,10 @@ async def on_text(m: Message):
         await ask_tz(m); return
 
     data = await ai_parse(uid, text)
-    desc = clean_desc(data.get("description") or text)
+    desc = (data.get("description") or "").strip() or text.strip()
     cands = data.get("datetimes", [])
 
-    # сначала «жёсткие» правила
+    # «страховки» — уменьшаем лишние вопросы
     cands = collapse_by_24h(uid, text, cands)
     cands = collapse_by_meridiem(uid, text, cands)
 
@@ -399,7 +423,7 @@ async def on_text(m: Message):
 
     await m.reply("Не понял. Скажи, когда напомнить (например: «завтра в 19 отчёт»).")
 
-# ========= Callback'и =========
+# ========= Callback’и =========
 @router.callback_query(F.data.startswith("settz|"))
 async def cb_settz(cb: CallbackQuery):
     uid = cb.from_user.id
@@ -492,18 +516,18 @@ async def on_voice(m: Message):
         if os.path.getsize(ogg_path) == 0:
             await m.reply("Файл скачался пустым. Отправь голосовое ещё раз."); return
         try:    await ogg_to_wav(ogg_path, wav_path)
-        except Exception as e:
+        except Exception:
             await m.reply("Не смог обработать аудио (конвертация)."); return
         await m.chat.do("typing")
         try:    text = await transcribe_file_to_text(wav_path, lang="ru")
-        except RuntimeError as e:
+        except RuntimeError:
             await m.reply("Whisper не принял файл или квота исчерпана."); return
 
     if not text:
         await m.reply("Пустая расшифровка — повтори, пожалуйста."); return
 
     data = await ai_parse(uid, text)
-    desc = clean_desc(data.get("description") or text)
+    desc = (data.get("description") or "").strip() or text.strip()
     cands = collapse_by_24h(uid, text, data.get("datetimes", []))
     cands = collapse_by_meridiem(uid, text, cands)
 
@@ -534,14 +558,14 @@ async def on_audio(m: Message):
             await m.reply("Аудио скачалось пустым."); return
         await m.chat.do("typing")
         try:    text = await transcribe_file_to_text(path, lang="ru")
-        except RuntimeError as e:
+        except RuntimeError:
             await m.reply("Whisper не принял файл или квота исчерпана."); return
 
     if not text:
         await m.reply("Пустая расшифровка."); return
 
     data = await ai_parse(uid, text)
-    desc = clean_desc(data.get("description") or text)
+    desc = (data.get("description") or "").strip() or text.strip()
     cands = collapse_by_24h(uid, text, data.get("datetimes", []))
     cands = collapse_by_meridiem(uid, text, cands)
 
