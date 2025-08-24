@@ -12,6 +12,7 @@ import pytz
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ========= OpenAI (LLM + Whisper) =========
@@ -35,7 +36,6 @@ if not BOT_TOKEN:
 bot = Bot(BOT_TOKEN)
 dp  = Dispatcher()
 
-# маршрутизаторы
 router = Router()
 voice_router = Router()
 dp.include_router(router)
@@ -44,23 +44,20 @@ dp.include_router(voice_router)
 scheduler = AsyncIOScheduler(timezone=BASE_TZ)
 
 # ========= In-memory (MVP) =========
-REMINDERS: list[dict] = []             # {"user_id","text","remind_dt","repeat"}
-PENDING: dict[int, dict] = {}          # {"description","candidates":[iso,...]}
-USER_TZS: dict[int, str] = {}          # user_id -> IANA | "UTC+<minutes>"
+REMINDERS: list[dict] = []
+PENDING: dict[int, dict] = {}
+USER_TZS: dict[int, str] = {}
 
-# ========= ffmpeg: мягкое определение (не падаем, если нет) =========
-FFMPEG_PATH: str | None = None  # если None — войсы отключены
+# ========= ffmpeg (устойчивое определение) =========
+FFMPEG_PATH: str | None = None
 
 def try_resolve_ffmpeg() -> str | None:
-    # 1) ENV
     env = os.getenv("FFMPEG_PATH")
     if env and os.path.exists(env) and os.access(env, os.X_OK):
         return os.path.realpath(env)
-    # 2) which ffmpeg
     found = shutil.which("ffmpeg")
     if found and os.path.exists(found) and os.access(found, os.X_OK):
         return os.path.realpath(found)
-    # 3) типовые пути
     for p in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
         if os.path.exists(p) and os.access(p, os.X_OK):
             return os.path.realpath(p)
@@ -73,7 +70,6 @@ else:
     print("[init] ffmpeg not found — voice features disabled (text reminders still work).")
 
 async def _smoke_ffmpeg():
-    """Если ffmpeg есть — проверим -version; если нет — просто пропустим."""
     if not FFMPEG_PATH:
         return
     proc = await asyncio.create_subprocess_exec(
@@ -111,12 +107,10 @@ OFFSET_FLEX_RX = re.compile(r"^[+-]?\s*(\d{1,2})(?::\s*([0-5]\d))?$")
 
 def parse_user_tz_string(s: str):
     s = (s or "").strip()
-    # IANA?
     try:
         return pytz.timezone(s)
     except Exception:
         pass
-    # +HH[:MM]
     m = OFFSET_FLEX_RX.match(s)
     if not m:
         return None
@@ -348,46 +342,70 @@ async def on_text(m: Message):
 
     await m.reply("Не понял. Скажи, когда напомнить (например: «завтра в 19 отчёт»).")
 
-# ========= Callback'и =========
+# ========= Callback'и (безопасно отрабатываем просрочку) =========
 @router.callback_query(F.data.startswith("settz|"))
 async def cb_settz(cb: CallbackQuery):
     uid = cb.from_user.id
     _, payload = cb.data.split("|", 1)
     if payload == "ASK_OFFSET":
-        await cb.message.answer("Введи смещение: +03:00, +3:00, +3, 3, 03 или IANA (Europe/Moscow).")
-        await cb.answer(); return
+        try:
+            await cb.message.answer("Введи смещение: +03:00, +3:00, +3, 3, 03 или IANA (Europe/Moscow).")
+            await cb.answer()
+        except TelegramBadRequest:
+            pass
+        return
     tz_obj = parse_user_tz_string(payload)
     if tz_obj is None:
-        await cb.answer("Не понял часовой пояс", show_alert=True); return
+        try:
+            await cb.answer("Не понял часовой пояс", show_alert=True)
+        except TelegramBadRequest:
+            pass
+        return
     store_user_tz(uid, tz_obj)
     try:
         await cb.message.edit_text("Часовой пояс сохранён. Пиши напоминание ✍️")
-    except Exception:
-        await cb.message.answer("Часовой пояс сохранён. Пиши напоминание ✍️")
-    await cb.answer("OK")
+    except TelegramBadRequest:
+        try:
+            await cb.message.answer("Часовой пояс сохранён. Пиши напоминание ✍️")
+        except TelegramBadRequest:
+            pass
+    try:
+        await cb.answer("OK")
+    except TelegramBadRequest:
+        pass
 
 @router.callback_query(F.data.startswith("time|"))
 async def cb_time(cb: CallbackQuery):
     uid = cb.from_user.id
     if uid not in PENDING or not PENDING[uid].get("candidates"):
-        await cb.answer("Нет активного уточнения"); return
+        try:
+            await cb.answer("Нет активного уточнения")
+        except TelegramBadRequest:
+            pass
+        return
     iso = cb.data.split("|", 1)[1]
     dt = as_local_for(uid, iso)
     desc = PENDING[uid].get("description","Напоминание")
     PENDING.pop(uid, None)
     REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
     plan(REMINDERS[-1])
+
     try:
         await cb.message.edit_text(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
-    except Exception:
-        await cb.message.answer(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
-    await cb.answer("Установлено ✅")
+    except TelegramBadRequest:
+        try:
+            await cb.message.answer(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
+        except TelegramBadRequest:
+            pass
+    try:
+        await cb.answer("Установлено ✅")
+    except TelegramBadRequest:
+        pass
 
 # ========= Голос / Аудио (Whisper) =========
 oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if OpenAI else None
 
 async def ogg_to_wav(src_ogg: str, dst_wav: str) -> None:
-    """OGG/OPUS -> WAV 16kHz mono с подробным stderr."""
     if not FFMPEG_PATH:
         raise RuntimeError("ffmpeg not available")
     proc = await asyncio.create_subprocess_exec(
@@ -425,7 +443,6 @@ async def on_voice(m: Message):
     with tempfile.TemporaryDirectory() as tmpd:
         ogg_path = f"{tmpd}/in.ogg"
         wav_path = f"{tmpd}/in.wav"
-
         await m.bot.download(tg_file, destination=ogg_path)
 
         size = os.path.getsize(ogg_path)
@@ -508,10 +525,14 @@ async def on_audio(m: Message):
 
 # ========= RUN =========
 async def main():
-    await _smoke_ffmpeg()   # если ffmpeg есть — проверим; если нет — просто идём дальше
+    await _smoke_ffmpeg()
     scheduler.start()
     print("✅ bot is polling")
-    await dp.start_polling(bot)
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
+        drop_pending_updates=True,  # не берём старые апдейты при рестарте
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
