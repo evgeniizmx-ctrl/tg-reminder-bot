@@ -18,12 +18,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # ========= OpenAI (LLM + Whisper) =========
 try:
     from openai import OpenAI
+    from openai import RateLimitError, APIStatusError, BadRequestError
 except Exception:
     OpenAI = None
+    RateLimitError = APIStatusError = BadRequestError = Exception  # заглушки
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")   # парсер текста
-WHISPER_MODEL  = os.getenv("WHISPER_MODEL", "whisper-1")    # STT
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")       # NLU-парсер
+WHISPER_MODEL  = os.getenv("WHISPER_MODEL", "gpt-4o-mini-transcribe")  # STT
 
 # ========= Telegram / TZ =========
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
@@ -203,8 +205,14 @@ SYSTEM_PROMPT = """Ты — интеллектуальный парсер нап
   "clarify_type": "time|date|both|none",
   "reason": "строка"
 }
-Понимай разговорные формы; если часы двусмысленны — верни 2 кандидата (06:00 и 18:00).
-Если только дата — попроси время. Если только время — поставь на ближайшее будущее. Описание очисти от вводных слов.
+Правила:
+- Понимай разговорные формы и опечатки.
+- Если время указано как «в H» (H от 1 до 12) без слов «утром/днём/вечером/ночью»,
+  верни ДВА кандидата для того же дня: H:00 и (H+12):00.
+- Если в запросе только дата — попроси время (need_clarification=true, clarify_type="time").
+- Если только время — ставь на ближайшее будущее.
+- Описание очисти от вводных слов.
+- ISO8601 возвращай с таймзоной пользователя, из контекста 'user_tz'.
 """
 
 def build_user_prompt(uid: int, text: str) -> str:
@@ -305,7 +313,7 @@ async def cmd_debug(m: Message):
         f"Python: {platform.python_version()}"
     )
 
-# ========= Текст =========
+# ========= Текст (исправленный порядок логики) =========
 @router.message(F.text)
 async def on_text(m: Message):
     uid = m.from_user.id
@@ -321,20 +329,23 @@ async def on_text(m: Message):
 
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
+    cands = data.get("datetimes", [])
 
-    if data.get("ok") and data.get("datetimes"):
-        dt = as_local_for(uid, data["datetimes"][0])
+    # 1) если двусмысленно — сначала кнопки
+    if data.get("ok") and len(cands) >= 2:
+        PENDING[uid] = {"description": desc, "candidates": cands}
+        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
+        return
+
+    # 2) если один кандидат — сразу ставим
+    if data.get("ok") and len(cands) == 1:
+        dt = as_local_for(uid, cands[0])
         REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
         plan(REMINDERS[-1])
         await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
         return
 
-    cands = data.get("datetimes", [])
-    if len(cands) >= 2:
-        PENDING[uid] = {"description": desc, "candidates": cands}
-        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
-        return
-
+    # 3) если нужна конкретизация — спрашиваем
     if data.get("need_clarification", True):
         PENDING[uid] = {"description": desc}
         await m.reply(f"Окей, «{desc}». Уточни дату/время.")
@@ -421,13 +432,24 @@ async def transcribe_file_to_text(path: str, lang: str = "ru") -> str:
     if not oa_client:
         raise RuntimeError("OpenAI client not initialized")
     loop = asyncio.get_running_loop()
+
     def _run():
         with open(path, "rb") as f:
-            r = oa_client.audio.transcriptions.create(
-                model=WHISPER_MODEL, file=f, language=lang
+            return oa_client.audio.transcriptions.create(
+                model=WHISPER_MODEL,
+                file=f,
+                language=lang,
             )
+
+    try:
+        r = await loop.run_in_executor(None, _run)
         return (r.text or "").strip()
-    return await loop.run_in_executor(None, _run)
+    except RateLimitError:
+        raise RuntimeError("QUOTA_EXCEEDED")
+    except APIStatusError as e:
+        raise RuntimeError(f"API_STATUS_{getattr(e, 'status', 'NA')}")
+    except BadRequestError as e:
+        raise RuntimeError(f"BAD_REQUEST_{getattr(e, 'message', 'unknown')}")
 
 @voice_router.message(F.voice)
 async def on_voice(m: Message):
@@ -462,18 +484,28 @@ async def on_voice(m: Message):
         await m.chat.do("typing")
         try:
             text = await transcribe_file_to_text(wav_path, lang="ru")
-        except Exception as e:
-            print("[WHISPER ERROR]", e)
-            await m.reply("Whisper не принял файл. Попробуй ещё раз."); return
+        except RuntimeError as e:
+            msg = str(e)
+            if msg == "QUOTA_EXCEEDED":
+                await m.reply("🎙️ Распознавание временно недоступно: исчерпана квота OpenAI для голосового распознавания. Текстовые напоминания работают.")
+            else:
+                await m.reply("Whisper не принял файл. Попробуй ещё раз позже.")
+            return
 
     if not text:
         await m.reply("Пустая расшифровка — повтори, пожалуйста."); return
 
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
+    cands = data.get("datetimes", [])
 
-    if data.get("ok") and data.get("datetimes"):
-        dt = as_local_for(uid, data["datetimes"][0])
+    if data.get("ok") and len(cands) >= 2:
+        PENDING[uid] = {"description": desc, "candidates": cands}
+        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
+        return
+
+    if data.get("ok") and len(cands) == 1:
+        dt = as_local_for(uid, cands[0])
         REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
         plan(REMINDERS[-1])
         await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
@@ -504,18 +536,28 @@ async def on_audio(m: Message):
         await m.chat.do("typing")
         try:
             text = await transcribe_file_to_text(path, lang="ru")
-        except Exception as e:
-            print("[WHISPER AUDIO ERROR]", e)
-            await m.reply("Whisper не принял файл."); return
+        except RuntimeError as e:
+            msg = str(e)
+            if msg == "QUOTA_EXCEEDED":
+                await m.reply("🎙️ Распознавание временно недоступно: исчерпана квота OpenAI для голосового распознавания. Текстовые напоминания работают.")
+            else:
+                await m.reply("Whisper не принял файл. Попробуй ещё раз позже.")
+            return
 
     if not text:
         await m.reply("Пустая расшифровка."); return
 
     data = await ai_parse(uid, text)
     desc = clean_desc(data.get("description") or text)
+    cands = data.get("datetimes", [])
 
-    if data.get("ok") and data.get("datetimes"):
-        dt = as_local_for(uid, data["datetimes"][0])
+    if data.get("ok") and len(cands) >= 2:
+        PENDING[uid] = {"description": desc, "candidates": cands}
+        await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
+        return
+
+    if data.get("ok") and len(cands) == 1:
+        dt = as_local_for(uid, cands[0])
         REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
         plan(REMINDERS[-1])
         await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
