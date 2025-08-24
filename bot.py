@@ -15,11 +15,17 @@ from openai import OpenAI
 # Config & Logging
 # =====================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PROMPTS_PATH = os.getenv("PROMPTS_PATH", "prompts.yaml")
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TRANSCRIBE_MODEL = os.getenv("ASR_MODEL", "whisper-1")
+
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN is not set")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -32,10 +38,24 @@ class PromptPack(BaseModel):
 
 def load_prompts() -> PromptPack:
     with open(PROMPTS_PATH, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    return PromptPack(**data)
+        raw = yaml.safe_load(f)
 
-PROMPTS = load_prompts()
+    if "system" in raw:
+        return PromptPack(system=raw["system"], fewshot=raw.get("fewshot", []))
+
+    raise ValueError("prompts.yaml должен содержать ключи 'system' и (опционально) 'fewshot'.")
+
+try:
+    PROMPTS = load_prompts()
+    logging.info("Prompts loaded: system=%s... | fewshot=%d",
+                 (PROMPTS.system or "")[:40].replace("\n", " "),
+                 len(PROMPTS.fewshot))
+except Exception as e:
+    logging.exception("Failed to load prompts.yaml: %s", e)
+    class _PP(BaseModel):
+        system: str
+        fewshot: list = []
+    PROMPTS = _PP(system="Fallback system prompt", fewshot=[])
 
 # =====================
 # Output schema from LLM
@@ -142,6 +162,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(CallbackQueryHandler(handle_pick, pattern=r"^pick::"))
+    logging.info("Bot starting… polling enabled")
     app.run_polling()
 
 if __name__ == "__main__":
