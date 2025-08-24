@@ -1,4 +1,4 @@
-# bot.py — умный NLU + аккуратные описания, кнопки только при реальной двусмысленности
+# bot.py — умный NLU + fast-path, кнопки только если действительно двусмысленно
 import os
 import re
 import json
@@ -180,24 +180,23 @@ async def send_reminder(uid: int, text: str):
     except Exception as e:
         print("send_reminder error:", e)
 
-# ========= LLM-парсер (умный) =========
+# ========= LLM-парсер =========
 SYSTEM_PROMPT = """Ты — умный парсер напоминаний на русском. Верни строго JSON по схеме:
 {
   "ok": true|false,
-  "description": "string",           // краткое ДЕЛО без даты/времени/слов «сегодня/завтра» и без слова «Напоминание»
-  "datetimes": ["ISO8601", ...],     // 1 время — когда всё однозначно, РОВНО 2 времени — только если двусмысленно (например «в 4»)
-  "need_clarification": true|false,  // true если времени нет или дата/время неполные
+  "description": "string",
+  "datetimes": ["ISO8601", ...],
+  "need_clarification": true|false,
   "clarify_type": "time|date|both|none",
-  "reason": "string"                 // коротко почему нужна ясность
+  "reason": "string"
 }
-ВАЖНО:
-- Не добавляй фразы вроде «Напоминание на…». Описание — только смысл задачи (например: «падел с Никитой», «позвонить маме»).
-- Не пиши время/дату в description. Не переводись числа в слова: «11:30», а не «одиннадцать тридцать».
-- Понимай разговорные формы, ошибки («щавтра»=«завтра», «падел»=допустимо как есть), «через 20 минут», «полтретьего», «без пяти пять».
-- Если время с меридианом (утра/дня/вечера/ночи) — верни ОДНО время с соответствующим часом.
-- Если 24-часовой формат («17:30», «1730», «08:05») — верни ОДНО время ровно так.
-- Только «в H» (H 1..12) без меридиана — верни ДВА кандидата: H:00 и (H+12):00 одной даты.
-- Используй now_local и user_tz из пользователя, чтобы вычислить дату (например «завтра»).
+Правила:
+- description = краткое ДЕЛО без даты/времени и без фразы «Напоминание на…».
+- Не переводить цифры в слова. Время только цифрами.
+- «утра/дня/вечера/ночи» даёт однозначный час.
+- Формат 24ч («17:30», «1730», «08:05») — однозначно.
+- Только «в H» (1..12) без меридиана — верни ровно ДВА кандидата (H:00 и H+12:00).
+- Используй now_local и user_tz из пользователя, чтобы вычислить дату «сегодня/завтра/…».
 """
 
 FEW_SHOTS = [
@@ -251,7 +250,6 @@ def build_user_prompt(uid: int, text: str) -> list[dict]:
             "locale": "ru-RU"
         }, ensure_ascii=False)}
     ]
-    # мини few-shot для стабилизации поведения
     for ex in FEW_SHOTS:
         base.append({"role": "user", "content": json.dumps(ex, ensure_ascii=False)})
         base.append({"role": "assistant", "content": json.dumps(ex["expect"], ensure_ascii=False)})
@@ -290,7 +288,7 @@ def _meridiem_target_hour(h: int, mer: str) -> int:
     if m.startswith("утр"):  return 0 if h == 12 else h % 12
     if m.startswith("дн"):   return (h % 12) + 12
     if m.startswith("веч"):  return (h % 12) + 12
-    return 0 if h == 12 else h % 12  # ночь
+    return 0 if h == 12 else h % 12
 
 def collapse_by_meridiem(uid: int, text: str, dt_isos: list[str]) -> list[str]:
     m = MERIDIEM_RX.search(text or "")
@@ -321,6 +319,80 @@ def collapse_by_24h(uid: int, text: str, dt_isos: list[str]) -> list[str]:
     base = as_local_for(uid, dt_isos[0])
     fixed = base.replace(hour=h, minute=mm, second=0, microsecond=0)
     return [fixed.isoformat()]
+
+# ========= FAST PATH (частые формы без LLM) =========
+DAY_WORDS = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
+
+RX_DAY = re.compile(r"\b(сегодня|завтра|послезавтра)\b", re.I | re.U)
+RX_HHMM = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")                  # 17:30
+RX_HHMM_COMPACT = re.compile(r"(?<!\d)([01]?\d|2[0-3])([0-5]\d)\b")      # 1730
+RX_HH_ONLY = re.compile(r"\bв\s*([01]?\d|2[0-3])\b", re.I)                # в 22 / в 6
+RX_MER = re.compile(r"\bв\s*([1-9]|1[0-2])\s*(?:час(?:а|ов)?)?\s*(утра|дня|вечера|ночи)\b", re.I | re.U)
+
+def _base_date_for(uid: int, text: str):
+    tz = get_user_tz(uid)
+    now = datetime.now(tz)
+    m = RX_DAY.search(text)
+    if not m: return None
+    delta = DAY_WORDS[m.group(1).lower()]
+    return (now + timedelta(days=delta)).date()
+
+def _strip_bits(text: str, *subs: str) -> str:
+    s = text
+    for sub in subs:
+        s = re.sub(re.escape(sub), " ", s, flags=re.I)
+    s = re.sub(r"\b(сегодня|завтра|послезавтра)\b", " ", s, flags=re.I)
+    s = re.sub(r"\bв\b", " ", s, flags=re.I)
+    s = re.sub(r"\b(утра|дня|вечера|ночи)\b", " ", s, flags=re.I)
+    return norm(s)
+
+def fast_path_parse(uid: int, text: str):
+    s = norm(text)
+    base = _base_date_for(uid, s)
+    tz = get_user_tz(uid)
+
+    # день + HH:MM
+    m = RX_HHMM.search(s)
+    if base and m:
+        h, mm = int(m.group(1)), int(m.group(2))
+        dt = tz.localize(datetime(base.year, base.month, base.day, h, mm))
+        desc = _strip_bits(s, m.group(0))
+        return True, desc or "Напоминание", [dt.isoformat()]
+
+    # день + 1730
+    m = RX_HHMM_COMPACT.search(s)
+    if base and m:
+        h, mm = int(m.group(1)), int(m.group(2))
+        dt = tz.localize(datetime(base.year, base.month, base.day, h, mm))
+        desc = _strip_bits(s, m.group(0))
+        return True, desc or "Напоминание", [dt.isoformat()]
+
+    # день + «в 6/22» (+ меридиан)
+    mmer = RX_MER.search(s)
+    if base and mmer:
+        h12 = int(mmer.group(1)); mer = mmer.group(2).lower()
+        if mer.startswith("утр") or mer.startswith("ноч"):
+            hfinal = 0 if h12 == 12 else h12
+        else:
+            hfinal = (h12 % 12) + 12
+        dt = tz.localize(datetime(base.year, base.month, base.day, hfinal, 0))
+        desc = _strip_bits(s, mmer.group(0))
+        return True, desc or "Напоминание", [dt.isoformat()]
+
+    m = RX_HH_ONLY.search(s)
+    if base and m:
+        h = int(m.group(1))
+        if h >= 13 or h == 0:
+            dt = tz.localize(datetime(base.year, base.month, base.day, h % 24, 0))
+            desc = _strip_bits(s, m.group(0))
+            return True, desc or "Напоминание", [dt.isoformat()]
+        else:
+            v1 = tz.localize(datetime(base.year, base.month, base.day, h % 12, 0))
+            v2 = tz.localize(datetime(base.year, base.month, base.day, (h % 12) + 12, 0))
+            desc = _strip_bits(s, m.group(0))
+            return True, desc or "Напоминание", [v1.isoformat(), v2.isoformat()]
+
+    return None
 
 # ========= Команды =========
 @router.message(Command("start"))
@@ -396,11 +468,25 @@ async def on_text(m: Message):
             return
         await ask_tz(m); return
 
+    # FAST PATH
+    fp = fast_path_parse(uid, text)
+    if fp:
+        ok, desc, cands = fp
+        if ok and len(cands) >= 2:
+            PENDING[uid] = {"description": desc, "candidates": cands}
+            await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands))
+            return
+        if ok and len(cands) == 1:
+            dt = as_local_for(uid, cands[0])
+            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
+            plan(REMINDERS[-1])
+            await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
+            return
+
+    # LLM fallback
     data = await ai_parse(uid, text)
     desc = (data.get("description") or "").strip() or text.strip()
     cands = data.get("datetimes", [])
-
-    # «страховки» — уменьшаем лишние вопросы
     cands = collapse_by_24h(uid, text, cands)
     cands = collapse_by_meridiem(uid, text, cands)
 
@@ -411,7 +497,7 @@ async def on_text(m: Message):
 
     if data.get("ok") and len(cands) == 1:
         dt = as_local_for(uid, cands[0])
-        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat": "none"})
+        REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"})
         plan(REMINDERS[-1])
         await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}")
         return
@@ -526,6 +612,19 @@ async def on_voice(m: Message):
     if not text:
         await m.reply("Пустая расшифровка — повтори, пожалуйста."); return
 
+    # FAST PATH
+    fp = fast_path_parse(uid, text)
+    if fp:
+        ok, desc, cands = fp
+        if ok and len(cands) >= 2:
+            PENDING[uid] = {"description": desc, "candidates": cands}
+            await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands)); return
+        if ok and len(cands) == 1:
+            dt = as_local_for(uid, cands[0])
+            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"}); plan(REMINDERS[-1])
+            await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}"); return
+
+    # LLM fallback
     data = await ai_parse(uid, text)
     desc = (data.get("description") or "").strip() or text.strip()
     cands = collapse_by_24h(uid, text, data.get("datetimes", []))
@@ -564,6 +663,19 @@ async def on_audio(m: Message):
     if not text:
         await m.reply("Пустая расшифровка."); return
 
+    # FAST PATH
+    fp = fast_path_parse(uid, text)
+    if fp:
+        ok, desc, cands = fp
+        if ok and len(cands) >= 2:
+            PENDING[uid] = {"description": desc, "candidates": cands}
+            await m.reply(f"Уточни время для «{desc}»", reply_markup=kb_variants_for(uid, cands)); return
+        if ok and len(cands) == 1:
+            dt = as_local_for(uid, cands[0])
+            REMINDERS.append({"user_id": uid, "text": desc, "remind_dt": dt, "repeat":"none"}); plan(REMINDERS[-1])
+            await m.reply(f"Готово. Напомню: «{desc}» {fmt_dt_local(dt)}"); return
+
+    # LLM fallback
     data = await ai_parse(uid, text)
     desc = (data.get("description") or "").strip() or text.strip()
     cands = collapse_by_24h(uid, text, data.get("datetimes", []))
