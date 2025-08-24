@@ -322,7 +322,7 @@ def fire_kb(reminder_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Через 10 мин", callback_data=f"snz|10m|{reminder_id}"),
-            InlineKeyboardButton("Через час", callback_data=f"snz|1h|{reminder_id}")
+            InlineKeyboardButton("Через 1 час", callback_data=f"snz|1h|{reminder_id}")
         ],
         [InlineKeyboardButton("✅", callback_data=f"done|{reminder_id}")]
     ])
@@ -473,7 +473,7 @@ async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка перезагрузки: {e}")
 
 def _ack_text(title: str, iso: str) -> str:
-    return f"Окей, напомню «{title}» {fmt_dt(iso)}"
+    return f"📅 Окей, напомню «{title}» {fmt_dt(iso)}"
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tz = context.user_data.get("tz", DEFAULT_TZ)
@@ -581,7 +581,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, delta, rid = data.split("|", 2)
             row = db.get(rid)
             if not row or row["status"] != "active":
-                await query.edit_message_text("⏸ Отложено (напоминание не найдено)")
+                await query.edit_message_text("⏰ Отложено (напоминание не найдено)")
                 return
             user_tz = row["tz"]
             tz = tz_from_offset(user_tz)
@@ -595,7 +595,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.update_due(rid, new_iso)
             cancel_job_if_exists(context.application, rid)
             schedule_job_for(context.application, db.get(rid))
-            await query.edit_message_text(f"⏸ Отложено «{row['title']}» до {fmt_dt(new_iso)}")
+            await query.edit_message_text(f"⏰ Отложено «{row['title']}» до {fmt_dt(new_iso)}")
             return
 
         if data.startswith("done|"):
