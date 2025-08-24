@@ -97,19 +97,40 @@ async def schedule_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, ti
     except Exception as e:
         logging.exception("schedule_reminder failed: %s", e)
 
+def bump_to_future(iso_when: str) -> str:
+    """Если время в прошлом — подними до ближайшего будущего (+2c)."""
+    try:
+        when = datetime.fromisoformat(iso_when)
+        now = datetime.now(when.tzinfo)
+        if when <= now:
+            when = now + timedelta(seconds=2)
+        return when.replace(microsecond=0).isoformat()
+    except Exception:
+        return iso_when
+
 # ---- Local relative-time parser ("через ...") ----
-REL_MIN = re.compile(r"через\s+(?:минуту|1\s*мин(?:ут)?)(?:\b|$)", re.I)
-REL_NMIN = re.compile(r"через\s+(\d+)\s*мин(?:ут|ы)?(?:\b|$)", re.I)
-REL_HALF = re.compile(r"через\s+полчаса(?:\b|$)", re.I)
-REL_NH = re.compile(r"через\s+(\d+)\s*час(?:а|ов)?(?:\b|$)", re.I)
-REL_ND = re.compile(r"через\s+(\d+)\s*д(ень|ня|ней)?(?:\b|$)", re.I)
-REL_WEEK = re.compile(r"через\s+недел(?:ю|ю)(?:\b|$)", re.I)
+REL_MIN    = re.compile(r"через\s+(?:минуту|1\s*мин(?:ут)?)(?:\b|$)", re.I)
+REL_NSEC   = re.compile(r"через\s+(\d+)\s*сек(?:унд|унды|ун|)?(?:\b|$)", re.I)
+REL_NMIN   = re.compile(r"через\s+(\d+)\s*мин(?:ут|ы)?(?:\b|$)", re.I)
+REL_HALF   = re.compile(r"через\s+полчаса(?:\b|$)", re.I)
+REL_NH     = re.compile(r"через\s+(\d+)\s*час(?:а|ов)?(?:\b|$)", re.I)
+REL_ND     = re.compile(r"через\s+(\d+)\s*д(ень|ня|ней)?(?:\b|$)", re.I)
+REL_WEEK   = re.compile(r"через\s+недел(?:ю|ю)(?:\b|$)", re.I)
 
 def _clean_title(text: str) -> str:
-    t = re.sub(r"\b(напомни(ть)?|пожалуйста)\b", "", text, flags=re.I).strip()
-    for rx in (REL_MIN, REL_NMIN, REL_HALF, REL_NH, REL_ND, REL_WEEK):
-        t = rx.sub("", t).strip()
-    return t or "Напоминание"
+    """
+    Аккуратно чистим исходный текст:
+    - убираем 'напомни', 'пожалуйста'
+    - вырезаем только сами относительные конструкции 'через ...'
+    Остальное сохраняем (например, 'про').
+    """
+    t = text.strip()
+    t = re.sub(r"\b(напомни(ть)?|пожалуйста)\b", "", t, flags=re.I)
+    for rx in (REL_MIN, REL_NSEC, REL_NMIN, REL_HALF, REL_NH, REL_ND, REL_WEEK):
+        t = rx.sub("", t)
+    # зачистка хвостовых знаков
+    t = re.sub(r"\s{2,}", " ", t).strip(",. :")
+    return t or text or "Напоминание"
 
 def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
     """Вернёт ISO-строку, если нашли «через …», иначе None."""
@@ -117,6 +138,9 @@ def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
     now = datetime.now(tz).replace(microsecond=0)
     if REL_MIN.search(text):
         return (now + timedelta(minutes=1)).isoformat()
+    m = REL_NSEC.search(text)
+    if m:
+        return (now + timedelta(seconds=int(m.group(1)))).isoformat()
     m = REL_NMIN.search(text)
     if m:
         return (now + timedelta(minutes=int(m.group(1)))).isoformat()
@@ -131,17 +155,6 @@ def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
     if REL_WEEK.search(text):
         return (now + timedelta(days=7)).isoformat()
     return None
-
-def bump_to_future(iso_when: str) -> str:
-    """Если время в прошлом — подними до ближайшего будущего (+2с)."""
-    try:
-        when = datetime.fromisoformat(iso_when)
-        now = datetime.now(when.tzinfo)
-        if when <= now:
-            when = now + timedelta(seconds=2)
-        return when.replace(microsecond=0).isoformat()
-    except Exception:
-        return iso_when
 
 # =====================
 # Prompt store
@@ -311,7 +324,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if iso:
         title = _clean_title(text)
         iso = bump_to_future(iso)
-        await update.message.reply_text(f"Окей, напомню {fmt_dt(iso)}")
+        await update.message.reply_text(f"Окей, напомню «{title}» {fmt_dt(iso)}")
         await schedule_reminder(context, update.effective_chat.id, title, iso)
         return
 
@@ -331,7 +344,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if iso:
         title = _clean_title(text)
         iso = bump_to_future(iso)
-        await update.message.reply_text(f"Окей, напомню {fmt_dt(iso)}")
+        await update.message.reply_text(f"Окей, напомню «{title}» {fmt_dt(iso)}")
         await schedule_reminder(context, update.effective_chat.id, title, iso)
         return
 
@@ -343,8 +356,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def route_llm_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: LLMResult, user_tz: str):
     chat_id = update.effective_chat.id
     if result.intent == "create_reminder" and result.fixed_datetime:
-        await update.message.reply_text(f"Окей, напомню {fmt_dt(result.fixed_datetime)}")
-        await schedule_reminder(context, chat_id, result.title or result.text_original or "Напоминание", result.fixed_datetime)
+        title = result.title or result.text_original or "Напоминание"
+        await update.message.reply_text(f"Окей, напомню «{title}» {fmt_dt(result.fixed_datetime)}")
+        await schedule_reminder(context, chat_id, title, result.fixed_datetime)
     elif result.intent == "ask_clarification" and result.options:
         kb = build_time_keyboard(result.options)
         await update.message.reply_text("Уточни:", reply_markup=kb)
@@ -364,13 +378,14 @@ async def handle_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             iso = data
         iso = bump_to_future(iso)
-        await query.edit_message_text(f"Окей, напомню {fmt_dt(iso)}")
-        await schedule_reminder(context, query.message.chat_id, "Напоминание", iso)
+        title = "Напоминание"
+        await query.edit_message_text(f"Окей, напомню «{title}» {fmt_dt(iso)}")
+        await schedule_reminder(context, query.message.chat_id, title, iso)
     except Exception as e:
         logging.exception("handle_pick failed: %s", e)
         try:
             chat_id = (query.message.chat_id if query.message else update.effective_chat.id)
-            await context.bot.send_message(chat_id=chat_id, text=f"Окей, напомню {fmt_dt(locals().get('iso','?'))}")
+            await context.bot.send_message(chat_id=chat_id, text=f"Окей, напомню «Напоминание» {fmt_dt(locals().get('iso','?'))}")
         except Exception:
             logging.exception("fallback send_message failed")
 
