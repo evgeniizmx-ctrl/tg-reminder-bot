@@ -115,8 +115,8 @@ class DB:
             title TEXT NOT NULL,
             note TEXT,
             tz TEXT NOT NULL,
-            due_at TEXT,                 -- ISO with offset
-            rrule TEXT,                  -- iCal RRULE (nullable)
+            due_at TEXT,
+            rrule TEXT,
             status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','done','canceled')),
             last_msg_id INTEGER,
             created_at TEXT NOT NULL,
@@ -274,15 +274,15 @@ async def call_llm(text: str, user_tz: str) -> LLMResult:
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
 # =====================
-# Local relative-time parser
+# Local relative-time parser (fixed order)
 # =====================
-REL_MIN    = re.compile(r"через\s+(?:минуту|1\s*мин(?:ут)?)(?:\b|$)", re.I)
-REL_NSEC   = re.compile(r"через\s+(\d+)\s*сек(?:унд|унды|ун|)?(?:\b|$)", re.I)
-REL_NMIN   = re.compile(r"через\s+(\d+)\s*мин(?:ут|ы)?(?:\b|$)", re.I)
-REL_HALF   = re.compile(r"через\s+полчаса(?:\b|$)", re.I)
-REL_NH     = re.compile(r"через\s+(\d+)\s*час(?:а|ов)?(?:\b|$)", re.I)
-REL_ND     = re.compile(r"через\s+(\d+)\s*д(ень|ня|ней)?(?:\b|$)", re.I)
-REL_WEEK   = re.compile(r"через\s+недел(?:ю|ю)(?:\b|$)", re.I)
+REL_MIN  = re.compile(r"через\s+(?:минуту|1\s*мин(?:\.|ут)?)\b", re.I)
+REL_NSEC = re.compile(r"через\s+(\d+)\s*сек(?:унд|унды|ун|)?\b", re.I)
+REL_NMIN = re.compile(r"через\s+(\d+)\s*мин(?:ут|ы)?\b", re.I)
+REL_HALF = re.compile(r"через\s+полчаса\b", re.I)
+REL_NH   = re.compile(r"через\s+(\d+)\s*час(?:а|ов)?\b", re.I)
+REL_ND   = re.compile(r"через\s+(\d+)\s*д(ень|ня|ней)?\b", re.I)
+REL_WEEK = re.compile(r"через\s+недел(?:ю|ю)\b", re.I)
 
 def _clean_title(text: str) -> str:
     t = text.strip()
@@ -295,24 +295,34 @@ def _clean_title(text: str) -> str:
 def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
     tz = tz_from_offset(user_tz)
     now = datetime.now(tz).replace(microsecond=0)
-    if REL_MIN.search(text):
-        return (now + timedelta(minutes=1)).isoformat()
+
+    # ВАЖНО: сначала N минут/сек/часов/дней → затем одиночные формы
     m = REL_NSEC.search(text)
     if m:
         return (now + timedelta(seconds=int(m.group(1)))).isoformat()
+
     m = REL_NMIN.search(text)
     if m:
         return (now + timedelta(minutes=int(m.group(1)))).isoformat()
+
     if REL_HALF.search(text):
         return (now + timedelta(minutes=30)).isoformat()
+
     m = REL_NH.search(text)
     if m:
         return (now + timedelta(hours=int(m.group(1)))).isoformat()
+
     m = REL_ND.search(text)
     if m:
         return (now + timedelta(days=int(m.group(1)))).isoformat()
+
     if REL_WEEK.search(text):
         return (now + timedelta(days=7)).isoformat()
+
+    # «через минуту» / «через 1 мин»
+    if REL_MIN.search(text):
+        return (now + timedelta(minutes=1)).isoformat()
+
     return None
 
 # =====================
