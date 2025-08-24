@@ -274,7 +274,7 @@ async def call_llm(text: str, user_tz: str) -> LLMResult:
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
 # =====================
-# Local relative-time parser (и ФУНКЦИЯ, которой не хватало)
+# Local relative-time parser
 # =====================
 REL_MIN  = re.compile(r"через\s+(?:минуту|1\s*мин(?:\.|ут)?)\b", re.I)
 REL_NSEC = re.compile(r"через\s+(\d+)\s*сек(?:унд|унды|ун|)?\b", re.I)
@@ -285,7 +285,6 @@ REL_ND   = re.compile(r"через\s+(\d+)\s*д(ень|ня|ней)?\b", re.I)
 REL_WEEK = re.compile(r"через\s+недел(?:ю|ю)\b", re.I)
 
 def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
-    """Парсим только «через …»: секунды, минуты, час(ы), дни, неделю, полчаса, «минуту»."""
     tz = tz_from_offset(user_tz)
     now = datetime.now(tz).replace(microsecond=0)
 
@@ -316,7 +315,7 @@ def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
 
     return None
 
-# служебные слова/фразы для фолбэк-очистки заголовка
+# для fallback заголовка
 RX_JUNK = [
     re.compile(r"\b(сегодня|завтра|послезавтра)\b", re.I),
     re.compile(r"\b(утра|утром|вечером|днём|ночи|ночью)\b", re.I),
@@ -356,11 +355,14 @@ def fire_kb(reminder_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅", callback_data=f"done|{reminder_id}")]
     ])
 
+# ---- FIXED: список как набор «строка-кнопка» ----
 def list_keyboard(items: List[sqlite3.Row], page: int, total_pages: int) -> InlineKeyboardMarkup:
     rows = []
     for r in items:
         rid = r["id"]
-        rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"ldel|{rid}|p{page}")])
+        label = f"🗑 {fmt_dt(r['due_at'])} — {r['title']}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"ldel|{rid}|p{page}")])
+
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("← Назад", callback_data=f"lp|{page-1}"))
@@ -368,15 +370,13 @@ def list_keyboard(items: List[sqlite3.Row], page: int, total_pages: int) -> Inli
         nav.append(InlineKeyboardButton("Вперёд →", callback_data=f"lp|{page+1}"))
     if nav:
         rows.append(nav)
+
     return InlineKeyboardMarkup(rows) if rows else None
 
 def render_list_text(items: List[sqlite3.Row], page: int, total_pages: int) -> str:
     if not items:
         return "Будущих напоминаний нет."
-    lines = [f"📋 Ближайшие напоминания — страница {page}/{total_pages}:"]
-    for r in items:
-        lines.append(f"• {fmt_dt(r['due_at'])} — «{r['title']}»")
-    return "\n".join(lines)
+    return f"📋 Ближайшие напоминания — страница {page}/{total_pages}.\nНажми на строку, чтобы удалить."
 
 # =====================
 # Scheduling
@@ -526,7 +526,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tz = context.user_data.get("tz", DEFAULT_TZ)
     text = update.message.text.strip()
 
-    # локальные "через N..."
     iso = try_parse_relative_local(text, user_tz)
     if iso:
         title = _clean_title_for_relative(text)
@@ -536,7 +535,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_job_for(context.application, db.get(rid))
         return
 
-    # LLM
     result = await call_llm(text, user_tz)
     if result.intent == "create_reminder" and result.fixed_datetime:
         iso = bump_to_future(result.fixed_datetime)
