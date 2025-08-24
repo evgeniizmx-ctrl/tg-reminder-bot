@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import json
 import yaml
 import logging
@@ -7,8 +8,10 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
+)
 from openai import OpenAI
 
 # =====================
@@ -16,16 +19,27 @@ from openai import OpenAI
 # =====================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ENV
+TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 PROMPTS_PATH = os.getenv("PROMPTS_PATH", "prompts.yaml")
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 TRANSCRIBE_MODEL = os.getenv("ASR_MODEL", "whisper-1")
 
+def _valid_token(t: str) -> bool:
+    # Формат телеграм-токена: <digits>:<35+ [A-Za-z0-9_-]>
+    return bool(re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", t))
+
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
+if not _valid_token(TOKEN):
+    raise RuntimeError("TELEGRAM_TOKEN looks invalid (format mismatch)")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
+
+logging.info("Boot: env OK, starting prompts load…")
+logging.info("Env: TELEGRAM_TOKEN len=%d prefix=%s***",
+             len(TOKEN), TOKEN.split(':', 1)[0] if ':' in TOKEN else 'NO_COLON')
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -37,11 +51,20 @@ class PromptPack(BaseModel):
     fewshot: List[dict] = []
 
 def load_prompts() -> PromptPack:
+    # 1) Явный файл
     with open(PROMPTS_PATH, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
+    # 2) Нормальный формат
     if "system" in raw:
         return PromptPack(system=raw["system"], fewshot=raw.get("fewshot", []))
+
+    # 3) Попытка авто-конверсии альтернативных схем
+    if "parse" in raw and isinstance(raw["parse"], dict):
+        sys_txt = raw["parse"].get("system") or raw["parse"].get("instruction")
+        shots = raw["parse"].get("fewshot") or raw.get("examples") or []
+        if sys_txt:
+            return PromptPack(system=sys_txt, fewshot=shots)
 
     raise ValueError("prompts.yaml должен содержать ключи 'system' и (опционально) 'fewshot'.")
 
@@ -55,14 +78,15 @@ except Exception as e:
     class _PP(BaseModel):
         system: str
         fewshot: list = []
-    PROMPTS = _PP(system="Fallback system prompt", fewshot=[])
+    PROMPTS = _PP(system="Ты помощник-напоминалка. Всегда отвечай валидным JSON по схеме. "
+                         "Если не уверен — intent='ask_clarification'.", fewshot=[])
 
 # =====================
 # Output schema from LLM
 # =====================
 class ReminderOption(BaseModel):
-    iso_datetime: str
-    label: str
+    iso_datetime: str  # RFC3339
+    label: str         # подпись кнопки
 
 class LLMResult(BaseModel):
     intent: str = Field(description="'create_reminder' | 'ask_clarification' | 'chat'")
@@ -78,13 +102,18 @@ class LLMResult(BaseModel):
 # Helpers
 # =====================
 async def transcribe_voice(file_bytes: bytes, filename: str = "audio.ogg") -> str:
+    """
+    Передаём в OpenAI Whisper .ogg/Opus напрямую.
+    ВАЖНО: у BytesIO должно быть корректное имя с расширением.
+    """
     f = io.BytesIO(file_bytes)
-    f.name = filename
+    f.name = filename if filename.endswith(".ogg") else (filename + ".ogg")
     resp = client.audio.transcriptions.create(
         model=TRANSCRIBE_MODEL,
         file=f,
         response_format="text"
     )
+    # SDK v1 возвращает строку для response_format="text"
     return resp
 
 async def call_llm(text: str) -> LLMResult:
@@ -103,6 +132,7 @@ async def call_llm(text: str) -> LLMResult:
         return LLMResult(**data)
     except (json.JSONDecodeError, ValidationError) as e:
         logging.exception("LLM JSON parse failed: %s\nRaw: %s", e, raw)
+        # fallback: попросим уточнение
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
 def build_time_keyboard(options: List[ReminderOption]) -> InlineKeyboardMarkup:
@@ -121,6 +151,8 @@ async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         PROMPTS = load_prompts()
         await update.message.reply_text("Промты перезагружены ✅")
+        logging.info("Prompts reloaded: system=%s... | fewshot=%d",
+                     (PROMPTS.system or "")[:40].replace("\n", " "), len(PROMPTS.fewshot))
     except Exception as e:
         logging.exception("/reload error")
         await update.message.reply_text(f"Ошибка перезагрузки: {e}")
@@ -133,13 +165,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.voice.get_file()
     file_bytes = await file.download_as_bytearray()
-    text = await transcribe_voice(file_bytes)
+    text = await transcribe_voice(file_bytes, filename="telegram_voice.ogg")
     result = await call_llm(text)
     await route_llm_result(update, context, result)
 
 async def route_llm_result(update: Update, context: ContextTypes.DEFAULT_TYPE, result: LLMResult):
     if result.intent == "create_reminder" and result.fixed_datetime:
-        await update.message.reply_text(f"Напоминание создано: {result.title or result.text_original}\n⏰ {result.fixed_datetime}")
+        await update.message.reply_text(
+            f"Напоминание создано: {result.title or result.text_original}\n⏰ {result.fixed_datetime}"
+        )
     elif result.intent == "ask_clarification" and result.options:
         kb = build_time_keyboard(result.options)
         await update.message.reply_text("Уточни время:", reply_markup=kb)
