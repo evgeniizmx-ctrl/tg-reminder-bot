@@ -1,11 +1,8 @@
 [phases.setup]
-# Устанавливаем системный пакет ffmpeg
 nixPkgs = ["ffmpeg"]
 
 [phases.install]
-# Ставим python-зависимости
 cmds = ["pip install -U pip && pip install -r requirements.txt"]
 
 [start]
-# Команда запуска
 cmd = "python bot.py"
