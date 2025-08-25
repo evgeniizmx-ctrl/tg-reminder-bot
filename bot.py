@@ -162,7 +162,6 @@ def now_in_user_tz(tz_str: str) -> datetime:
 
 def iso_utc(dt: datetime) -> str:
     if dt.tzinfo is None: raise ValueError("aware dt required")
-    # не обнуляем секунды, чтобы не попасть в прошлое и не словить misfire
     dt = dt.astimezone(timezone.utc).replace(microsecond=0)
     return dt.isoformat()
 
@@ -406,6 +405,38 @@ def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
     day = rec.get("day")
     return f"каждое {day}-е число в {time_str} — «{title}»"
 
+# NEW: make sure time fully visible, trim long titles at the end
+def format_reminder_button_label(row: sqlite3.Row, user_tz: str, max_total: int = 38) -> str:
+    """
+    Builds button label like '25.08 в 20:00 — «Название…»'
+    Ensures date & time are intact; trims title if needed.
+    max_total counts visible chars after the bin emoji (Telegram trims by width).
+    """
+    kind = row["kind"] or "oneoff"
+    if kind == "oneoff" and row["when_iso"]:
+        dt_local = to_user_local(row["when_iso"], user_tz).strftime("%d.%m в %H:%M")
+    else:
+        # For recurring, reuse formatting above to get a stable prefix
+        rec = json.loads(row["recurrence_json"]) if row["recurrence_json"] else {}
+        rtype = rec.get("type")
+        if rtype == "daily":
+            dt_local = f"каждый день в {rec.get('time','00:00')}"
+        elif rtype == "weekly":
+            dt_local = f"{ru_weekly_phrase(rec.get('weekday',''))} в {rec.get('time','00:00')}"
+        else:
+            dt_local = f"каждое {rec.get('day','?')}-е в {rec.get('time','00:00')}"
+
+    base_left = f"{dt_local} — «"
+    title = row["title"] or ""
+    tail = "»"
+    room_for_title = max_total - len(base_left) - len(tail)
+    if room_for_title < 1:
+        # fallback: at least keep time fully
+        return f"{dt_local}"
+    if len(title) > room_for_title:
+        title = title[: max(0, room_for_title - 1)] + "…"
+    return f"{base_left}{title}{tail}"
+
 # ---------- Handlers ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -450,8 +481,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = "🗓 Ближайшие напоминания —"
     kb_rows = []
     for r in rows:
-        line = format_reminder_line(r, tz)
-        kb_rows.append([InlineKeyboardButton(f"🗑 {line}", callback_data=f"del:{r['id']}")])
+        label = format_reminder_button_label(r, tz)  # <-- trimmed title, time intact
+        kb_rows.append([InlineKeyboardButton(f"🗑 {label}", callback_data=f"del:{r['id']}")])
 
     await safe_reply(update, header, reply_markup=InlineKeyboardMarkup(kb_rows))
 
@@ -502,7 +533,7 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
     dt_local = to_user_local(when_iso_utc, tz)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+    await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -523,7 +554,7 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
             schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
+            return await safe_reply(update, f"⏰ Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
                                     reply_markup=kb)
     context.user_data["__auto_answer"] = choice
     await handle_text(update, context)
@@ -560,7 +591,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
             dt_local = to_user_local(when_iso_utc, user_tz)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
+            return await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
                                     reply_markup=kb)
         if r["intent"] == "ask":
             set_clarify_state(context, {
@@ -600,11 +631,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
             rtype = recurrence.get("type")
             if rtype == "daily":
-                text = f"🔔🔔 Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
+                text = f"⏰ Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
             elif rtype == "weekly":
-                text = f"🔔🔔 Окей, буду напоминать «{title}» {ru_weekly_phrase(recurrence.get('weekday'))} в {recurrence.get('time')}"
+                text = f"⏰ Окей, буду напоминать «{title}» {ru_weekly_phrase(recurrence.get('weekday'))} в {recurrence.get('time')}"
             else:
-                text = f"🔔🔔 Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
+                text = f"⏰ Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
             return await safe_reply(update, text, reply_markup=kb)
 
@@ -618,7 +649,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
         dt_local = to_user_local(when_iso_utc, user_tz)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-        return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
+        return await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
                                 reply_markup=kb)
 
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
