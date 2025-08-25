@@ -72,7 +72,6 @@ def db_init():
                 recurrence_json text                -- JSON с {type,weekday,day,time,tz}
             )
         """)
-        # Мягкие ALTER для обратной совместимости
         try: conn.execute("alter table reminders add column kind text default 'oneoff'")
         except Exception: pass
         try: conn.execute("alter table reminders add column recurrence_json text")
@@ -150,7 +149,6 @@ def db_get_reminder(rem_id: int):
 
 # ---------- TZ utils --------
 def tzinfo_from_user(tz_str: str) -> timezone | ZoneInfo:
-    """Конвертация СТРОГО валидной строки TZ в tzinfo. Предполагается, что валидация уже прошла."""
     if not tz_str:
         return timezone(timedelta(hours=3))
     tz_str = tz_str.strip()
@@ -177,7 +175,7 @@ def iso_no_seconds(dt: datetime) -> str:
 def parse_iso_flexible(s: str) -> datetime:
     return dparser.isoparse(s)
 
-# ---------- UI: Keyboards ---
+# ---------- UI ----------
 MAIN_MENU_KB = ReplyKeyboardMarkup(
     [[KeyboardButton("📝 Список напоминаний"), KeyboardButton("⚙️ Настройки")]],
     resize_keyboard=True, one_time_keyboard=False
@@ -215,24 +213,32 @@ def build_tz_inline_kb() -> InlineKeyboardMarkup:
         rows.append(btns)
     return InlineKeyboardMarkup(rows)
 
-# ---------- TZ parsing (строгая валидация) ----------
+# ---------- Helpers ----------
+async def safe_reply(update: Update, text: str, reply_markup=None):
+    """
+    Отправляет ответ корректно как для обычного сообщения, так и для callback-кнопок.
+    """
+    if update and update.message:
+        return await update.message.reply_text(text, reply_markup=reply_markup)
+    chat = update.effective_chat if update else None
+    if chat:
+        return await chat.send_message(text, reply_markup=reply_markup)
+    # крайний случай — никак
+    return None
+
 def normalize_offset(sign: str, hh: str, mm: str | None) -> str:
     h = int(hh); m = int(mm or 0)
     return f"{sign}{h:02d}:{m:02d}"
 
 def parse_tz_input(text: str) -> str | None:
-    """Вернёт нормализованный TZ ('+03:00' или 'Europe/Moscow') или None если это НЕ TZ."""
     if not text:
         return None
     t = text.strip()
-    # кнопка-город — тут не ловим (ее обрабатывает cb_tz), но если вдруг пришла строкой:
     if t in CITY_TO_OFFSET:
         return CITY_TO_OFFSET[t]
-    # смещение
     m = re.fullmatch(r"([+-])(\d{1,2})(?::?(\d{2}))?$", t)
     if m:
         return normalize_offset(m.group(1), m.group(2), m.group(3))
-    # IANA
     if "/" in t and " " not in t:
         try:
             _ = ZoneInfo(t)
@@ -261,10 +267,8 @@ async def call_llm(user_text: str, user_tz: str) -> dict:
         {"role": "system", "content": header},
         {"role": "system", "content": PROMPTS["parse"]["system"]},
     ]
-
     few = PROMPTS.get("fewshot") or []
     messages.extend(few)
-
     messages.append({"role": "user", "content": user_text})
 
     resp = client.chat.completions.create(
@@ -347,20 +351,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tz = db_get_user_tz(user_id)
     if not tz:
-        await update.message.reply_text(
+        await safe_reply(update,
             "Для начала укажи свой часовой пояс.\n"
             "Выбери город или пришли вручную смещение (+03:00) или IANA (Europe/Moscow).",
             reply_markup=MAIN_MENU_KB
         )
-        await update.message.reply_text("Выбери из списка:", reply_markup=build_tz_inline_kb())
+        await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
         return
-    await update.message.reply_text(
-        f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
-        reply_markup=MAIN_MENU_KB
-    )
+    await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
+                     reply_markup=MAIN_MENU_KB)
 
 async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Обрабатывает ВВОД ТЕКСТОМ (не кнопками). Возвращает True, если это был TZ."""
     if not update.message or not update.message.text:
         return False
     text = update.message.text.strip()
@@ -372,17 +373,14 @@ async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     db_set_user_tz(user_id, tz)
     log.info("TZ set via text: user=%s tz=%s", user_id, tz)
-    await update.message.reply_text(
-        f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
-        reply_markup=MAIN_MENU_KB
-    )
+    await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
+                     reply_markup=MAIN_MENU_KB)
     return True
 
 async def cb_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает выбор из inline-клавиатуры tz:*"""
     q = update.callback_query
     await q.answer()
-    data = q.data  # tz:<value>|tz:other
+    data = q.data
     if not data.startswith("tz:"):
         return
     value = data.split(":", 1)[1]
@@ -400,8 +398,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     rows = db_future(user_id)
     if not rows:
-        await update.message.reply_text("Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
-        return
+        return await safe_reply(update, "Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
 
     lines = ["🗓 Ближайшие напоминания —"]
     kb_rows = []
@@ -424,7 +421,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(line)
         kb_rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{r['id']}")])
 
-    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
+    await safe_reply(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
 
 async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -488,7 +485,8 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_oneoff(rem_id, user_id, iso, title, kind="oneoff")
         tz = db_get_user_tz(user_id) or "+03:00"
         dt_local = parse_iso_flexible(iso).astimezone(tzinfo_from_user(tz))
-        await q.edit_message_text(f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+        await q.edit_message_text(f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -498,7 +496,7 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     choice = data.split("answer:", 1)[1]
     context.user_data["__auto_answer"] = choice
-    await handle_text(update, context)
+    await handle_text(update, context)  # дальше safe_reply всё отправит корректно
 
 # ---------- Clarification memory ----------
 def get_clarify_state(context: ContextTypes.DEFAULT_TYPE):
@@ -522,15 +520,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if incoming_text == "📝 Список напоминаний" or incoming_text.lower() == "/list":
         return await cmd_list(update, context)
     if incoming_text == "⚙️ Настройки" or incoming_text.lower() == "/settings":
-        return await update.message.reply_text("Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
+        return await safe_reply(update, "Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
 
     user_tz = db_get_user_tz(user_id)
     if not user_tz:
-        await update.message.reply_text(
+        await safe_reply(update,
             "Сначала укажи часовой пояс. Выбери из списка ниже или пришли вручную:",
             reply_markup=MAIN_MENU_KB
         )
-        await update.message.reply_text("Выбери из списка:", reply_markup=build_tz_inline_kb())
+        await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
         return
 
     cstate = get_clarify_state(context)
@@ -540,7 +538,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await call_llm(user_text_for_llm, user_tz)
     except Exception:
-        return await update.message.reply_text("Что-то не понял. Скажи, например: «завтра в 15 позвонить маме».")
+        return await safe_reply(update, "Что-то не понял. Скажи, например: «завтра в 15 позвонить маме».")
     intent = result.get("intent")
 
     if intent == "ask_clarification":
@@ -558,7 +556,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 kb_rows.append([InlineKeyboardButton(str(v), callback_data=f"answer:{v}")])
 
-        return await update.message.reply_text(question, reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None)
+        return await safe_reply(update, question, reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None)
 
     if intent == "create_reminder":
         set_clarify_state(context, None)
@@ -577,10 +575,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = f"📅 Окей, буду напоминать «{title}» каждую {recurrence.get('weekday')} в {recurrence.get('time')}"
             else:
                 text = f"📅 Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
-            return await update.message.reply_text(text, reply_markup=MAIN_MENU_KB)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+            return await safe_reply(update, text, reply_markup=kb)
 
         if not dt_iso:
-            return await update.message.reply_text("Не понял время. Напиши, например: «сегодня 18:30».")
+            return await safe_reply(update, "Не понял время. Напиши, например: «сегодня 18:30».")
         dt = parse_iso_flexible(dt_iso)
         dt_iso_clean = iso_no_seconds(dt)
         rem_id = db_add_reminder_oneoff(user_id, title, body, dt_iso_clean)
@@ -588,13 +587,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         tz = db_get_user_tz(user_id) or "+03:00"
         dt_local = parse_iso_flexible(dt_iso_clean).astimezone(tzinfo_from_user(tz))
-        return await update.message.reply_text(
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+        return await safe_reply(update,
             f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
-            reply_markup=MAIN_MENU_KB
+            reply_markup=kb
         )
 
     set_clarify_state(context, None)
-    await update.message.reply_text("Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+    await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
 # ---------- main -----------
 def main():
