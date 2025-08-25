@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
+from calendar import monthrange
 
 from pydantic import BaseModel, Field, ValidationError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
@@ -31,6 +32,11 @@ def _extract_token(raw: str | None) -> str:
     m = re.search(r"[0-9]+:[A-Za-z0-9_-]{30,}", raw)
     return m.group(0) if m else raw
 
+def _mask(s: str | None) -> str:
+    if not s: return ""
+    s = s.strip()
+    return s[:6] + "..." + s[-4:] if len(s) > 12 else "***"
+
 RAW_TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 RAW_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TOKEN = _extract_token(RAW_TELEGRAM_TOKEN) or _extract_token(RAW_BOT_TOKEN)
@@ -47,8 +53,8 @@ LIST_PAGE_SIZE = int(os.getenv("LIST_PAGE_SIZE", "8"))
 def _valid_token(t: str) -> bool:
     return bool(re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", t))
 
-logging.info("Env debug: TELEGRAM_TOKEN=%r BOT_TOKEN=%r | picked=%r",
-             RAW_TELEGRAM_TOKEN, RAW_BOT_TOKEN, TOKEN)
+logging.info("Env debug: TELEGRAM_TOKEN=%s BOT_TOKEN=%s | picked=%s",
+             _mask(RAW_TELEGRAM_TOKEN), _mask(RAW_BOT_TOKEN), _mask(TOKEN))
 
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN / BOT_TOKEN not set (empty)")
@@ -92,7 +98,7 @@ def bump_to_future(iso_when: str) -> str:
         when = datetime.fromisoformat(iso_when)
         now = datetime.now(when.tzinfo)
         if when <= now:
-            when = now + timedelta(seconds=2)
+            when = now + timedelta(seconds=5)
         return when.replace(microsecond=0).isoformat()
     except Exception:
         return iso_when
@@ -247,10 +253,13 @@ async def transcribe_voice(file_bytes: bytes, filename: str = "audio.ogg") -> st
     resp = client.audio.transcriptions.create(
         model=TRANSCRIBE_MODEL,
         file=f,
-        response_format="text"
+        response_format="text",
+        temperature=0,
+        language="ru"
     )
     return resp
 
+import time
 async def call_llm(text: str, user_tz: str) -> LLMResult:
     now = now_iso_for_tz(user_tz)
     messages = [
@@ -259,12 +268,22 @@ async def call_llm(text: str, user_tz: str) -> LLMResult:
         *PROMPTS.fewshot,
         {"role": "user", "content": text}
     ]
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        temperature=0.2,
-        response_format={"type": "json_object"}
-    )
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                timeout=20
+            )
+            break
+        except Exception as e:
+            logging.warning("LLM call failed (attempt %d): %s", attempt+1, e)
+            if attempt == 2:
+                # возврат безопасного заготовка
+                return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
+            time.sleep(0.7 * (attempt+1))
     raw = resp.choices[0].message.content
     try:
         data = json.loads(raw)
@@ -274,7 +293,7 @@ async def call_llm(text: str, user_tz: str) -> LLMResult:
         return LLMResult(intent="ask_clarification", need_confirmation=True, options=[])
 
 # =====================
-# Local relative-time parser
+# Local relative-time parser (one-shot)
 # =====================
 REL_MIN  = re.compile(r"через\s+(?:минуту|1\s*мин(?:\.|ут)?)\b", re.I)
 REL_NSEC = re.compile(r"через\s+(\d+)\s*сек(?:унд|унды|ун|)?\b", re.I)
@@ -282,7 +301,7 @@ REL_NMIN = re.compile(r"через\s+(\d+)\s*мин(?:ут|ы)?\b", re.I)
 REL_HALF = re.compile(r"через\s+полчаса\b", re.I)
 REL_NH   = re.compile(r"через\s+(\d+)\s*час(?:а|ов)?\b", re.I)
 REL_ND   = re.compile(r"через\s+(\d+)\s*д(ень|ня|ней)?\b", re.I)
-REL_WEEK = re.compile(r"через\s+недел(?:ю|ю)\b", re.I)
+REL_WEEK = re.compile(r"через\s+недел(?:ю|ю|юто)?\b", re.I)
 
 def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
     tz = tz_from_offset(user_tz)
@@ -312,6 +331,139 @@ def try_parse_relative_local(text: str, user_tz: str) -> Optional[str]:
 
     if REL_MIN.search(text):
         return (now + timedelta(minutes=1)).isoformat()
+
+    return None
+
+# =====================
+# Recurrence parsing (daily/weekly/monthly)
+# =====================
+EVERY_DAY_RX   = re.compile(r"\b(каждый\s*день|ежедневно)\b", re.I)
+WEEKLY_RX      = re.compile(r"\b(раз\s+в\s+неделю|еженедел(?:ьно|ьник)?)\b", re.I)
+WEEKDAY_RX     = re.compile(r"\b(понедельник|вторник|среда|среду|четверг|пятница|пятницу|суббота|субботу|воскресенье)\b", re.I)
+MONTHDAY_RX    = re.compile(r"\bкажд(ый|ое|ого)\s+(\d{1,2})\s*(?:числа|число)\b", re.I)
+AT_HH_RX       = re.compile(r"\bв\s+(\d{1,2})(?::(\d{2}))?\s*(?:час(а|ов)?)?\b", re.I)
+
+_WEEKDAY_MAP = {
+    "понедельник":"MO","вторник":"TU","среда":"WE","среду":"WE","четверг":"TH",
+    "пятница":"FR","пятницу":"FR","суббота":"SA","субботу":"SA","воскресенье":"SU"
+}
+
+_DOW = {"MO":0,"TU":1,"WE":2,"TH":3,"FR":4,"SA":5,"SU":6}
+
+def parse_rrule(rrule: str) -> dict:
+    parts = {}
+    for chunk in (rrule or "").split(";"):
+        if not chunk: continue
+        k, _, v = chunk.partition("=")
+        parts[k.upper()] = v
+    return parts
+
+def next_due_from_rrule(base: datetime, rrule: str) -> Optional[str]:
+    p = parse_rrule(rrule)
+    freq = p.get("FREQ", "").upper()
+    hh = int(p.get("BYHOUR", "9"))
+    mm = int(p.get("BYMINUTE", "0"))
+    tz = base.tzinfo
+
+    def at_time(d: datetime) -> datetime:
+        return d.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+    now = base
+    if freq == "DAILY":
+        cand = at_time(now)
+        if cand <= now:
+            cand = at_time(now + timedelta(days=1))
+        return cand.isoformat()
+
+    if freq == "WEEKLY":
+        byday = [d for d in p.get("BYDAY","").split(",") if d]
+        if not byday:
+            byday = [list(_DOW.keys())[now.weekday()]]
+        best = None
+        for code in byday:
+            wd = _DOW.get(code.upper(), now.weekday())
+            delta = (wd - now.weekday()) % 7
+            cand = at_time(now + timedelta(days=delta))
+            if cand <= now:
+                cand = at_time(cand + timedelta(days=7))
+            if best is None or cand < best:
+                best = cand
+        return best.isoformat()
+
+    if freq == "MONTHLY":
+        md = int(p.get("BYMONTHDAY", "1"))
+        y, m = now.year, now.month
+        try:
+            cand = at_time(datetime(y, m, md, tzinfo=tz))
+        except ValueError:
+            md = monthrange(y, m)[1]
+            cand = at_time(datetime(y, m, md, tzinfo=tz))
+        if cand <= now:
+            m2 = m + 1
+            y2 = y + (1 if m2 == 13 else 0)
+            m2 = 1 if m2 == 13 else m2
+            md2 = int(p.get("BYMONTHDAY", "1"))
+            last = monthrange(y2, m2)[1]
+            md2 = min(md2, last)
+            cand = at_time(datetime(y2, m2, md2, tzinfo=tz))
+        return cand.isoformat()
+    return None
+
+def kb_pick_time() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("09:00", callback_data="pt|09:00"),
+         InlineKeyboardButton("12:00", callback_data="pt|12:00"),
+         InlineKeyboardButton("18:00", callback_data="pt|18:00"),
+         InlineKeyboardButton("21:00", callback_data="pt|21:00")],
+        [InlineKeyboardButton("Другое время", callback_data="pt|other")]
+    ])
+
+def kb_pick_weekday() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Пн", callback_data="pwd|MO"),
+         InlineKeyboardButton("Вт", callback_data="pwd|TU"),
+         InlineKeyboardButton("Ср", callback_data="pwd|WE"),
+         InlineKeyboardButton("Чт", callback_data="pwd|TH")],
+        [InlineKeyboardButton("Пт", callback_data="pwd|FR"),
+         InlineKeyboardButton("Сб", callback_data="pwd|SA"),
+         InlineKeyboardButton("Вс", callback_data="pwd|SU")]
+    ])
+
+def try_parse_recurrence(text: str, user_tz: str):
+    """
+    Возвращает dict:
+      {"mode":"daily|weekly|monthly","rrule":"...","need":{"time":bool,"weekday":bool},"title":"..."}
+    или None, если это не периодическая команда.
+    """
+    title = extract_title_fallback(text)
+
+    tm = AT_HH_RX.search(text)
+    hh = mm = None
+    if tm:
+        hh = int(tm.group(1)); mm = int(tm.group(2) or 0)
+
+    if EVERY_DAY_RX.search(text):
+        need_time = (hh is None)
+        rrule = "FREQ=DAILY" + (f";BYHOUR={hh};BYMINUTE={mm}" if hh is not None else "")
+        return {"mode":"daily","rrule":rrule,"need":{"time":need_time,"weekday":False},"title":title}
+
+    if WEEKLY_RX.search(text) or WEEKDAY_RX.search(text):
+        mwd = WEEKDAY_RX.search(text)
+        byday = _WEEKDAY_MAP[mwd.group(0).lower()] if mwd else None
+        need_weekday = byday is None
+        need_time = (hh is None)
+        base = "FREQ=WEEKLY"
+        if byday: base += f";BYDAY={byday}"
+        if hh is not None: base += f";BYHOUR={hh};BYMINUTE={mm}"
+        return {"mode":"weekly","rrule":base,"need":{"time":need_time,"weekday":need_weekday},"title":title}
+
+    mmday = MONTHDAY_RX.search(text)
+    if mmday:
+        day = int(mmday.group(2))
+        need_time = (hh is None)
+        base = f"FREQ=MONTHLY;BYMONTHDAY={day}"
+        if hh is not None: base += f";BYHOUR={hh};BYMINUTE={mm}"
+        return {"mode":"monthly","rrule":base,"need":{"time":need_time,"weekday":False},"title":title}
 
     return None
 
@@ -350,17 +502,36 @@ def fire_kb(reminder_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Через 10 мин", callback_data=f"snz|10m|{reminder_id}"),
+            InlineKeyboardButton("Через 30 мин", callback_data=f"snz|30m|{reminder_id}"),
             InlineKeyboardButton("Через 1 час", callback_data=f"snz|1h|{reminder_id}")
         ],
         [InlineKeyboardButton("✅", callback_data=f"done|{reminder_id}")]
     ])
 
-# ---- FIXED: список как набор «строка-кнопка» ----
+def rrule_to_human(rrule: str) -> str:
+    if not rrule: return ""
+    p = parse_rrule(rrule)
+    freq = p.get("FREQ","")
+    hh = p.get("BYHOUR"); mm = p.get("BYMINUTE")
+    tm = f" в {int(hh):02d}:{int(mm or 0):02d}" if hh else ""
+    if freq=="DAILY":
+        return f"каждый день{tm}"
+    if freq=="WEEKLY":
+        d = p.get("BYDAY")
+        rus = {"MO":"по понедельникам","TU":"по вторникам","WE":"по средам","TH":"по четвергам","FR":"по пятницам","SA":"по субботам","SU":"по воскресеньям"}
+        return f"{rus.get(d,'еженедельно')}{tm}"
+    if freq=="MONTHLY":
+        day = p.get("BYMONTHDAY","1")
+        return f"каждое {day} число{tm}"
+    return rrule
+
+# ---- Список как набор «строка-кнопка» ----
 def list_keyboard(items: List[sqlite3.Row], page: int, total_pages: int) -> InlineKeyboardMarkup:
     rows = []
     for r in items:
         rid = r["id"]
-        label = f"🗑 {fmt_dt(r['due_at'])} — {r['title']}"
+        prefix = rrule_to_human(r["rrule"]) if r["rrule"] else fmt_dt(r["due_at"])
+        label = f"🗑 {prefix} — {r['title']}"
         rows.append([InlineKeyboardButton(label, callback_data=f"ldel|{rid}|p{page}")])
 
     nav = []
@@ -410,6 +581,18 @@ def schedule_job_for(app: Application, row: sqlite3.Row):
             reply_markup=fire_kb(rid)
         )
         db.set_last_msg_id(rid, sent.message_id)
+        # пересчитать следующее срабатывание, если периодическое
+        try:
+            fresh = db.get(rid)
+            if fresh and fresh["status"] == "active" and fresh["rrule"]:
+                tz = tz_from_offset(fresh["tz"])
+                base = datetime.now(tz)
+                next_iso = next_due_from_rrule(base, fresh["rrule"])
+                if next_iso:
+                    db.update_due(rid, next_iso)
+                    schedule_job_for(ctx.application, db.get(rid))
+        except Exception as e:
+            logging.exception("RRULE reschedule failed for %s: %s", rid, e)
 
     job = app.job_queue.run_once(_fire, when=when)
     app.bot_data.setdefault("jobs", {})[rid] = job
@@ -419,12 +602,19 @@ def schedule_all_on_start(app: Application):
     rows = db.active_to_schedule()
     for r in rows:
         try:
-            due = datetime.fromisoformat(r["due_at"])
-            now = datetime.now(due.tzinfo)
-            if due <= now - timedelta(minutes=10):
-                new_iso = (now + timedelta(seconds=2)).replace(microsecond=0).isoformat()
-                db.update_due(r["id"], new_iso)
-                r = dict(r); r["due_at"] = new_iso
+            tz = tz_from_offset(r["tz"])
+            if r["rrule"]:
+                nxt = next_due_from_rrule(datetime.now(tz), r["rrule"])
+                if nxt:
+                    db.update_due(r["id"], nxt)
+                    r = dict(r); r["due_at"] = nxt
+            else:
+                due = datetime.fromisoformat(r["due_at"])
+                now = datetime.now(due.tzinfo)
+                if due <= now - timedelta(minutes=10):
+                    new_iso = (now + timedelta(seconds=2)).replace(microsecond=0).isoformat()
+                    db.update_due(r["id"], new_iso)
+                    r = dict(r); r["due_at"] = new_iso
         except Exception:
             pass
         schedule_job_for(app, r)
@@ -496,8 +686,32 @@ async def handle_tz_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================
 # Reply-menu buttons handler
 # =====================
+MENU_OR_TEXT = re.compile(r".*", re.S)
+
 async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
+
+    # ожидание ручного ввода времени для периодических
+    if context.user_data.get("time_waiting"):
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+        if not m:
+            await update.message.reply_text("Формат времени HH:MM, например 09:00")
+            return
+        hh, mm = int(m.group(1)), int(m.group(2))
+        parts = parse_rrule(context.user_data.get("pending_rrule","FREQ=DAILY"))
+        parts["BYHOUR"]=str(hh); parts["BYMINUTE"]=str(mm)
+        rrule = ";".join([f"{k}={v}" for k,v in parts.items()])
+        context.user_data["pending_rrule"] = rrule
+        context.user_data["time_waiting"] = False
+        tz_str = context.user_data.get("pending_tz", DEFAULT_TZ)
+        tz = tz_from_offset(tz_str)
+        title = context.user_data.pop("pending_title","Напоминание")
+        due_iso = next_due_from_rrule(datetime.now(tz), rrule)
+        rid = db.add(update.effective_chat.id, title, tz_str, due_iso, rrule=rrule)
+        await update.message.reply_text(_ack_periodic(title, rrule, due_iso))
+        schedule_job_for(context.application, db.get(rid))
+        return
+
     if text == MENU_BTN_LIST:
         await cmd_list(update, context)
         return
@@ -522,10 +736,33 @@ async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _ack_text(title: str, iso: str) -> str:
     return f"📅 Окей, напомню «{title}» {fmt_dt(iso)}"
 
+def _ack_periodic(title: str, rrule: str, next_iso: str) -> str:
+    return f"📅 Окей, «{title}» — {rrule_to_human(rrule)}. Ближайшее: {fmt_dt(next_iso)}"
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tz = context.user_data.get("tz", DEFAULT_TZ)
     text = update.message.text.strip()
 
+    # PERIODIC first
+    rec = try_parse_recurrence(text, user_tz)
+    if rec:
+        context.user_data["pending_rrule"] = rec["rrule"]
+        context.user_data["pending_title"] = rec["title"]
+        context.user_data["pending_tz"] = user_tz
+        if rec["need"]["weekday"]:
+            await update.message.reply_text("Выбери день недели:", reply_markup=kb_pick_weekday())
+            return
+        if rec["need"]["time"]:
+            await update.message.reply_text("Во сколько напоминать?", reply_markup=kb_pick_time())
+            return
+        tz = tz_from_offset(user_tz)
+        due_iso = next_due_from_rrule(datetime.now(tz), rec["rrule"])
+        rid = db.add(update.effective_chat.id, rec["title"], user_tz, due_iso, rrule=rec["rrule"], origin=None)
+        await update.message.reply_text(_ack_periodic(rec["title"], rec["rrule"], due_iso))
+        schedule_job_for(context.application, db.get(rid))
+        return
+
+    # one-shot relative shortcuts
     iso = try_parse_relative_local(text, user_tz)
     if iso:
         title = _clean_title_for_relative(text)
@@ -535,6 +772,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_job_for(context.application, db.get(rid))
         return
 
+    # LLM flow
     result = await call_llm(text, user_tz)
     if result.intent == "create_reminder" and result.fixed_datetime:
         iso = bump_to_future(result.fixed_datetime)
@@ -548,9 +786,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(opt.label, callback_data=f"pick|{opt.iso_datetime}")]
             for opt in result.options
         ])
+        # сохраним контекст на случай выбора
+        context.user_data["pending_title"] = extract_title_fallback(text)
         await update.message.reply_text("Уточни:", reply_markup=kb)
     else:
-        await update.message.reply_text("Не понял. Скажи, например: «завтра в 15 позвонить маме».")
+        await update.message.reply_text("Не понял. Скажи, например: «завтра в 15 позвонить маме» или «каждый день пить таблетки в 09:00».")
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_tz = context.user_data.get("tz", DEFAULT_TZ)
@@ -558,6 +798,26 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_bytes = await file.download_as_bytearray()
     text = await transcribe_voice(file_bytes, filename="telegram_voice.ogg")
 
+    # PERIODIC first
+    rec = try_parse_recurrence(text, user_tz)
+    if rec:
+        context.user_data["pending_rrule"] = rec["rrule"]
+        context.user_data["pending_title"] = rec["title"]
+        context.user_data["pending_tz"] = user_tz
+        if rec["need"]["weekday"]:
+            await update.message.reply_text("Выбери день недели:", reply_markup=kb_pick_weekday())
+            return
+        if rec["need"]["time"]:
+            await update.message.reply_text("Во сколько напоминать?", reply_markup=kb_pick_time())
+            return
+        tz = tz_from_offset(user_tz)
+        due_iso = next_due_from_rrule(datetime.now(tz), rec["rrule"])
+        rid = db.add(update.effective_chat.id, rec["title"], user_tz, due_iso, rrule=rec["rrule"], origin=None)
+        await update.message.reply_text(_ack_periodic(rec["title"], rec["rrule"], due_iso))
+        schedule_job_for(context.application, db.get(rid))
+        return
+
+    # one-shot relative
     iso = try_parse_relative_local(text, user_tz)
     if iso:
         title = _clean_title_for_relative(text)
@@ -567,6 +827,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_job_for(context.application, db.get(rid))
         return
 
+    # LLM
     result = await call_llm(text, user_tz)
     if result.intent == "create_reminder" and result.fixed_datetime:
         iso = bump_to_future(result.fixed_datetime)
@@ -580,9 +841,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(opt.label, callback_data=f"pick|{opt.iso_datetime}")]
             for opt in result.options
         ])
+        context.user_data["pending_title"] = extract_title_fallback(text)
         await update.message.reply_text("Уточни:", reply_markup=kb)
     else:
-        await update.message.reply_text("Не понял. Скажи, например: «завтра в 15 позвонить маме».")
+        await update.message.reply_text("Не понял. Скажи, например: «завтра в 15 позвонить маме» или «каждую субботу баня в 19:00».")
 
 # =====================
 # List / Pagination
@@ -619,10 +881,50 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("pick|"):
             _, iso = data.split("|", 1)
             iso = bump_to_future(iso)
-            title = extract_title_fallback("Напоминание")
+            title = (context.user_data.pop("pending_title", None) or extract_title_fallback("Напоминание"))
             user_tz = context.user_data.get("tz", DEFAULT_TZ)
             rid = db.add(query.message.chat_id, title, user_tz, iso)
             await query.edit_message_text(f"📅 Окей, напомню «{title}» {fmt_dt(iso)}")
+            schedule_job_for(context.application, db.get(rid))
+            return
+
+        # weekly: pick weekday
+        if data.startswith("pwd|"):
+            _, byday = data.split("|", 1)
+            rrule = (context.user_data.get("pending_rrule") or "FREQ=WEEKLY")
+            parts = parse_rrule(rrule); parts["BYDAY"]=byday
+            rrule = ";".join([f"{k}={v}" for k,v in parts.items()])
+            context.user_data["pending_rrule"] = rrule
+            if "BYHOUR" not in parts:
+                await query.edit_message_text("Во сколько напоминать?", reply_markup=kb_pick_time())
+                return
+            tz_str = context.user_data.get("pending_tz", DEFAULT_TZ)
+            tz = tz_from_offset(tz_str)
+            title = context.user_data.pop("pending_title","Напоминание")
+            due_iso = next_due_from_rrule(datetime.now(tz), rrule)
+            rid = db.add(query.message.chat_id, title, tz_str, due_iso, rrule=rrule)
+            await query.edit_message_text(_ack_periodic(title, rrule, due_iso))
+            schedule_job_for(context.application, db.get(rid))
+            return
+
+        # pick time (presets / manual)
+        if data.startswith("pt|"):
+            _, val = data.split("|", 1)
+            if val == "other":
+                context.user_data["time_waiting"] = True
+                await query.edit_message_text("Введи время в формате HH:MM (например, 09:30)")
+                return
+            hh, mm = val.split(":")
+            rrule = context.user_data.get("pending_rrule") or "FREQ=DAILY"
+            parts = parse_rrule(rrule); parts["BYHOUR"]=str(int(hh)); parts["BYMINUTE"]=str(int(mm))
+            rrule = ";".join([f"{k}={v}" for k,v in parts.items()])
+            context.user_data["pending_rrule"] = rrule
+            tz_str = context.user_data.get("pending_tz", DEFAULT_TZ)
+            tz = tz_from_offset(tz_str)
+            title = context.user_data.pop("pending_title","Напоминание")
+            due_iso = next_due_from_rrule(datetime.now(tz), rrule)
+            rid = db.add(query.message.chat_id, title, tz_str, due_iso, rrule=rrule)
+            await query.edit_message_text(_ack_periodic(title, rrule, due_iso))
             schedule_job_for(context.application, db.get(rid))
             return
 
@@ -686,6 +988,9 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_list(update, context)
 
+async def cmd_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
 # =====================
 # Main
 # =====================
@@ -700,16 +1005,18 @@ def main():
 
     menu_filter = (
         filters.Regex(f"^{re.escape(MENU_BTN_LIST)}$") |
-        filters.Regex(f"^{re.escape(MENU_BTN_SETTINGS)}$")
+        filters.Regex(f"^{re.escape(MENU_BTN_SETTINGS)}$") |
+        filters.TEXT  # чтобы ловить ручной ввод времени
     )
     app.add_handler(MessageHandler(menu_filter, handle_menu_buttons))
 
     app.add_handler(CommandHandler("reload", reload_prompts))
     app.add_handler(CommandHandler("list", cmd_list_handler))
+    app.add_handler(CommandHandler("tz", cmd_tz))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    app.add_handler(CallbackQueryHandler(handle_callbacks, pattern="^(pick|snz|done|lp|ldel)"))
+    app.add_handler(CallbackQueryHandler(handle_callbacks, pattern="^(pick|snz|done|lp|ldel|pwd|pt)"))
 
     async def on_error(update, context):
         logging.exception("PTB error: %s | update=%r", context.error, update)
