@@ -428,28 +428,35 @@ async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"📅 Окей, напомню «{title}» {pretty}")
 
 
-async def main_async():
+# =========================
+# APP & ENTRYPOINT (PTB v20)
+# =========================
+
+def build_app() -> Application:
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Хэндлеры команд
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reload", cmd_reload))
     app.add_handler(CommandHandler("list", cmd_list))
 
-    app.add_handler(CallbackQueryHandler(on_cb, pattern=r"^del:"))
+    # Callback-кнопки
+    app.add_handler(CallbackQueryHandler(on_cb,   pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
 
+    # Текстовые сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    log.info("Bot starting… polling enabled")
-    # В PTB v20 нужно run_polling, а не app.updater.idle()
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()  # совместимость
-    await app.run_polling()            # корректный способ
-    await app.stop()
+    return app
+
 
 def main():
-    asyncio.run(main_async())
+    app = build_app()
+    # Если у тебя где-то есть SCHED.start(), оставь его выше по файлу (он уже стартует)
+    # Запуск PTB v20: без asyncio.run/initialize/updater.start_polling
+    log.info("Bot starting… polling enabled")
+    app.run_polling(close_loop=False)  # close_loop=False чтобы не закрывать уже существующий loop
+
 
 if __name__ == "__main__":
     main()
