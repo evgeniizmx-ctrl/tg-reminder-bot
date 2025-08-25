@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
-
 from dateutil import parser as dparser
 
 from telegram import (
@@ -41,10 +40,10 @@ PROMPTS_PATH = os.environ.get("PROMPTS_PATH", "prompts.yaml")
 DB_PATH = os.environ.get("DB_PATH", "reminders.db")
 
 if not BOT_TOKEN:
-    log.error("BOT_TOKEN не задан. Установи BOT_TOKEN (или TELEGRAM_TOKEN) в переменных окружения.")
+    log.error("BOT_TOKEN не задан. Укажи BOT_TOKEN (или TELEGRAM_TOKEN) в переменных окружения.")
     raise SystemExit(1)
 if not os.environ.get("OPENAI_API_KEY"):
-    log.warning("OPENAI_API_KEY не задан — парсер LLM недоступен, но препарсер покроет типовые кейсы.")
+    log.warning("OPENAI_API_KEY не задан — LLM парсер будет недоступен, но базовый препарсер работает.")
 
 # ---------- DB --------------
 def db():
@@ -69,9 +68,10 @@ def db_init():
                 when_iso text,
                 status text default 'scheduled',
                 kind text default 'oneoff',         -- 'oneoff' | 'recurring'
-                recurrence_json text                -- JSON с {type,weekday,day,time,tz}
+                recurrence_json text                -- JSON {type,weekday,day,time,tz}
             )
         """)
+        # мягкие ALTER
         try: conn.execute("alter table reminders add column kind text default 'oneoff'")
         except Exception: pass
         try: conn.execute("alter table reminders add column recurrence_json text")
@@ -256,7 +256,6 @@ PROMPTS = load_prompts()
 async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = None) -> dict:
     now_iso = now_iso_override or iso_no_seconds(now_in_user_tz(user_tz))
     header = f"NOW_ISO={now_iso}\nTZ_DEFAULT={user_tz or '+03:00'}"
-
     messages = [
         {"role": "system", "content": PROMPTS["system"]},
         {"role": "system", "content": header},
@@ -265,12 +264,7 @@ async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = 
     few = PROMPTS.get("fewshot") or []
     messages.extend(few)
     messages.append({"role": "user", "content": user_text})
-
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0.2
-    )
+    resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, temperature=0.2)
     txt = resp.choices[0].message.content.strip()
     try:
         return json.loads(txt)
@@ -280,72 +274,71 @@ async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = 
             return json.loads(m.group(0))
         raise
 
-# ---------- Rule-based препарсер (детерминированный) ----------
-_TIME_HHMM = re.compile(r"\b([01]?\d|2[0-3])[:\.]?([0-5]\d)?\b")
+# ---------- Rule-based препарсер ----------
+def _clean_spaces(s: str) -> str:
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 def _extract_title(text: str) -> str:
-    t = re.sub(r"\b(сегодня|завтра|послезавтра)\b", "", text, flags=re.IGNORECASE)
-    t = re.sub(r"\bчерез\b.+", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"\bв\s+([0-2]?\d(:\d{2})?)\b", "", t, flags=re.IGNORECASE)
-    t = t.strip(" ,.;—-")
+    t = text
+    # удалить метки дней
+    t = re.sub(r"\b(сегодня|завтра|послезавтра)\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bчерез\b\s+[^,;.]+", " ", t, flags=re.IGNORECASE)
+    # убрать «в 4», «в 4:30», «в 4 часа/часов/час»
+    t = re.sub(r"\bв\s+\d{1,2}(:\d{2})?\s*(час(?:а|ов)?|ч)?\b", " ", t, flags=re.IGNORECASE)
+    # убрать обрывки "в HH" без минут
+    t = re.sub(r"\bв\s+\d{1,2}\b", " ", t, flags=re.IGNORECASE)
+    # финальная чистка
+    t = _clean_spaces(t.strip(" ,.;—-"))
     return t.capitalize() if t else "Напоминание"
 
 def rule_parse(text: str, now: datetime):
     s = text.strip().lower()
 
-    # через минуту / через N минут / через (пол)часа / часы
-    m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(ут|)|\d+\s*час(а|ов)?)", s)
+    # через минуту / N минут / полчаса / N часов
+    m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)", s)
     if m:
         delta = timedelta()
         chunk = m.group(1)
-        if chunk == "полчаса":
+        if "полчаса" in chunk:
             delta = timedelta(minutes=30)
-        elif chunk == "минуту":
+        elif "минуту" in chunk:
             delta = timedelta(minutes=1)
         elif "мин" in chunk:
             n = int(re.search(r"\d+", chunk).group())
             delta = timedelta(minutes=n)
         else:
-            # часы
             n = int(re.search(r"\d+", chunk).group())
             delta = timedelta(hours=n)
         when = now + delta
         title = _extract_title(text)
-        return {
-            "intent": "create_reminder",
-            "title": title,
-            "fixed_datetime": iso_no_seconds(when),
-            "recurrence": None
-        }
+        return {"intent": "create_reminder", "title": title, "fixed_datetime": iso_no_seconds(when), "recurrence": None}
 
-    # сегодня/завтра/послезавтра в HH[:MM]?
+    # сегодня/завтра/послезавтра в HH[:MM]?( час(ов/а)?)
     md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s)
-    mt = re.search(r"\bв\s+(\d{1,2})(?::?(\d{2}))?\b", s)
+    mt = re.search(r"\bв\s+(\d{1,2})(?::?(\d{2}))?\s*(час(?:а|ов)?|ч)?\b", s)
     if md and mt:
         base = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[md.group(1)]
         day = (now + timedelta(days=base)).date()
         hh = int(mt.group(1))
         mm = int(mt.group(2) or 0)
-        # двусмысленно ТОЛЬКО 1..12 без минут
-        if mt.group(2) is None and 1 <= hh <= 12:
-            # спросим утро/вечер
+        has_word_hour = bool(mt.group(3))
+
+        # двусмысленно ТОЛЬКО 1..12 без минут и БЕЗ уточняющих минут — даже если есть "часа" всё равно двусмысленно
+        if mm == 0 and 1 <= hh <= 12:
             title = _extract_title(text)
             return {
                 "intent": "ask",
                 "expects": "time",
                 "question": "Уточни, пожалуйста, время",
-                "variants": ["{:02d}:00".format(hh), "{:02d}:00".format((hh % 12) + 12)],
+                "variants": [f"{hh:02d}:00", f"{(hh % 12) + 12:02d}:00"],
                 "base_date": day.isoformat(),
                 "title": title
             }
-        # однозначно
+
         when = datetime(day.year, day.month, day.day, hh, mm, tzinfo=now.tzinfo)
         title = _extract_title(text)
-        return {
-            "intent": "create_reminder",
-            "title": title,
-            "fixed_datetime": iso_no_seconds(when),
-            "recurrence": None
-        }
+        return {"intent": "create_reminder", "title": title, "fixed_datetime": iso_no_seconds(when), "recurrence": None}
 
     return None  # пусть обработает LLM
 
@@ -560,10 +553,11 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = "Напоминание"
         rem_id = db_add_reminder_oneoff(user_id, title, None, iso)
         schedule_oneoff(rem_id, user_id, iso, title, kind="oneoff")
+
         tz = db_get_user_tz(user_id) or "+03:00"
         dt_local = parse_iso_flexible(iso).astimezone(tzinfo_from_user(tz))
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-        await safe_reply(update, f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+        await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
     except Exception as e:
         log.exception("cb_pick error: %s", e)
         await q.answer("Ошибка выбора времени", show_alert=True)
@@ -580,7 +574,7 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         choice = data.split("answer:", 1)[1]
 
-        # если есть зафиксированная дата от препарсера — создаём сами
+        # быстрый путь: был препарсер с базовой датой
         cstate = context.user_data.get("clarify_state") or {}
         base_date = cstate.get("base_date")
         expects = cstate.get("expects")
@@ -589,23 +583,20 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tz = db_get_user_tz(user_id) or "+03:00"
 
         if base_date and expects == "time":
-            # нормализуем время
             m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?$", choice.strip())
             if not m:
-                # fallback — отправим в основной обработчик
                 context.user_data["__auto_answer"] = choice
                 return await handle_text(update, context)
             hh = int(m.group(1)); mm = int(m.group(2) or 0)
-            # двусмысленное «4» мы сюда не попадаем — кнопки дают 04:00/16:00
             when_local = datetime.fromisoformat(base_date).replace(hour=hh, minute=mm, tzinfo=tzinfo_from_user(tz))
             iso = iso_no_seconds(when_local)
             rem_id = db_add_reminder_oneoff(user_id, title, None, iso)
             schedule_oneoff(rem_id, user_id, iso, title, kind="oneoff")
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"📅 Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
+            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
                                     reply_markup=kb)
 
-        # иначе — через LLM (но с замороженным NOW_ISO)
+        # иначе — через LLM
         context.user_data["__auto_answer"] = choice
         return await handle_text(update, context)
     except Exception as e:
@@ -645,7 +636,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
         return
 
-    # ---- детерминированный препарсер
+    # --- детерминированный препарсер
     now_local = now_in_user_tz(user_tz)
     r = rule_parse(incoming_text, now_local)
     if r:
@@ -656,7 +647,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_oneoff(rem_id, user_id, iso, title, kind="oneoff")
             dt_local = parse_iso_flexible(iso).astimezone(tzinfo_from_user(user_tz))
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
+            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
                                     reply_markup=kb)
         if r["intent"] == "ask":
             set_clarify_state(context, {
@@ -669,7 +660,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_rows = [[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in r["variants"]]
             return await safe_reply(update, r["question"], reply_markup=InlineKeyboardMarkup(kb_rows))
 
-    # ---- LLM (с «замороженным» NOW_ISO)
+    # --- LLM (с замороженным NOW_ISO)
     cstate = get_clarify_state(context)
     now_iso_for_state = (cstate.get("now_iso") if cstate else iso_no_seconds(now_local))
     user_text_for_llm = (f"Исходная заявка: {cstate['original']}\nОтвет на уточнение: {incoming_text}"
@@ -708,11 +699,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
             rtype = recurrence.get("type")
             if rtype == "daily":
-                text = f"📅 Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
+                text = f"🔔🔔 Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
             elif rtype == "weekly":
-                text = f"📅 Окей, буду напоминать «{title}» каждую {recurrence.get('weekday')} в {recurrence.get('time')}"
+                text = f"🔔🔔 Окей, буду напоминать «{title}» каждую {recurrence.get('weekday')} в {recurrence.get('time')}"
             else:
-                text = f"📅 Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
+                text = f"🔔🔔 Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
             return await safe_reply(update, text, reply_markup=kb)
 
@@ -726,10 +717,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tz = db_get_user_tz(user_id) or "+03:00"
         dt_local = parse_iso_flexible(dt_iso_clean).astimezone(tzinfo_from_user(tz))
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-        return await safe_reply(update,
-            f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
-            reply_markup=kb
-        )
+        return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
     set_clarify_state(context, None)
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
