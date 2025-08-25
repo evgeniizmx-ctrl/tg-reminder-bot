@@ -33,8 +33,15 @@ log = logging.getLogger("planner-bot")
 
 # -------- OpenAI (опционально) ------------
 from openai import OpenAI
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
+_client = None
+def get_openai() -> OpenAI:
+    global _client
+    if _client is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        _client = OpenAI(api_key=api_key)
+    return _client
 # ---------- ENV -------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
 PROMPTS_PATH = os.environ.get("PROMPTS_PATH", "prompts.yaml")
@@ -276,10 +283,11 @@ async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = 
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY not set")
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0.2
+    resp = client = get_openai()
+resp = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=messages,
+    temperature=0.2
     )
     txt = resp.choices[0].message.content.strip()
     try:
