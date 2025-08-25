@@ -525,7 +525,7 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
             return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
                                     reply_markup=kb)
-    context.user_data["__auto_answer"] = choice
+    context.user_data["__auto_answer"] = choice  # handle_text возьмёт и склеит с original
     await handle_text(update, context)
 
 def get_clarify_state(context: ContextTypes.DEFAULT_TYPE):
@@ -533,7 +533,11 @@ def get_clarify_state(context: ContextTypes.DEFAULT_TYPE):
 def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
     if state is None: context.user_data.pop("clarify_state", None)
     else: context.user_data["clarify_state"] = state
-
+def merge_with_original(context: ContextTypes.DEFAULT_TYPE, reply_text: str) -> str:
+    """Если есть незавершённое уточнение, склеиваем прошлую фразу с новым ответом."""
+    st = context.user_data.get("clarify_state") or {}
+    original = st.get("original")
+    return f"{original}. {reply_text}" if original else reply_text
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await try_handle_tz_input(update, context): return
