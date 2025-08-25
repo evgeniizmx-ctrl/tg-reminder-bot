@@ -6,11 +6,12 @@ import sqlite3
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 import pytz
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel
+from openai import OpenAI
 
 from telegram import (
     Update,
@@ -18,36 +19,34 @@ from telegram import (
     InlineKeyboardButton,
     KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
-    ContextTypes,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
 
-# ============ ЛОГИ ============
+# ----------------- ЛОГИ -----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("reminder-bot")
 
-# ============ ENV ============
+# ----------------- ENV -----------------
 TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY") or ""
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN missing")
 if not OPENAI_API_KEY:
     log.warning("OPENAI_API_KEY missing — LLM parsing will fail.")
 
-# ============ DB ============
+# ----------------- DB -----------------
 DB_PATH = os.getenv("DB_PATH", "reminders.db")
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.row_factory = sqlite3.Row
@@ -61,22 +60,18 @@ CREATE TABLE IF NOT EXISTS reminders (
   chat_id INTEGER NOT NULL,
   title TEXT NOT NULL,
   when_ts INTEGER,                  -- unix ts для одноразовых и "время суток" старта для периодики
-  tz TEXT,                          -- "+03:00" и т.п.
+  tz TEXT,                          -- "+03:00"
   repeat TEXT DEFAULT 'none',       -- 'none'|'daily'|'weekly'|'monthly'
   day_of_week INTEGER,              -- 1..7 (Пн..Вс) для weekly
   day_of_month INTEGER,             -- 1..31 для monthly
   state TEXT DEFAULT 'active',      -- 'active'|'done'|'cancelled'
-  created_at INTEGER                -- unix ts
+  created_at INTEGER
 );
 """
 )
 conn.commit()
 
-# ============ ПАМЯТЬ УТОЧНЕНИЙ ============
-PENDING: Dict[int, Dict[str, Any]] = {}  # user_id -> {"pending": dict, "clarify_count": int}
-MAX_CLARIFY = 2
-
-# ============ МЕНЮ-КЛАВИАТУРА ============
+# ----------------- МЕНЮ -----------------
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         [KeyboardButton("📋 Список напоминаний")],
@@ -85,47 +80,40 @@ MAIN_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-# ============ ПРОМПТЫ ============
+# ----------------- PROMPTS -----------------
 class PromptPack(BaseModel):
-    system: Optional[str] = None  # root-level system (можно не использовать)
+    system: str | None = None
     parse: Dict[str, Any]
-    fewshot: Optional[List[Dict[str, str]]] = None
+    fewshot: List[Dict[str, str]] | None = None
 
 def load_prompts() -> PromptPack:
     path = os.getenv("PROMPTS_PATH", "prompts.yaml")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f)
-        pack = PromptPack(**raw)
-        log.info(
-            "Prompts loaded: system=%s | fewshot=%s",
-            (pack.parse.get("system", "")[:40] + "...") if pack.parse.get("system") else None,
-            len(pack.fewshot or []),
-        )
-        return pack
-    except Exception as e:
-        log.error("Failed to load prompts.yaml: %s", e, exc_info=False)
-        raise
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    pack = PromptPack(**raw)
+    log.info(
+        "Prompts loaded: system=%s | fewshot=%s",
+        (pack.parse.get("system", "")[:40] + "...") if pack.parse.get("system") else None,
+        len(pack.fewshot or []),
+    )
+    return pack
 
 PROMPTS = load_prompts()
 
-# ============ ВСПОМОГАТЕЛЬНЫЕ ДАТЫ ============
-def now_iso_with_tz(tz_offset: str) -> str:
-    # tz_offset "+03:00"
-    sign = 1 if tz_offset.startswith("+") else -1
-    hh, mm = map(int, tz_offset[1:].split(":"))
-    off = timezone(timedelta(minutes=sign * (hh * 60 + mm)))
-    return datetime.now(off).replace(microsecond=0).isoformat()
-
+# ----------------- ДАТЫ/ВРЕМЯ -----------------
 def ensure_tz_offset(s: Optional[str]) -> str:
-    # по умолчанию +03:00
     if not s:
         return "+03:00"
     m = re.fullmatch(r"[+-]\d{2}:\d{2}", s.strip())
     return s.strip() if m else "+03:00"
 
+def now_iso_with_tz(tz_offset: str) -> str:
+    sign = 1 if tz_offset.startswith("+") else -1
+    hh, mm = map(int, tz_offset[1:].split(":"))
+    off = timezone(timedelta(minutes=sign * (hh * 60 + mm)))
+    return datetime.now(off).replace(microsecond=0).isoformat()
+
 def iso_to_unix(iso_str: str) -> int:
-    # поддержка RFC3339 с оффсетом
     dt = datetime.fromisoformat(iso_str)
     return int(dt.timestamp())
 
@@ -136,7 +124,6 @@ def unix_to_local_str(ts: int, tz_offset: str) -> str:
     dt = datetime.fromtimestamp(ts, tz=off)
     return dt.strftime("%d.%m %H:%M")
 
-# строит ISO следующего локального "сегодня в HH:MM" (если прошло — завтра)
 def build_today_time_iso(tz_offset: str, hhmm: str) -> str:
     sign = 1 if tz_offset.startswith("+") else -1
     hh_off, mm_off = map(int, tz_offset[1:].split(":"))
@@ -148,15 +135,10 @@ def build_today_time_iso(tz_offset: str, hhmm: str) -> str:
         dt += timedelta(days=1)
     return dt.isoformat()
 
-# ============ OPENAI LLM ============
-from openai import OpenAI
+# ----------------- OPENAI -----------------
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 async def call_llm(text: str, tz_offset: str) -> Optional[dict]:
-    """
-    Собираем сообщения: system + NOW_ISO/TZ_DEFAULT + user + fewshot.
-    Возвращаем распарсенный dict или None.
-    """
     tz_offset = ensure_tz_offset(tz_offset)
     now_iso = now_iso_with_tz(tz_offset)
     system_text = PROMPTS.parse.get("system", "")
@@ -165,61 +147,41 @@ async def call_llm(text: str, tz_offset: str) -> Optional[dict]:
     if system_text:
         messages.append({"role": "system", "content": system_text})
 
-    # Передаём «служебный» NOW_ISO / TZ_DEFAULT отдельным сообщением (как описано в промте)
-    messages.append(
-        {
-            "role": "user",
-            "content": f"NOW_ISO={now_iso}  TZ_DEFAULT={tz_offset}",
-        }
-    )
+    messages.append({"role": "user", "content": f"NOW_ISO={now_iso}  TZ_DEFAULT={tz_offset}"})
 
-    # few-shot (если есть)
-    few = PROMPTS.fewshot or []
-    for fs in few:
+    for fs in PROMPTS.fewshot or []:
         role = fs.get("role")
         content = fs.get("content", "")
         if role and content:
             messages.append({"role": role, "content": content})
 
-    # основной ввод пользователя
     messages.append({"role": "user", "content": text})
-
-    log.debug("LLM messages: %s", messages)
 
     try:
         resp = await asyncio.to_thread(
             openai_client.chat.completions.create,
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            model=OPENAI_MODEL,
             messages=messages,
             temperature=0.2,
         )
-        raw = resp.choices[0].message.content or ""
-        # иногда модель оборачивает в бэктики — снимем
-        raw = raw.strip()
+        raw = (resp.choices[0].message.content or "").strip()
         if raw.startswith("```"):
             raw = re.sub(r"^```(json|JSON)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw).strip()
-        # просто парсим JSON
         data = json.loads(raw)
         return data
     except Exception as e:
         log.error("LLM error: %s", e, exc_info=False)
         return None
 
-# ============ УТОЧНЕНИЯ ============
+# ----------------- УТОЧНЕНИЯ -----------------
+PENDING: Dict[int, Dict[str, Any]] = {}  # user_id -> {"pending":{}, "clarify_count":int}
+MAX_CLARIFY = 2
 
 def upsert_pending(user_id: int, payload: dict):
     d = PENDING.get(user_id, {"pending": {}, "clarify_count": 0})
     pen = d["pending"]
-    for k in [
-        "title",
-        "description",
-        "timezone",
-        "fixed_datetime",
-        "repeat",
-        "day_of_week",
-        "day_of_month",
-    ]:
+    for k in ["title", "description", "timezone", "fixed_datetime", "repeat", "day_of_week", "day_of_month"]:
         if payload.get(k) is not None:
             pen[k] = payload[k]
     PENDING[user_id] = {"pending": pen, "clarify_count": d["clarify_count"]}
@@ -228,10 +190,6 @@ def inc_clarify(user_id: int):
     d = PENDING.get(user_id, {"pending": {}, "clarify_count": 0})
     d["clarify_count"] += 1
     PENDING[user_id] = d
-
-def can_clarify(user_id: int) -> bool:
-    d = PENDING.get(user_id)
-    return (d is None) or (d["clarify_count"] < MAX_CLARIFY)
 
 def render_options_keyboard(options: List[dict], cb_prefix: str = "clarify") -> InlineKeyboardMarkup:
     rows, row = [], []
@@ -251,8 +209,7 @@ def render_options_keyboard(options: List[dict], cb_prefix: str = "clarify") -> 
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
-# ============ СОХРАНЕНИЕ/СНООЗ ============
-
+# ----------------- CRUD -----------------
 def save_reminder(
     user_id: int,
     chat_id: int,
@@ -300,7 +257,7 @@ def delete_reminder(rem_id: int) -> bool:
     conn.commit()
     return cur.rowcount > 0
 
-# ============ ВСПОМОГАТЕЛЬНОЕ: ДЛЯ ПЕРИОДИКИ ============
+# ----------------- ПЕРИОДИКА -----------------
 def compute_next_fire(row: sqlite3.Row) -> Optional[int]:
     repeat = row["repeat"]
     if repeat == "none":
@@ -316,9 +273,9 @@ def compute_next_fire(row: sqlite3.Row) -> Optional[int]:
     base_time = datetime.fromtimestamp(row["when_ts"], tz=off) if row["when_ts"] else now_local
 
     if repeat == "daily":
-        nxt = base_time
+        nxt = now_local.replace(hour=base_time.hour, minute=base_time.minute, second=0, microsecond=0)
         if nxt <= now_local:
-            nxt = nxt + timedelta(days=1)
+            nxt += timedelta(days=1)
         return int(nxt.astimezone(timezone.utc).timestamp())
 
     if repeat == "weekly":
@@ -334,13 +291,11 @@ def compute_next_fire(row: sqlite3.Row) -> Optional[int]:
     if repeat == "monthly":
         dom = int(row["day_of_month"] or 1)
         y, m = now_local.year, now_local.month
-        # кандидат в текущем месяце
         import calendar
         last = calendar.monthrange(y, m)[1]
         d = dom if dom <= last else last
         candidate = now_local.replace(day=d, hour=base_time.hour, minute=base_time.minute, second=0, microsecond=0)
         if candidate <= now_local:
-            # следующий месяц
             if m == 12:
                 y, m = y + 1, 1
             else:
@@ -359,65 +314,41 @@ def bump_next(row_id: int, next_ts: Optional[int]):
         cur.execute("UPDATE reminders SET state='done' WHERE id=?", (row_id,))
     conn.commit()
 
-# ============ SCHEDULER LOOP ============
-async def scheduler_loop(app: Application):
-    log.info("Scheduler started")
-    while True:
-        try:
-            now_ts = int(datetime.utcnow().timestamp())
-            cur.execute(
-                "SELECT * FROM reminders WHERE state='active' AND when_ts IS NOT NULL AND when_ts <= ?",
-                (now_ts,),
-            )
-            due = cur.fetchall()
-            for row in due:
-                # Отправка уведомления + инлайн-кнопки
-                tz_off = row["tz"] or "+03:00"
-                when_str = unix_to_local_str(row["when_ts"], tz_off)
-                kb = InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton("⏰ через 10 мин", callback_data=f"snooze:10:{row['id']}"),
-                            InlineKeyboardButton("🕒 через 1 час", callback_data=f"snooze:60:{row['id']}"),
-                            InlineKeyboardButton("✅ Готово", callback_data=f"done:{row['id']}"),
-                        ]
-                    ]
-                )
-                try:
-                    await app.bot.send_message(
-                        chat_id=row["chat_id"],
-                        text=f"📅 Напоминание: {row['title']}\n⏱ {when_str}",
-                        reply_markup=kb,
-                    )
-                except Exception as e:
-                    log.error("Send reminder failed: %s", e, exc_info=False)
-
-                # Рассчитать следующее (если периодика), либо завершить
-                next_ts = compute_next_fire(row)
-                bump_next(row["id"], next_ts)
-
-        except Exception as e:
-            log.error("Scheduler error: %s", e, exc_info=False)
-
-        await asyncio.sleep(30)
-
-# ============ ХЕНДЛЕРЫ ============
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(
-        "Привет! Я напоминалка. Напиши что и когда напомнить.\n"
-        "Например: «завтра в 11 падел», «через 10 минут позвонить», «каждый день в 9 пить таблетки».",
-        reply_markup=MAIN_MENU,
-    )
-
-async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PROMPTS
+# ----------------- SCHEDULER (JobQueue tick) -----------------
+async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
     try:
-        PROMPTS = load_prompts()
-        await update.message.reply_text("🔄 Промпты перезагружены.")
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка загрузки промптов: {e}")
+        now_ts = int(datetime.utcnow().timestamp())
+        cur.execute(
+            "SELECT * FROM reminders WHERE state='active' AND when_ts IS NOT NULL AND when_ts <= ?",
+            (now_ts,),
+        )
+        due = cur.fetchall()
+        for row in due:
+            tz_off = row["tz"] or "+03:00"
+            when_str = unix_to_local_str(row["when_ts"], tz_off)
+            kb = InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton("⏰ через 10 мин", callback_data=f"snooze:10:{row['id']}"),
+                    InlineKeyboardButton("🕒 через 1 час", callback_data=f"snooze:60:{row['id']}"),
+                    InlineKeyboardButton("✅ Готово", callback_data=f"done:{row['id']}")
+                ]]
+            )
+            try:
+                await app.bot.send_message(
+                    chat_id=row["chat_id"],
+                    text=f"📅 Напоминание: {row['title']}\n⏱ {when_str}",
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                log.error("Send reminder failed: %s", e, exc_info=False)
 
+            next_ts = compute_next_fire(row)
+            bump_next(row["id"], next_ts)
+    except Exception as e:
+        log.error("Scheduler error: %s", e, exc_info=False)
+
+# ----------------- ХЕЛПЕРЫ UI -----------------
 def format_period_suffix(row: sqlite3.Row) -> str:
     if row["repeat"] == "none":
         return ""
@@ -432,6 +363,33 @@ def format_period_suffix(row: sqlite3.Row) -> str:
         return f" (ежемесячно, {dom} числа)"
     return ""
 
+# ----------------- HANDLERS -----------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я напоминалка. Напиши что и когда напомнить.\n"
+        "Например: «завтра в 11 падел», «через 10 минут позвонить», «каждый день в 9 пить таблетки».",
+        reply_markup=MAIN_MENU,
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Примеры:\n"
+        "• завтра в 11 падел\n"
+        "• через 10 минут позвонить\n"
+        "• каждый день в 9 пить таблетки\n"
+        "• раз в неделю в среду в 19 — зал\n"
+        "• каждое 5 число месяца в 18 — баня\n",
+        reply_markup=MAIN_MENU,
+    )
+
+async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global PROMPTS
+    try:
+        PROMPTS = load_prompts()
+        await update.message.reply_text("🔄 Промпты перезагружены.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка загрузки промптов: {e}")
+
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     cur.execute(
@@ -443,16 +401,13 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пока нет активных напоминаний.")
         return
 
-    chunks = []
     for r in rows:
         tz = r["tz"] or "+03:00"
         when_s = "-" if r["when_ts"] is None else unix_to_local_str(r["when_ts"], tz)
         suffix = format_period_suffix(r)
-        line = f"• {r['title']}\n   ⏱ {when_s}{suffix}"
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{r['id']}")]]
-        )
-        await update.message.reply_text(line, reply_markup=kb)
+        text = f"• {r['title']}\n   ⏱ {when_s}{suffix}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{r['id']}")]])
+        await update.message.reply_text(text, reply_markup=kb)
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
@@ -467,9 +422,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
-
-    # определим tz пользователя; у тебя может быть свой механизм — оставим по умолчанию +03:00
-    tz_offset = context.user_data.get("tz_offset", "+03:00")
+    tz_offset = ensure_tz_offset(context.user_data.get("tz_offset") or "+03:00")
 
     data = await call_llm(text, tz_offset)
     if not data:
@@ -485,11 +438,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     timezone_str = ensure_tz_offset(data.get("timezone") or tz_offset)
 
     if intent == "ask_clarification":
-        # сохраним промежуточные данные
+        # сохраняем промежуточные
         upsert_pending(user.id, data)
-        inc = PENDING.get(user.id, {"clarify_count": 0})["clarify_count"]
-        if inc >= MAX_CLARIFY:
-            # создаём лучшую догадку
+        d = PENDING.get(user.id, {"clarify_count": 0})
+        if d["clarify_count"] >= MAX_CLARIFY:
             pen = PENDING[user.id]["pending"]
             rem_id = save_reminder(
                 user.id,
@@ -510,14 +462,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📅 Окей, записал: {pen.get('title','Напоминание')} — {pretty}", reply_markup=MAIN_MENU)
             return
 
-        inc_clarify(user.id)
+        d["clarify_count"] += 1
+        PENDING[user.id] = d
         opts = data.get("options") or []
-
-        # если опций нет, подкинем стандартные (время)
         if not opts:
             std = ["08:00", "12:00", "19:00"]
             opts = [{"iso_datetime": build_today_time_iso(timezone_str, hh), "label": hh} for hh in std]
-
         kb = render_options_keyboard(opts, cb_prefix="clarify")
         await update.message.reply_text("Уточни, пожалуйста:", reply_markup=kb)
         return
@@ -537,7 +487,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pretty = unix_to_local_str(iso_to_unix(fixed), timezone_str) if fixed else "—"
         await update.message.reply_text(f"📅 Окей, напомню: {title}\n⏱ {pretty}", reply_markup=MAIN_MENU)
     else:
-        # периодика
         when_s = "-" if not fixed else unix_to_local_str(iso_to_unix(fixed), timezone_str)
         suffix = ""
         if repeat == "daily":
@@ -547,7 +496,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             suffix = f"еженедельно, {map_dow.get(day_of_week or 1,'?')}"
         elif repeat == "monthly":
             suffix = f"каждое {day_of_month} число"
-
         await update.message.reply_text(
             f"📅 Окей, напомню: {title}\n⏱ {when_s} ({suffix})",
             reply_markup=MAIN_MENU,
@@ -558,7 +506,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     await q.answer()
     if data.startswith("snooze:"):
-        # snooze:MIN:ID
         try:
             _, mins, rem_id = data.split(":", 2)
             mins = int(mins)
@@ -567,7 +514,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         new_ts = snooze_reminder(rem_id, mins)
         if new_ts:
-            # Получим tz для красивого вывода
             cur.execute("SELECT tz, title FROM reminders WHERE id=?", (rem_id,))
             row = cur.fetchone()
             tz_off = row["tz"] or "+03:00"
@@ -592,7 +538,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok:
             await q.edit_message_text("🗑 Удалено")
     elif data.startswith("clarify:"):
-        # clarify:ISO:DOW:DOM
         try:
             _, iso, dow, dom = data.split(":", 3)
         except:
@@ -614,7 +559,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         PENDING[user_id] = {"pending": pen, "clarify_count": d["clarify_count"]}
 
-        # проверка готовности
         repeat = pen.get("repeat", "none")
         ready = False
         if repeat == "none":
@@ -627,7 +571,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ready = bool(pen.get("fixed_datetime")) and bool(pen.get("day_of_month"))
 
         if ready:
-            rem_id = save_reminder(
+            save_reminder(
                 user_id,
                 q.message.chat_id,
                 pen.get("title", "Напоминание"),
@@ -645,10 +589,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await q.edit_message_text(f"✅ Записал: {pen.get('title','Напоминание')} — {pretty}")
         else:
-            # ещё один раунд уточнения или авто-догадка
             d = PENDING.get(user_id, {"pending": pen, "clarify_count": 0})
             if d["clarify_count"] >= MAX_CLARIFY:
-                rem_id = save_reminder(
+                save_reminder(
                     user_id,
                     q.message.chat_id,
                     pen.get("title", "Напоминание"),
@@ -664,7 +607,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d["clarify_count"] += 1
             PENDING[user_id] = d
 
-            # выбираем, что спросить
             opts = []
             if not pen.get("fixed_datetime"):
                 for hh in ["08:00", "12:00", "19:00"]:
@@ -683,46 +625,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("Выбери число месяца:", reply_markup=render_options_keyboard(opts))
                 return
 
-# ============ /help ============
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Примеры:\n"
-        "• завтра в 11 падел\n"
-        "• через 10 минут позвонить\n"
-        "• каждый день в 9 пить таблетки\n"
-        "• раз в неделю в среду в 19 — зал\n"
-        "• каждое 5 число месяца в 18 — баня\n",
-        reply_markup=MAIN_MENU,
-    )
-
-# ============ MAIN ============
+# ----------------- APP -----------------
 def build_app() -> Application:
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reload", reload_prompts))
 
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(snooze|done|del|clarify):"))
-    # Главное меню
     app.add_handler(MessageHandler(filters.Regex(r"^(📋 Список напоминаний|⚙️ Настройки)$"), handle_menu))
-    # Остальной текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # 🔔 Планировщик через JobQueue: каждые 30 сек, первый запуск через 5 сек
+    app.job_queue.run_repeating(scheduler_tick, interval=30, first=5)
+
     return app
 
-async def main_async():
+def main():
     log.info("Bot starting… polling enabled")
     app = build_app()
-    # запустим планировщик в фоне
-    asyncio.create_task(scheduler_loop(app))
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-await app.updater.running
-    await app.stop()
-    await app.shutdown()
-
-def main():
-    asyncio.run(main_async())
+    # PTB v20+: run_polling() вместо ручного initialize/start/updater.idle()
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
