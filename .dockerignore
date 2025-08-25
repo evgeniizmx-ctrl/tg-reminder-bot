@@ -4,9 +4,10 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
-*.sqlite
 .env
-.venv
-venv
-node_modules
-.DS_Store
+venv/
+.venv/
+.idea/
+.vscode/
+dist/
+build/
