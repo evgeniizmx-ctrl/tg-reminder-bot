@@ -19,12 +19,6 @@ parse:
     - Время с минутами («11:30», «23:45») всегда однозначно.
     - Часы 13–24 считаются однозначными: «19» → 19:00.
     - Слитная запись «1710», «0915», «700» → 17:10, 09:15, 07:00.
-    - Слова времени суток:
-        • если явно сказано «утром/утра» — трактуй часы как до полудня (AM), напр. «11 утра» → 11:00;
-        • «вечером/вечера» — после полудня (PM), напр. «7 вечера» → 19:00, «11 вечера» → 23:00;
-        • «днём/дня» — дневное время; если указан час 1..12, это PM (напр. «в 2 днём» → 14:00);
-        • «ночью/ночи» — 00:00–04:59; «в 2 ночи» → 02:00.
-      Если указан час вместе со словом времени суток — НЕ спрашивай «утро или вечер», это однозначно.
     - Относительное время (строго от NOW_ISO):
         «через минуту» → +1m
         «через 5 минут» → +5m
@@ -39,6 +33,10 @@ parse:
         «без десяти шесть» → 05:50
         «без двадцати десять» → 09:40
         «в начале восьмого» → ~07:05 (округляй здраво)
+
+    - Если в запросе есть слова "утром", "вечером", "днём", "ночью" вместе с часами — это ВСЕГДА однозначно. НЕ задавай уточняющих вопросов. 
+      Например: «в 11 утра» → 11:00, «в 7 вечера» → 19:00, «в 2 ночи» → 02:00.
+
     - Двусмысленно ТОЛЬКО «в 1..12» без минут и контекста. Тогда спрашивай.
     - Если указано время, которое сегодня уже прошло (и это «в 1..12» без минут) — ближайшее будущее обычно завтра.
     - Если сформулирована периодичность — верни recurrence (см. ниже).
@@ -59,6 +57,13 @@ parse:
       }
     и "fixed_datetime": null.
 
+    КОНТЕКСТ ДЛЯ УТОЧНЕНИЙ
+    - Если предыдущий ответ был intent="ask_clarification" и пришёл новый ответ пользователя,
+      ОБЪЕДИНЯЙ его с исходным text_original и трактуй как единый запрос.
+      Если после объединения данных достаточно — верни сразу intent="create_reminder".
+    - Если уточнение пользователя содержит только цифру 1..12 и в исходном запросе было "утром/вечером/днём/ночью",
+      трактуй это как час, а не как день недели или число.
+
     УТОЧНЕНИЯ (не более ДВУХ шагов):
     - Если данных мало — intent="ask_clarification".
     - Сначала предпочитай СВОБОДНЫЙ текстовый ответ от пользователя.
@@ -74,25 +79,12 @@ parse:
           После ответа верни второе уточнение question:"Во сколько?", expects:"time".
         • Если ответ «в 6» без минут — верни второе уточнение с variants ["06:00","18:00"]
           и question "Утро или вечер?".
-    - КОНТЕКСТ ДЛЯ УТОЧНЕНИЙ:
-      Если предыдущий ответ был intent="ask_clarification" и пришёл новый ответ пользователя,
-      ОБЪЕДИНЯЙ его с исходным text_original и трактуй как единый запрос.
-      Если после объединения данных достаточно — верни сразу intent="create_reminder" (не зацикливайся).
-    - Если в объединённом тексте есть «утром/вечером/днём/ночью», одиночные часы 1..12 трактуй как ВРЕМЯ, а не как день недели/число:
-        «утром … . 11» → 11:00; «вечером … . 7» → 19:00; «днём … . 2» → 14:00; «ночью … . 2» → 02:00.
-      НЕ спрашивай «утро или вечер» в таких случаях.
-    - Если в первой части есть периодичность («каждый день», «раз в неделю», «каждую среду»), а новая часть — только время,
-      сохраняй периодичность и просто заполняй time внутри recurrence.
-    - Если требуется день недели и пользователь прислал номер 1..7 — сопоставь:
-      1=mon, 2=tue, 3=wed, 4=thu, 5=fri, 6=sat, 7=sun.
-      Приоритет «день недели» используй только если это явно запросили,
-      иначе одиночное число 1..12 в контексте времени считай часом.
 
     ЕСЛИ ОДНОЗНАЧНО
     - intent="create_reminder"; сразу верни либо fixed_datetime (ISO-8601 с оффсетом),
       либо recurrence (для повторяющихся).
 
-    ЕСЛИ СЛОВА СОМНИТЕЛЬНЫ (баня/банк)
+    ЕСЛИ СЛОВА СОМНИТЕЛЬНЫ (банк/баня)
     - Не зацикливайся. Фиксируй то, что понятнее из контекста, и продолжай.
 
     ФОРМАТ ОТВЕТА — строго JSON:
@@ -171,114 +163,6 @@ fewshot:
       }
 
   - role: user
-    content: "9 утра"
-  - role: assistant
-    content: |
-      {
-        "intent": "create_reminder",
-        "text_original": "Пить таблетки каждый день. 9 утра",
-        "title": "Таблетки",
-        "description": null,
-        "timezone": null,
-        "fixed_datetime": null,
-        "recurrence": { "type": "daily", "weekday": null, "day": null, "time": "09:00" },
-        "need_confirmation": false,
-        "question": null,
-        "expects": null,
-        "variants": []
-      }
-
-  - role: user
-    content: "утром падел"
-  - role: assistant
-    content: |
-      {
-        "intent": "ask_clarification",
-        "text_original": "утром падел",
-        "title": "Падел",
-        "description": null,
-        "timezone": null,
-        "fixed_datetime": null,
-        "recurrence": null,
-        "need_confirmation": false,
-        "question": "Во сколько утром?",
-        "expects": "time",
-        "variants": []
-      }
-
-  - role: user
-    content: "11"
-  - role: assistant
-    content: |
-      {
-        "intent": "create_reminder",
-        "text_original": "утром падел. 11",
-        "title": "Падел",
-        "description": null,
-        "timezone": null,
-        "fixed_datetime": "2025-08-26T11:00:00+03:00",
-        "recurrence": null,
-        "need_confirmation": false,
-        "question": null,
-        "expects": null,
-        "variants": []
-      }
-
-  - role: user
-    content: "Раз в неделю зал в 5"
-  - role: assistant
-    content: |
-      {
-        "intent": "ask_clarification",
-        "text_original": "Раз в неделю зал в 5",
-        "title": "Зал",
-        "description": null,
-        "timezone": null,
-        "fixed_datetime": null,
-        "recurrence": null,
-        "need_confirmation": false,
-        "question": "Какой день недели?",
-        "expects": "weekday",
-        "variants": ["mon","tue","wed","thu","fri","sat","sun"]
-      }
-
-  - role: user
-    content: "3"
-  - role: assistant
-    content: |
-      {
-        "intent": "create_reminder",
-        "text_original": "Раз в неделю зал в 5. 3",
-        "title": "Зал",
-        "description": null,
-        "timezone": null,
-        "fixed_datetime": null,
-        "recurrence": { "type": "weekly", "weekday": "wed", "time": "17:00" },
-        "need_confirmation": false,
-        "question": null,
-        "expects": null,
-        "variants": []
-      }
-
-  - role: user
-    content: "Завтра падел в 11 утра"
-  - role: assistant
-    content: |
-      {
-        "intent": "create_reminder",
-        "text_original": "Завтра падел в 11 утра",
-        "title": "Падел",
-        "description": null,
-        "timezone": null,
-        "fixed_datetime": "2025-08-26T11:00:00+03:00",
-        "recurrence": null,
-        "need_confirmation": false,
-        "question": null,
-        "expects": null,
-        "variants": []
-      }
-
-  - role: user
     content: "через 20 минут перезвони Васе"
   - role: assistant
     content: |
@@ -297,17 +181,53 @@ fewshot:
       }
 
   - role: user
-    content: "каждое 5 число в 19:30 баня"
+    content: "каждое 5 число в 19:30 встреча"
   - role: assistant
     content: |
       {
         "intent": "create_reminder",
-        "text_original": "каждое 5 число в 19:30 баня",
-        "title": "Баня",
+        "text_original": "каждое 5 число в 19:30 встреча",
+        "title": "Встреча",
         "description": null,
         "timezone": null,
         "fixed_datetime": null,
         "recurrence": { "type": "monthly", "day": 5, "time": "19:30" },
+        "need_confirmation": false,
+        "question": null,
+        "expects": null,
+        "variants": []
+      }
+
+  - role: user
+    content: "Утром падел"
+  - role: assistant
+    content: |
+      {
+        "intent": "ask_clarification",
+        "text_original": "Утром падел",
+        "title": "Падел",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": null,
+        "recurrence": null,
+        "need_confirmation": false,
+        "question": "Во сколько утром?",
+        "expects": "time",
+        "variants": []
+      }
+
+  - role: user
+    content: "11"
+  - role: assistant
+    content: |
+      {
+        "intent": "create_reminder",
+        "text_original": "Утром падел. 11",
+        "title": "Падел",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": "2025-08-26T11:00:00+03:00",
+        "recurrence": null,
         "need_confirmation": false,
         "question": null,
         "expects": null,
