@@ -59,15 +59,10 @@ parse:
     - В JSON добавляй:
         "question": "<короткий вопрос одним предложением>",
         "expects": "time" | "weekday" | "date" | "periodicity",
-        "variants": []  # список кнопок-дублёров; может быть пустым. Элементы могут быть:
-                        # 1) строками (ярлык кнопки), 2) объектами {"label":"…","iso_datetime":"…"}.
-      Примеры:
-        • «Пить таблетки каждый день» → question: "Во сколько напоминать каждый день?",
-          expects:"time", variants: [].
-        • «Зал раз в неделю в 5» → сначала question:"Какой день недели?", expects:"weekday".
-          После ответа верни второе уточнение question:"Во сколько?", expects:"time".
-        • Если ответ «в 6» без минут — верни второе уточнение с variants ["06:00","18:00"]
-          и question "Утро или вечер?".
+        "variants": []
+    - ЕСЛИ intent="ask_clarification" и пришёл новый ответ пользователя —
+      объединяй его с исходным text_original и трактуй как единый запрос.
+      Если после объединения данных достаточно — верни сразу intent="create_reminder".
 
     ЕСЛИ ОДНОЗНАЧНО
     - intent="create_reminder"; сразу верни либо fixed_datetime (ISO-8601 с оффсетом),
@@ -152,21 +147,57 @@ fewshot:
       }
 
   - role: user
-    content: "Зал раз в неделю в 5 часов"
+    content: "9 утра"
+  - role: assistant
+    content: |
+      {
+        "intent": "create_reminder",
+        "text_original": "Пить таблетки каждый день. 9 утра",
+        "title": "Таблетки",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": null,
+        "recurrence": { "type": "daily", "weekday": null, "day": null, "time": "09:00" },
+        "need_confirmation": false,
+        "question": null,
+        "expects": null,
+        "variants": []
+      }
+
+  - role: user
+    content: "утром падел"
   - role: assistant
     content: |
       {
         "intent": "ask_clarification",
-        "text_original": "Зал раз в неделю в 5 часов",
-        "title": "Зал",
+        "text_original": "утром падел",
+        "title": "Падел",
         "description": null,
         "timezone": null,
         "fixed_datetime": null,
         "recurrence": null,
         "need_confirmation": false,
-        "question": "Какой день недели?",
-        "expects": "weekday",
-        "variants": ["mon","tue","wed","thu","fri","sat","sun"]
+        "question": "Во сколько утром?",
+        "expects": "time",
+        "variants": []
+      }
+
+  - role: user
+    content: "в 10"
+  - role: assistant
+    content: |
+      {
+        "intent": "create_reminder",
+        "text_original": "утром падел. в 10",
+        "title": "Падел",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": "2025-08-26T10:00:00+03:00",
+        "recurrence": null,
+        "need_confirmation": false,
+        "question": null,
+        "expects": null,
+        "variants": []
       }
 
   - role: user
@@ -204,3 +235,4 @@ fewshot:
         "expects": null,
         "variants": []
       }
+
