@@ -162,7 +162,7 @@ def now_in_user_tz(tz_str: str) -> datetime:
 
 def iso_utc(dt: datetime) -> str:
     if dt.tzinfo is None: raise ValueError("aware dt required")
-    dt = dt.astimezone(timezone.utc).replace(second=0, microsecond=0)
+    dt = dt.astimezone(timezone.utc).replace(microsecond=0)  # секунды НЕ обнуляем, чтобы не уронить в прошлое
     return dt.isoformat()
 
 def parse_iso(s: str) -> datetime:
@@ -250,7 +250,7 @@ async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = 
     if now_iso_override:
         try: now_local = dparser.isoparse(now_iso_override)
         except Exception: pass
-    header = f"NOW_ISO={now_local.replace(second=0, microsecond=0).isoformat()}\nTZ_DEFAULT={user_tz or '+03:00'}"
+    header = f"NOW_ISO={now_local.replace(microsecond=0).isoformat()}\nTZ_DEFAULT={user_tz or '+03:00'}"
     messages = [
         {"role": "system", "content": PROMPTS["system"]},
         {"role": "system", "content": header},
@@ -305,24 +305,26 @@ def rule_parse(text: str, now_local: datetime):
         return {"intent": "create", "title": title, "when_local": when_local}
     return None
 
-# ---------- Scheduler (создаём в PTB loop) ----------
+# ---------- Scheduler (инициализируем в PTB loop) ----------
 scheduler: AsyncIOScheduler | None = None
+TG_BOT = None  # ссылка на бот PTB, чтобы APScheduler мог слать сообщения
 
-async def fire_reminder(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    data = job.kwargs
-    chat_id = data["chat_id"]; rem_id = data["rem_id"]; title = data["title"]
-    kind = data.get("kind","oneoff")
-    kb_rows = [[
-        InlineKeyboardButton("Через 10 мин", callback_data=f"snooze:10:{rem_id}"),
-        InlineKeyboardButton("Через 1 час", callback_data=f"snooze:60:{rem_id}")
-    ]]
-    if kind == "oneoff":
-        kb_rows.append([InlineKeyboardButton("✅", callback_data=f"done:{rem_id}")])
-    await context.bot.send_message(chat_id, f"🔔 «{title}»", reply_markup=InlineKeyboardMarkup(kb_rows))
+async def fire_reminder(*, chat_id: int, rem_id: int, title: str, kind: str = "oneoff"):
+    """Колбэк APScheduler — без PTB context! Все параметры приходят из kwargs."""
+    try:
+        kb_rows = [[
+            InlineKeyboardButton("Через 10 мин", callback_data=f"snooze:10:{rem_id}"),
+            InlineKeyboardButton("Через 1 час", callback_data=f"snooze:60:{rem_id}")
+        ]]
+        if kind == "oneoff":
+            kb_rows.append([InlineKeyboardButton("✅", callback_data=f"done:{rem_id}")])
+
+        await TG_BOT.send_message(chat_id, f"🔔 «{title}»", reply_markup=InlineKeyboardMarkup(kb_rows))
+        log.info("Fired reminder id=%s to chat=%s", rem_id, chat_id)
+    except Exception as e:
+        log.exception("fire_reminder failed: %s", e)
 
 def ensure_scheduler() -> AsyncIOScheduler:
-    global scheduler
     if scheduler is None:
         raise RuntimeError("Scheduler not initialized yet")
     return scheduler
@@ -332,11 +334,12 @@ def schedule_oneoff(rem_id: int, user_id: int, when_iso_utc: str, title: str, ki
     dt_utc = parse_iso(when_iso_utc)
     sch.add_job(
         fire_reminder, DateTrigger(run_date=dt_utc),
-        id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=120, coalesce=True,
+        id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=300, coalesce=True,
         kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "kind": kind},
         name=f"rem {rem_id}",
     )
-    log.info("Scheduled oneoff id=%s at %s UTC", rem_id, dt_utc.isoformat())
+    log.info("Scheduled oneoff id=%s at %s UTC (title=%s)", rem_id, dt_utc.isoformat(), title)
+    sch.print_jobs()
 
 def schedule_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, tz_str: str):
     sch = ensure_scheduler()
@@ -350,14 +353,14 @@ def schedule_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, 
         trigger = CronTrigger(day=int(recurrence.get("day")), hour=hh, minute=mm, timezone=tzinfo)
     sch.add_job(
         fire_reminder, trigger,
-        id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=300, coalesce=True,
+        id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=600, coalesce=True,
         kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "kind": "recurring"},
         name=f"rem {rem_id}",
     )
-    log.info("Scheduled recurring id=%s (%s %s)", rem_id, rtype, time_str)
+    log.info("Scheduled recurring id=%s (%s %s, tz=%s)", rem_id, rtype, time_str, tz_str)
+    sch.print_jobs()
 
 def reschedule_all():
-    """Поднять все незавершённые напоминания из БД (после рестарта)."""
     sch = ensure_scheduler()
     with db() as conn:
         rows = conn.execute("select * from reminders where status='scheduled'").fetchall()
@@ -371,7 +374,7 @@ def reschedule_all():
                 schedule_recurring(r["id"], r["user_id"], r["title"], rec, tz)
     log.info("Rescheduled %d reminders from DB", len(rows))
 
-# ---------- Handlers ----------
+# ---------- Handlers (как были) ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tz = db_get_user_tz(user_id)
@@ -476,7 +479,7 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
     dt_local = to_user_local(when_iso_utc, tz)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%м в %H:%M')}", reply_markup=kb)
+    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -599,12 +602,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- post_init: создаём и стартуем APScheduler в PTB loop ----------
 async def on_startup(app: Application):
-    global scheduler
+    global scheduler, TG_BOT
+    TG_BOT = app.bot
     loop = asyncio.get_running_loop()
-    scheduler = AsyncIOScheduler(timezone=timezone.utc, event_loop=loop)
+    scheduler = AsyncIOScheduler(
+        timezone=timezone.utc,
+        event_loop=loop,
+        job_defaults={"coalesce": True, "misfire_grace_time": 600}
+    )
     scheduler.start()
     log.info("APScheduler started in PTB event loop")
-    # рескейдим все джобы из БД
     reschedule_all()
 
 # ---------- main ----------
@@ -614,7 +621,7 @@ def main():
 
     app = (Application.builder()
            .token(BOT_TOKEN)
-           .post_init(on_startup)   # ключевой фикс
+           .post_init(on_startup)
            .build())
 
     app.add_handler(CommandHandler("start", cmd_start))
