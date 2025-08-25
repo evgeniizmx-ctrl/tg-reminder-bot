@@ -54,7 +54,7 @@ def db_init():
                 status text default 'scheduled'
             )
         """)
-        # хранение незавершённого уточнения (чтобы LLM видела контекст)
+        # слот для незавершённого уточнения LLM
         conn.execute("""
             create table if not exists pending (
                 user_id integer primary key,
@@ -141,14 +141,31 @@ def db_future(user_id: int):
         return rows
 
 # ---------- TZ utils --------
+OFFSET_RE = re.compile(r'^([+-])(\d{1,2})(?::?(\d{2}))$')
+
+def is_valid_offset(s: str) -> bool:
+    return bool(OFFSET_RE.match(s.strip()))
+
+def normalize_offset(s: str) -> str:
+    m = OFFSET_RE.match(s.strip())
+    if not m:
+        return s
+    sign, hh, mm = m.group(1), int(m.group(2)), int(m.group(3) or 0)
+    return f"{sign}{hh:02d}:{mm:02d}"
+
+def is_valid_iana(s: str) -> bool:
+    try:
+        ZoneInfo(s.strip())
+        return True
+    except Exception:
+        return False
+
 def tzinfo_from_user(tz_str: str) -> timezone | ZoneInfo:
     if not tz_str:
         return timezone(timedelta(hours=3))
     tz_str = tz_str.strip()
-    if tz_str[0] in "+-":
-        m = re.fullmatch(r"([+-])(\d{1,2})(?::?(\d{2}))?", tz_str)
-        if not m:
-            return timezone(timedelta(hours=3))
+    if tz_str and tz_str[0] in "+-" and is_valid_offset(tz_str):
+        m = OFFSET_RE.match(tz_str)
         sign, hh, mm = m.group(1), int(m.group(2)), int(m.group(3) or 0)
         delta = timedelta(hours=hh, minutes=mm)
         if sign == "-":
@@ -229,19 +246,14 @@ async def call_llm(user_text: str, user_tz: str, clarify_ctx: dict | None = None
         {"role": "system", "content": PROMPTS["parse"]["system"]},
     ]
 
-    # few-shots
     few = PROMPTS.get("fewshot") or []
     messages.extend(few)
 
     if clarify_ctx:
-        # Помогаем модели понять, что это ответ на уточнение, и даём ей исходную фразу.
         prev_marker = f"PREV_INTENT=ask_clarification EXPECTS={clarify_ctx.get('expects') or 'unknown'}"
         messages.append({"role": "system", "content": prev_marker})
-        # Покажем последний вопрос ассистента
-        q = clarify_ctx.get("question")
-        if q:
-            messages.append({"role": "assistant", "content": q})
-        # Склеиваем исходный текст + ответ пользователя
+        if clarify_ctx.get("question"):
+            messages.append({"role": "assistant", "content": clarify_ctx["question"]})
         combined = f"{clarify_ctx.get('text_original','')}\nУточнение пользователя: {user_text}"
         messages.append({"role": "user", "content": combined})
     else:
@@ -266,7 +278,7 @@ scheduler = AsyncIOScheduler()
 
 async def fire_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
-    data = job.data  # dict with fields
+    data = job.data
     chat_id = data["chat_id"]
     rem_id = data["rem_id"]
     title = data["title"]
@@ -280,25 +292,19 @@ async def fire_reminder(context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(chat_id, f"🔔 «{title}»", reply_markup=kb)
 
-# helper to schedule
 def schedule_job(app: Application, rem_id: int, user_id: int, when_iso: str, title: str):
     dt = parse_iso_flexible(when_iso)  # aware
     scheduler.add_job(
         fire_reminder,
         trigger=DateTrigger(run_date=dt),
-        args=[],
-        kwargs={},
         id=f"rem-{rem_id}",
         replace_existing=True,
         misfire_grace_time=60,
         coalesce=True,
         name=f"rem {rem_id}",
-        jobstore=None
     )
-    # attach data via job modification
     job = scheduler.get_job(f"rem-{rem_id}")
     if job:
-        job.modify(kwargs=None, args=None, misfire_grace_time=60)
         job.data = {"chat_id": user_id, "rem_id": rem_id, "title": title}
 
 # ---------- Handlers --------
@@ -319,6 +325,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_MENU_KB
     )
 
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
+
+# STRICT TZ PARSER (не трогаем обычные сообщения)
 async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.message or not update.message.text:
         return False
@@ -330,12 +340,12 @@ async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif text == "Другой…":
         await update.message.reply_text("Пришли смещение вида +03:00 или IANA зону (Europe/Moscow).")
         return True
+    elif is_valid_offset(text):
+        tz = normalize_offset(text)
+    elif is_valid_iana(text):
+        tz = text
     else:
-        try:
-            _ = tzinfo_from_user(text)
-            tz = text
-        except Exception:
-            return False
+        return False
 
     db_set_user_tz(user_id, tz)
     await update.message.reply_text(
@@ -357,19 +367,15 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for r in rows:
         dt = parse_iso_flexible(r["when_iso"]).astimezone(tzinfo_from_user(tz))
-        line = f"• {dt.strftime('%d.%m в %H:%M')} — «{r['title']}»"
-        lines.append(line)
-        # текст напоминания как кнопка удаления
+        lines.append(f"• {dt.strftime('%d.%m в %H:%M')} — «{r['title']}»")
         kb_rows.append([InlineKeyboardButton(f"🗑 Удалить «{r['title']}»", callback_data=f"del:{r['id']}")])
 
-    text = "\n".join(lines)
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb_rows))
+    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
 
 async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data or ""
-    chat_id = q.message.chat_id
 
     if data.startswith("del:") or data.startswith("cancel:"):
         rem_id = int(data.split(":")[1])
@@ -379,11 +385,9 @@ async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("snooze:"):
         _, mins, rem_id = data.split(":")
-        rem_id = int(rem_id)
-        mins = int(mins)
+        rem_id = int(rem_id); mins = int(mins)
         dt = db_snooze(rem_id, mins)
         if dt:
-            # перезапланировать
             row = db().execute("select user_id,title,when_iso from reminders where id=?", (rem_id,)).fetchone()
             if row:
                 schedule_job(context.application, rem_id, row["user_id"], row["when_iso"], row["title"])
@@ -402,7 +406,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not update.message or not update.message.text:
         return
-
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
@@ -410,14 +413,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📝 Список напоминаний" or text.lower() == "/list":
         return await cmd_list(update, context)
     if text == "⚙️ Настройки" or text.lower() == "/settings":
-        return await update.message.reply_text("Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
+        return await cmd_settings(update, context)
 
     user_tz = db_get_user_tz(user_id)
     if not user_tz:
         await update.message.reply_text("Сначала укажи часовой пояс.", reply_markup=TZ_KB)
         return
 
-    # есть ли незавершённое уточнение?
     pending = db_get_pending(user_id)
     clarify_ctx = None
     if pending:
@@ -435,11 +437,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     intent = result.get("intent")
 
-    # обработка ask_clarification
     if intent == "ask_clarification":
         q = result.get("question") or "Уточни, пожалуйста."
         expects = result.get("expects")
-        # базовый текст — если уже было pending, склеиваем его с текущим ответом и храним как основу
         if pending:
             base = pending["text_original"]
             new_base = f"{base}. {text}"
@@ -452,7 +452,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             expects,
             q
         )
-        # кнопки-элементы, если модель вернула variants
         variants = result.get("variants") or []
         rows = []
         for v in variants[:4]:
@@ -464,7 +463,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(q, reply_markup=kb)
         return
 
-    # если успешно создаём — обязательно чистим pending
     if intent == "create_reminder":
         db_clear_pending(user_id)
 
@@ -474,9 +472,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         recurrence = result.get("recurrence")
 
         if recurrence:
-            # На стороне кода нет периодического планировщика (APScheduler однократный),
-            # по-простому: создадим ближайший запуск согласно time/weekday/day.
-            # (минимально: только daily/weekly/monthly ближайшая дата)
             tzinfo = tzinfo_from_user(user_tz)
             now = now_in_user_tz(user_tz)
             target_time = recurrence.get("time") or "09:00"
@@ -498,16 +493,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif recurrence["type"] == "monthly":
                 day = int(recurrence.get("day", now.day))
                 year, month = now.year, now.month
-                # попробуем в текущем месяце
                 try:
                     candidate = now.replace(day=day, hour=hh, minute=mm, second=0, microsecond=0)
                     if candidate <= now:
-                        # следующий месяц
                         month = month + 1 if month < 12 else 1
                         year = year + 1 if month == 1 else year
                         candidate = candidate.replace(year=year, month=month)
                 except ValueError:
-                    # если некорректный день (напр. 31 в феврале) — возьмём последнее число месяца
                     from calendar import monthrange
                     last = monthrange(year, month)[1]
                     candidate = now.replace(day=last, hour=hh, minute=mm, second=0, microsecond=0)
@@ -517,9 +509,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не понял время. Напиши, например: «сегодня 18:30».")
             return
 
-        # гарантируем tz-aware и нормальный формат без секунд
-        dt = parse_iso_flexible(dt_iso)
-        dt_iso_clean = iso_no_seconds(dt)
+        dt_iso_clean = iso_no_seconds(parse_iso_flexible(dt_iso))
         rem_id = db_add_reminder(user_id, title, body, dt_iso_clean)
         schedule_job(context.application, rem_id, user_id, dt_iso_clean, title)
 
@@ -535,10 +525,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # fallback: болталка/ошибка
     await update.message.reply_text("Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
-# pick from clarification inline (варианты времени)
 async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -548,7 +536,6 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = data.split("pick:")[1]
     user_id = q.message.chat_id
 
-    # если value похоже на iso — используем, иначе передадим в LLM как уточнение
     if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", value):
         iso = value
         title = "Напоминание"
@@ -560,7 +547,6 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_clear_pending(user_id)
         return
 
-    # иначе — делаем повторный вызов LLM с контекстом pending
     pending = db_get_pending(user_id)
     user_tz = db_get_user_tz(user_id) or "+03:00"
     if pending:
@@ -581,10 +567,9 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_job(context.application, rem_id, user_id, dt_iso_clean, title)
             tz = db_get_user_tz(user_id) or "+03:00"
             dt_local = parse_iso_flexible(dt_iso_clean).astimezone(tzinfo_from_user(tz))
-            await q.edit_message_text(f"🔔🔔 Окей, напомню «{title}»\n{dt_local.strftime('%d.%m в %H:%M')}")
+            await q.edit_message_text(f"🔔🔔 Окей, напомню «{title}»\n{dt_local.strftime('%d.%м в %H:%M')}")
             return
         else:
-            # снова просит уточнить
             db_set_pending(user_id, pending["text_original"], pending["title"], result.get("expects"), result.get("question"))
             await q.edit_message_text(result.get("question") or "Уточни, пожалуйста.")
             return
@@ -596,13 +581,12 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Scheduler
     scheduler.start()
     print("INFO planner-bot: APScheduler started in PTB event loop")
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("settings", lambda u,c: u.message.reply_text("Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)))
+    app.add_handler(CommandHandler("settings", cmd_settings))
 
     app.add_handler(CallbackQueryHandler(cb_inline, pattern=r"^(del:|done:|snooze:|cancel:)"))
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
