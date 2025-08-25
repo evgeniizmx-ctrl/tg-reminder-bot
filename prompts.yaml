@@ -48,7 +48,7 @@ parse:
           "type": "daily|weekly|monthly",
           "weekday": "mon|tue|wed|thu|fri|sat|sun" (только для weekly),
           "day": <1..31> (только для monthly),
-          "time": "HH:MM"               # локальное время пользователя
+          "time": "HH:MM"
         }
       }
     и "fixed_datetime": null.
@@ -59,7 +59,8 @@ parse:
     - В JSON добавляй:
         "question": "<короткий вопрос одним предложением>",
         "expects": "time" | "weekday" | "date" | "periodicity",
-        "variants": []  # список кнопок-дублёров; может быть пустым
+        "variants": []  # список кнопок-дублёров; может быть пустым. Элементы могут быть:
+                        # 1) строками (ярлык кнопки), 2) объектами {"label":"…","iso_datetime":"…"}.
       Примеры:
         • «Пить таблетки каждый день» → question: "Во сколько напоминать каждый день?",
           expects:"time", variants: [].
@@ -92,7 +93,7 @@ parse:
       "need_confirmation": false,
       "question": "<вопрос для уточнения или null>",
       "expects": "time|weekday|date|periodicity|null",
-      "variants": ["..."]                 # кнопки для второго шага уточнения
+      "variants": ["..."]
     }
 
 fewshot:
@@ -129,7 +130,7 @@ fewshot:
         "need_confirmation": true,
         "question": "Уточни, пожалуйста, время",
         "expects": "time",
-        "variants": []
+        "variants": ["04:00","16:00"]
       }
 
   - role: user
@@ -165,7 +166,7 @@ fewshot:
         "need_confirmation": false,
         "question": "Какой день недели?",
         "expects": "weekday",
-        "variants": []
+        "variants": ["mon","tue","wed","thu","fri","sat","sun"]
       }
 
   - role: user
