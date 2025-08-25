@@ -215,15 +215,11 @@ def build_tz_inline_kb() -> InlineKeyboardMarkup:
 
 # ---------- Helpers ----------
 async def safe_reply(update: Update, text: str, reply_markup=None):
-    """
-    Отправляет ответ корректно как для обычного сообщения, так и для callback-кнопок.
-    """
     if update and update.message:
         return await update.message.reply_text(text, reply_markup=reply_markup)
     chat = update.effective_chat if update else None
     if chat:
         return await chat.send_message(text, reply_markup=reply_markup)
-    # крайний случай — никак
     return None
 
 def normalize_offset(sign: str, hh: str, mm: str | None) -> str:
@@ -257,9 +253,9 @@ def load_prompts():
 PROMPTS = load_prompts()
 
 # ---------- LLM ------------
-async def call_llm(user_text: str, user_tz: str) -> dict:
-    now_local = now_in_user_tz(user_tz)
-    now_iso = iso_no_seconds(now_local)
+async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = None) -> dict:
+    # ВАЖНО: используем «замороженный» NOW_ISO, если он сохранён в clarify_state
+    now_iso = now_iso_override or iso_no_seconds(now_in_user_tz(user_tz))
     header = f"NOW_ISO={now_iso}\nTZ_DEFAULT={user_tz or '+03:00'}"
 
     messages = [
@@ -476,6 +472,12 @@ async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    # моментально убираем клавиатуру, чтобы нельзя было нажать повторно
+    try:
+        await q.edit_message_reply_markup(None)
+    except Exception:
+        pass
+
     data = q.data or ""
     if data.startswith("pick:"):
         iso = data.split("pick:")[1]
@@ -486,17 +488,24 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tz = db_get_user_tz(user_id) or "+03:00"
         dt_local = parse_iso_flexible(iso).astimezone(tzinfo_from_user(tz))
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-        await q.edit_message_text(f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+        # отправим отдельным сообщением, т.к. разметку уже сняли
+        await safe_reply(update, f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    # моментально убираем клавиатуру, чтобы нельзя было нажать повторно
+    try:
+        await q.edit_message_reply_markup(None)
+    except Exception:
+        pass
+
     data = q.data or ""
     if not data.startswith("answer:"):
         return
     choice = data.split("answer:", 1)[1]
     context.user_data["__auto_answer"] = choice
-    await handle_text(update, context)  # дальше safe_reply всё отправит корректно
+    await handle_text(update, context)
 
 # ---------- Clarification memory ----------
 def get_clarify_state(context: ContextTypes.DEFAULT_TYPE):
@@ -532,11 +541,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cstate = get_clarify_state(context)
-    user_text_for_llm = (f"Исходная заявка: {cstate['original']}\nОтвет на уточнение: {incoming_text}"
-                         if cstate else incoming_text)
+    # если это первый шаг — «замораживаем» NOW_ISO
+    now_iso_for_state = iso_no_seconds(now_in_user_tz(user_tz))
+    if not cstate:
+        user_text_for_llm = incoming_text
+    else:
+        user_text_for_llm = f"Исходная заявка: {cstate['original']}\nОтвет на уточнение: {incoming_text}"
+        # используем сохранённый NOW_ISO, если есть
+        now_iso_for_state = cstate.get("now_iso") or now_iso_for_state
 
     try:
-        result = await call_llm(user_text_for_llm, user_tz)
+        result = await call_llm(user_text_for_llm, user_tz, now_iso_override=now_iso_for_state)
     except Exception:
         return await safe_reply(update, "Что-то не понял. Скажи, например: «завтра в 15 позвонить маме».")
     intent = result.get("intent")
@@ -545,7 +560,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         question = result.get("question") or "Уточни, пожалуйста."
         variants = result.get("variants") or []
         original = cstate['original'] if cstate else (result.get("text_original") or incoming_text)
-        set_clarify_state(context, {"original": original})
+        # сохраняем original + ЗАМОРОЖЕННЫЙ NOW_ISO
+        set_clarify_state(context, {"original": original, "now_iso": now_iso_for_state})
 
         kb_rows = []
         for v in variants[:6]:
