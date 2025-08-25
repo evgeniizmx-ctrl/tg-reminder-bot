@@ -7,6 +7,7 @@ import logging
 import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import asyncio
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -241,7 +242,7 @@ _client = None
 def get_openai():
     global _client
     if _client is None:
-        _client = OpenAI(api_key=OPENAI_API_KEY)
+        _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     return _client
 
 async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = None) -> dict:
@@ -304,8 +305,8 @@ def rule_parse(text: str, now_local: datetime):
         return {"intent": "create", "title": title, "when_local": when_local}
     return None
 
-# ---------- Scheduler (UTC) ----------
-scheduler = AsyncIOScheduler(timezone=timezone.utc)
+# ---------- Scheduler (создаём в PTB loop) ----------
+scheduler: AsyncIOScheduler | None = None
 
 async def fire_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -320,16 +321,25 @@ async def fire_reminder(context: ContextTypes.DEFAULT_TYPE):
         kb_rows.append([InlineKeyboardButton("✅", callback_data=f"done:{rem_id}")])
     await context.bot.send_message(chat_id, f"🔔 «{title}»", reply_markup=InlineKeyboardMarkup(kb_rows))
 
+def ensure_scheduler() -> AsyncIOScheduler:
+    global scheduler
+    if scheduler is None:
+        raise RuntimeError("Scheduler not initialized yet")
+    return scheduler
+
 def schedule_oneoff(rem_id: int, user_id: int, when_iso_utc: str, title: str, kind: str = "oneoff"):
+    sch = ensure_scheduler()
     dt_utc = parse_iso(when_iso_utc)
-    scheduler.add_job(
+    sch.add_job(
         fire_reminder, DateTrigger(run_date=dt_utc),
-        id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=60, coalesce=True,
+        id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=120, coalesce=True,
         kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "kind": kind},
         name=f"rem {rem_id}",
     )
+    log.info("Scheduled oneoff id=%s at %s UTC", rem_id, dt_utc.isoformat())
 
 def schedule_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, tz_str: str):
+    sch = ensure_scheduler()
     tzinfo = tzinfo_from_user(tz_str)
     rtype = recurrence.get("type"); time_str = recurrence.get("time"); hh, mm = map(int, time_str.split(":"))
     if rtype == "daily":
@@ -338,12 +348,28 @@ def schedule_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, 
         trigger = CronTrigger(day_of_week=recurrence.get("weekday"), hour=hh, minute=mm, timezone=tzinfo)
     else:
         trigger = CronTrigger(day=int(recurrence.get("day")), hour=hh, minute=mm, timezone=tzinfo)
-    scheduler.add_job(
+    sch.add_job(
         fire_reminder, trigger,
         id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=300, coalesce=True,
         kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "kind": "recurring"},
         name=f"rem {rem_id}",
     )
+    log.info("Scheduled recurring id=%s (%s %s)", rem_id, rtype, time_str)
+
+def reschedule_all():
+    """Поднять все незавершённые напоминания из БД (после рестарта)."""
+    sch = ensure_scheduler()
+    with db() as conn:
+        rows = conn.execute("select * from reminders where status='scheduled'").fetchall()
+    for r in rows:
+        if (r["kind"] or "oneoff") == "oneoff" and r["when_iso"]:
+            schedule_oneoff(r["id"], r["user_id"], r["when_iso"], r["title"], kind="oneoff")
+        else:
+            rec = json.loads(r["recurrence_json"] or "{}")
+            tz = rec.get("tz") or "+03:00"
+            if rec:
+                schedule_recurring(r["id"], r["user_id"], r["title"], rec, tz)
+    log.info("Rescheduled %d reminders from DB", len(rows))
 
 # ---------- Handlers ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -408,7 +434,7 @@ async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     if data.startswith("del:"):
         rem_id = int(data.split(":")[1]); db_delete(rem_id)
-        job = scheduler.get_job(f"rem-{rem_id}"); 
+        sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
         if job: job.remove()
         await q.edit_message_text("Удалено ✅"); return
     if data.startswith("snooze:"):
@@ -420,10 +446,10 @@ async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"⏲ Отложено на {mins} мин.")
         else:
             when = iso_utc(datetime.now(timezone.utc) + timedelta(minutes=mins))
-            tmp = f"snooze-{rem_id}"
-            scheduler.add_job(
+            sch = ensure_scheduler()
+            sch.add_job(
                 fire_reminder, DateTrigger(run_date=parse_iso(when)),
-                id=tmp, replace_existing=True, misfire_grace_time=60, coalesce=True,
+                id=f"snooze-{rem_id}", replace_existing=True, misfire_grace_time=60, coalesce=True,
                 kwargs={"chat_id": row["user_id"], "rem_id": rem_id, "title": row["title"], "kind":"oneoff"},
                 name=f"snooze {rem_id}",
             )
@@ -431,7 +457,7 @@ async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data.startswith("done:"):
         rem_id = int(data.split(":")[1]); db_mark_done(rem_id)
-        job = scheduler.get_job(f"rem-{rem_id}"); 
+        sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
         if job: job.remove()
         await q.edit_message_text("✅ Выполнено"); return
 
@@ -450,7 +476,7 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
     dt_local = to_user_local(when_iso_utc, tz)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%м в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -566,18 +592,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
         dt_local = to_user_local(when_iso_utc, user_tz)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-        return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
+        return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%м в %H:%M')}",
                                 reply_markup=kb)
 
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
-# ---------- post_init: запускаем APScheduler в нужном loop ----------
+# ---------- post_init: создаём и стартуем APScheduler в PTB loop ----------
 async def on_startup(app: Application):
-    # ВАЖНО: стартуем планировщик уже внутри loop PTB,
-    # иначе джобы не исполнятся.
-    if not scheduler.running:
-        scheduler.start()
-        log.info("APScheduler started in PTB event loop")
+    global scheduler
+    loop = asyncio.get_running_loop()
+    scheduler = AsyncIOScheduler(timezone=timezone.utc, event_loop=loop)
+    scheduler.start()
+    log.info("APScheduler started in PTB event loop")
+    # рескейдим все джобы из БД
+    reschedule_all()
 
 # ---------- main ----------
 def main():
@@ -586,7 +614,7 @@ def main():
 
     app = (Application.builder()
            .token(BOT_TOKEN)
-           .post_init(on_startup)  # ⬅️ ключевой фикс
+           .post_init(on_startup)   # ключевой фикс
            .build())
 
     app.add_handler(CommandHandler("start", cmd_start))
