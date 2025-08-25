@@ -716,8 +716,8 @@ async def main_async():
     asyncio.create_task(scheduler_loop(app))
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(allowed_updates=None)
-    await app.updater.idle()
+    await app.updater.start_polling()
+await app.updater.running
     await app.stop()
     await app.shutdown()
 
