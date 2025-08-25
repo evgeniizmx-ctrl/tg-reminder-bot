@@ -235,13 +235,13 @@ def load_prompts():
         return yaml.safe_load(f)
 PROMPTS = load_prompts()
 
-# ---------- OpenAI (strict) ----------
+# ---------- OpenAI ----------
 from openai import OpenAI
 _client = None
 def get_openai():
     global _client
     if _client is None:
-        _client = OpenAI(api_key=OPENAI_API_KEY)  # без лишних kwargs
+        _client = OpenAI(api_key=OPENAI_API_KEY)
     return _client
 
 async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = None) -> dict:
@@ -519,7 +519,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_rows = [[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in r["variants"]]
             return await safe_reply(update, r["question"], reply_markup=InlineKeyboardMarkup(kb_rows))
 
-    # LLM строго обязателен
+    # LLM
     result = await call_llm(incoming_text, user_tz)
     intent = result.get("intent")
 
@@ -571,13 +571,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
+# ---------- post_init: запускаем APScheduler в нужном loop ----------
+async def on_startup(app: Application):
+    # ВАЖНО: стартуем планировщик уже внутри loop PTB,
+    # иначе джобы не исполнятся.
+    if not scheduler.running:
+        scheduler.start()
+        log.info("APScheduler started in PTB event loop")
+
 # ---------- main ----------
 def main():
     log.info("Starting PlannerBot...")
     db_init()
-    app = Application.builder().token(BOT_TOKEN).build()
-    scheduler.start()
-    log.info("Scheduler started (UTC)")
+
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .post_init(on_startup)  # ⬅️ ключевой фикс
+           .build())
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
@@ -588,6 +598,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
