@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("planner-bot")
 
-# ---------- ENV checks ----------
+# ---------- ENV ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
 PROMPTS_PATH = os.environ.get("PROMPTS_PATH", "prompts.yaml")
 DB_PATH = os.environ.get("DB_PATH", "reminders.db")
@@ -162,7 +162,8 @@ def now_in_user_tz(tz_str: str) -> datetime:
 
 def iso_utc(dt: datetime) -> str:
     if dt.tzinfo is None: raise ValueError("aware dt required")
-    dt = dt.astimezone(timezone.utc).replace(microsecond=0)  # секунды НЕ обнуляем, чтобы не уронить в прошлое
+    # не обнуляем секунды, чтобы не попасть в прошлое и не словить misfire
+    dt = dt.astimezone(timezone.utc).replace(microsecond=0)
     return dt.isoformat()
 
 def parse_iso(s: str) -> datetime:
@@ -268,7 +269,7 @@ async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = 
     m = re.search(r"\{[\s\S]+\}", txt)
     return json.loads(m.group(0) if m else txt)
 
-# ---------- Rule-based prep ----------
+# ---------- Rule-based quick parse ----------
 def _clean_spaces(s: str) -> str: return re.sub(r"\s+", " ", s).strip()
 def _extract_title(text: str) -> str:
     t = text
@@ -305,12 +306,12 @@ def rule_parse(text: str, now_local: datetime):
         return {"intent": "create", "title": title, "when_local": when_local}
     return None
 
-# ---------- Scheduler (инициализируем в PTB loop) ----------
+# ---------- Scheduler (APScheduler внутри PTB loop) ----------
 scheduler: AsyncIOScheduler | None = None
-TG_BOT = None  # ссылка на бот PTB, чтобы APScheduler мог слать сообщения
+TG_BOT = None  # PTB bot instance для отправки сообщений из APScheduler
 
 async def fire_reminder(*, chat_id: int, rem_id: int, title: str, kind: str = "oneoff"):
-    """Колбэк APScheduler — без PTB context! Все параметры приходят из kwargs."""
+    """Колбэк APScheduler — получает kwargs, без PTB context."""
     try:
         kb_rows = [[
             InlineKeyboardButton("Через 10 мин", callback_data=f"snooze:10:{rem_id}"),
@@ -374,7 +375,38 @@ def reschedule_all():
                 schedule_recurring(r["id"], r["user_id"], r["title"], rec, tz)
     log.info("Rescheduled %d reminders from DB", len(rows))
 
-# ---------- Handlers (как были) ----------
+# ---------- RU wording for weekly + list formatting ----------
+def ru_weekly_phrase(weekday_code: str) -> str:
+    mapping = {
+        "mon": ("каждый", "понедельник"),
+        "tue": ("каждый", "вторник"),
+        "wed": ("каждую", "среду"),
+        "thu": ("каждый", "четверг"),
+        "fri": ("каждую", "пятницу"),
+        "sat": ("каждую", "субботу"),
+        "sun": ("каждое", "воскресенье"),
+    }
+    det, word = mapping.get((weekday_code or "").lower(), ("каждый", weekday_code or "день"))
+    return f"{det} {word}"
+
+def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
+    title = row["title"]
+    kind = row["kind"] or "oneoff"
+    if kind == "oneoff" and row["when_iso"]:
+        dt_local = to_user_local(row["when_iso"], user_tz)
+        return f"{dt_local.strftime('%d.%m в %H:%M')} — «{title}»"
+    rec = json.loads(row["recurrence_json"]) if row["recurrence_json"] else {}
+    rtype = rec.get("type")
+    time_str = rec.get("time") or "00:00"
+    if rtype == "daily":
+        return f"каждый день в {time_str} — «{title}»"
+    if rtype == "weekly":
+        wd = ru_weekly_phrase(rec.get("weekday", ""))
+        return f"{wd} в {time_str} — «{title}»"
+    day = rec.get("day")
+    return f"каждое {day}-е число в {time_str} — «{title}»"
+
+# ---------- Handlers ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tz = db_get_user_tz(user_id)
@@ -413,24 +445,15 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = db_future(user_id)
     if not rows:
         return await safe_reply(update, "Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
-    lines = ["🗓 Ближайшие напоминания —"]; kb_rows = []
+
     tz = db_get_user_tz(user_id) or "+03:00"
+    header = "🗓 Ближайшие напоминания —"
+    kb_rows = []
     for r in rows:
-        title = r["title"]; kind = r["kind"] or "oneoff"
-        if kind == "oneoff" and r["when_iso"]:
-            dt_local = to_user_local(r["when_iso"], tz)
-            lines.append(f"• {dt_local.strftime('%d.%m в %H:%M')} — «{title}»")
-        else:
-            rec = json.loads(r["recurrence_json"]) if r["recurrence_json"] else {}
-            rtype = rec.get("type")
-            if rtype == "daily":
-                lines.append(f"• Каждый день в {rec.get('time')} — «{title}»")
-            elif rtype == "weekly":
-                lines.append(f"• Каждую {rec.get('weekday')} в {rec.get('time')} — «{title}»")
-            else:
-                lines.append(f"• Каждое {rec.get('day')}-е в {rec.get('time')} — «{title}»")
-        kb_rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{r['id']}")])
-    await safe_reply(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
+        line = format_reminder_line(r, tz)
+        kb_rows.append([InlineKeyboardButton(f"🗑 {line}", callback_data=f"del:{r['id']}")])
+
+    await safe_reply(update, header, reply_markup=InlineKeyboardMarkup(kb_rows))
 
 async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -579,7 +602,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if rtype == "daily":
                 text = f"🔔🔔 Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
             elif rtype == "weekly":
-                text = f"🔔🔔 Окей, буду напоминать «{title}» каждую {recurrence.get('weekday')} в {recurrence.get('time')}"
+                text = f"🔔🔔 Окей, буду напоминать «{title}» {ru_weekly_phrase(recurrence.get('weekday'))} в {recurrence.get('time')}"
             else:
                 text = f"🔔🔔 Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
@@ -595,12 +618,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
         dt_local = to_user_local(when_iso_utc, user_tz)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-        return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%м в %H:%M')}",
+        return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
                                 reply_markup=kb)
 
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
-# ---------- post_init: создаём и стартуем APScheduler в PTB loop ----------
+# ---------- Startup: APScheduler в PTB loop ----------
 async def on_startup(app: Application):
     global scheduler, TG_BOT
     TG_BOT = app.bot
