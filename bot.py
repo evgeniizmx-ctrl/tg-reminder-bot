@@ -1,462 +1,451 @@
 # bot.py
-import asyncio
-import json
-import logging
 import os
 import re
+import json
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List
-
 from zoneinfo import ZoneInfo
 
-from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-
-# OpenAI (pip install openai==1.40.0)
-from openai import OpenAI
-
-# APScheduler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
-import yaml
+from dateutil import parser as dparser
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton
 )
-log = logging.getLogger("bot")
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 
-# ========= ENV & CLIENTS =========
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-PROMPTS_PATH = os.getenv("PROMPTS_PATH", "prompts.yaml")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# -------- OpenAI ------------
+from openai import OpenAI
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("No BOT_TOKEN/TELEGRAM_TOKEN in env")
+# ---------- ENV -------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+PROMPTS_PATH = os.environ.get("PROMPTS_PATH", "prompts.yaml")
 
-# OpenAI
-oi = OpenAI(api_key=OPENAI_API_KEY)
+# ---------- DB --------------
+DB_PATH = os.environ.get("DB_PATH", "reminders.db")
 
-# ========= DB (fallback, можно заменить на свой сторедж) =========
-DB_PATH = os.getenv("DB_PATH", "data.db")
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def db_connect():
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_prefs(
-          user_id INTEGER PRIMARY KEY,
-          tz TEXT
+def db_init():
+    with db() as conn:
+        conn.execute("""
+            create table if not exists users (
+                user_id integer primary key,
+                tz text
+            )
+        """)
+        conn.execute("""
+            create table if not exists reminders (
+                id integer primary key autoincrement,
+                user_id integer not null,
+                title text not null,
+                body text,
+                when_iso text not null,
+                status text default 'scheduled'
+            )
+        """)
+        conn.commit()
+
+def db_get_user_tz(user_id: int) -> str | None:
+    with db() as conn:
+        row = conn.execute("select tz from users where user_id=?", (user_id,)).fetchone()
+        return row["tz"] if row and row["tz"] else None
+
+def db_set_user_tz(user_id: int, tz: str):
+    with db() as conn:
+        conn.execute("insert into users(user_id, tz) values(?, ?) on conflict(user_id) do update set tz=excluded.tz",
+                     (user_id, tz))
+        conn.commit()
+
+def db_add_reminder(user_id: int, title: str, body: str | None, when_iso: str) -> int:
+    with db() as conn:
+        cur = conn.execute(
+            "insert into reminders(user_id,title,body,when_iso) values(?,?,?,?)",
+            (user_id, title, body, when_iso)
         )
-        """
-    )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS reminders(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id INTEGER NOT NULL,
-          title TEXT NOT NULL,
-          iso TEXT NOT NULL,
-          tz TEXT,
-          done INTEGER DEFAULT 0
-        )
-        """
-    )
-    con.commit()
-    return con
+        conn.commit()
+        return cur.lastrowid
 
-DB = db_connect()
+def db_mark_done(rem_id: int):
+    with db() as conn:
+        conn.execute("update reminders set status='done' where id=?", (rem_id,))
+        conn.commit()
 
-def db_get_tz(user_id: int) -> Optional[str]:
-    cur = DB.execute("SELECT tz FROM user_prefs WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    return row[0] if row and row[0] else None
+def db_snooze(rem_id: int, minutes: int):
+    with db() as conn:
+        row = conn.execute("select when_iso from reminders where id=?", (rem_id,)).fetchone()
+        if not row:
+            return None
+        dt = parse_iso_flexible(row["when_iso"]) + timedelta(minutes=minutes)
+        new_iso = iso_no_seconds(dt)
+        conn.execute("update reminders set when_iso=?, status='scheduled' where id=?", (new_iso, rem_id))
+        conn.commit()
+        return dt
 
-def db_set_tz(user_id: int, tz: str) -> None:
-    DB.execute(
-        "INSERT INTO user_prefs(user_id, tz) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET tz=excluded.tz",
-        (user_id, tz),
-    )
-    DB.commit()
+def db_delete(rem_id: int):
+    with db() as conn:
+        conn.execute("delete from reminders where id=?", (rem_id,))
+        conn.commit()
 
-def db_add_reminder(user_id: int, title: str, iso: str, tz: Optional[str]) -> int:
-    cur = DB.execute(
-        "INSERT INTO reminders(user_id, title, iso, tz, done) VALUES(?,?,?,?,0)",
-        (user_id, title, iso, tz or ""),
-    )
-    DB.commit()
-    return cur.lastrowid
+def db_future(user_id: int):
+    now = datetime.now(timezone.utc).isoformat()
+    with db() as conn:
+        rows = conn.execute(
+            "select * from reminders where user_id=? and status='scheduled' order by when_iso asc",
+            (user_id,)
+        ).fetchall()
+        return rows
 
-def db_mark_done(rem_id: int) -> None:
-    DB.execute("UPDATE reminders SET done=1 WHERE id=?", (rem_id,))
-    DB.commit()
+# ---------- TZ utils --------
+def tzinfo_from_user(tz_str: str) -> timezone | ZoneInfo:
+    if not tz_str:
+        return timezone(timedelta(hours=3))
+    tz_str = tz_str.strip()
+    if tz_str[0] in "+-":
+        m = re.fullmatch(r"([+-])(\d{1,2})(?::?(\d{2}))?", tz_str)
+        if not m:
+            return timezone(timedelta(hours=3))
+        sign, hh, mm = m.group(1), int(m.group(2)), int(m.group(3) or 0)
+        delta = timedelta(hours=hh, minutes=mm)
+        if sign == "-":
+            delta = -delta
+        return timezone(delta)
+    try:
+        return ZoneInfo(tz_str)
+    except Exception:
+        return timezone(timedelta(hours=3))
 
-def db_list_future(user_id: int) -> List[sqlite3.Row]:
-    DB.row_factory = sqlite3.Row
-    cur = DB.execute(
-        "SELECT id, title, iso, tz, done FROM reminders WHERE user_id=? AND done=0 ORDER BY iso ASC",
-        (user_id,),
-    )
-    return cur.fetchall()
+def now_in_user_tz(tz_str: str) -> datetime:
+    return datetime.now(tzinfo_from_user(tz_str))
 
-# ========= PROMPTS =========
-@dataclass
-class PromptPack:
-    system: str
-    parse: List[Dict[str, str]]  # few-shot list: [{'role':'user'|'assistant', 'content': '...'}, ...]
+def iso_no_seconds(dt: datetime) -> str:
+    dt = dt.replace(microsecond=0)
+    s = dt.isoformat()
+    # ensure no seconds (if present)
+    s = re.sub(r":\d{2}([+-Z])", r"\1", s) if re.search(r"T\d{2}:\d{2}:\d{2}", s) else s
+    return s
 
-def load_prompts() -> PromptPack:
+def parse_iso_flexible(s: str) -> datetime:
+    return dparser.isoparse(s)
+
+# ---------- UI: Keyboards ---
+MAIN_MENU_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📝 Список напоминаний"), KeyboardButton("⚙️ Настройки")]],
+    resize_keyboard=True, one_time_keyboard=False
+)
+
+_TZ_ROWS = [
+    ["Калининград (+2)", "Москва (+3)"],
+    ["Самара (+4)", "Екатеринбург (+5)"],
+    ["Омск (+6)", "Новосибирск (+7)"],
+    ["Иркутск (+8)", "Якутск (+9)"],
+    ["Хабаровск (+10)", "Другой…"],
+]
+TZ_KB = ReplyKeyboardMarkup([[KeyboardButton(x) for x in row] for row in _TZ_ROWS],
+                            resize_keyboard=True, one_time_keyboard=True)
+
+CITY_TO_OFFSET = {
+    "Калининград (+2)": "+02:00",
+    "Москва (+3)": "+03:00",
+    "Самара (+4)": "+04:00",
+    "Екатеринбург (+5)": "+05:00",
+    "Омск (+6)": "+06:00",
+    "Новосибирск (+7)": "+07:00",
+    "Иркутск (+8)": "+08:00",
+    "Якутск (+9)": "+09:00",
+    "Хабаровск (+10)": "+10:00",
+}
+
+# ---------- Prompts ---------
+import yaml
+def load_prompts():
     with open(PROMPTS_PATH, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
-
-    if "system" not in raw or "parse" not in raw:
-        raise ValueError("prompts.yaml must have 'system' and 'parse' sections")
-
-    # normalize few-shot to list of dicts
-    few = raw["fewshot"] if "fewshot" in raw else raw.get("parse", [])
-    parse = []
-    for item in few:
-        if isinstance(item, dict) and "role" in item and "content" in item:
-            parse.append({"role": item["role"], "content": item["content"]})
-    pp = PromptPack(system=raw["system"], parse=parse)
-    log.info(
-        "Prompts loaded: system=%s | fewshot=%d",
-        (pp.system[:40] + "…") if len(pp.system) > 40 else pp.system,
-        len(pp.parse),
-    )
-    return pp
+    return raw
 
 PROMPTS = load_prompts()
 
-# ========= SCHEDULER =========
-SCHED = AsyncIOScheduler()
-SCHED.start()
+# ---------- LLM ------------
+async def call_llm(user_text: str, user_tz: str) -> dict:
+    now_local = now_in_user_tz(user_tz)
+    now_iso = iso_no_seconds(now_local)
+    header = f"NOW_ISO={now_iso}\nTZ_DEFAULT={user_tz or '+03:00'}"
 
-# ========= Utils =========
-def fmt_user_dt(dt: datetime, tz_str: Optional[str]) -> str:
-    """
-    Показываем человеку без секунд и без оффсета: 25.08 в 11:00
-    tz_str может быть IANA ('Europe/Moscow') или смещение '+03:00'
-    """
-    try:
-        if tz_str and "/" in tz_str:
-            dt = dt.astimezone(ZoneInfo(tz_str))
-        return dt.strftime("%d.%m в %H:%M")
-    except Exception:
-        return dt.strftime("%d.%m в %H:%M")
+    messages = [
+        {"role": "system", "content": PROMPTS["system"]},
+        {"role": "system", "content": header},
+        {"role": "system", "content": PROMPTS["parse"]["system"]},
+    ]
 
-def to_rfc3339_no_seconds(dt: datetime) -> str:
-    """Формат для хранения: YYYY-MM-DDTHH:MM±HH:MM (без секунд)."""
-    # У dt может быть оффсет вида +0300 — преобразуем к +03:00
-    s = dt.strftime("%Y-%m-%dT%H:%M%z")
-    if len(s) >= 5:
-        return s[:-2] + ":" + s[-2:]
-    return s
+    # few-shots if any
+    few = PROMPTS.get("fewshot") or []
+    messages.extend(few)
 
-def make_now_iso_and_tzdefault(user_tz: Optional[str]) -> (str, str):
-    """
-    NOW_ISO — в локальном поясе пользователя.
-    TZ_DEFAULT — смещение вида +03:00 (нужно для модели).
-    """
-    if user_tz and "/" in user_tz:
-        now_local = datetime.now(ZoneInfo(user_tz))
-    else:
-        # смещение вида +03:00 — зададим fixed offset
-        if user_tz and re.match(r"^[\+\-]\d{2}:\d{2}$", user_tz):
-            hours = int(user_tz[1:3])
-            mins = int(user_tz[4:6])
-            sign = 1 if user_tz[0] == "+" else -1
-            tzinfo = timezone(sign * timedelta(hours=hours, minutes=mins))
-            now_local = datetime.now(tzinfo)
-        else:
-            now_local = datetime.now().astimezone()
+    messages.append({"role": "user", "content": user_text})
 
-    tz_default = now_local.strftime("%z")
-    tz_default = tz_default[:3] + ":" + tz_default[3:]  # +0300 -> +03:00
-    now_iso = now_local.isoformat(timespec="seconds")   # для модели секунды норм
-    return now_iso, tz_default
-
-def build_llm_messages(user_text: str, user_tz: Optional[str], pp: PromptPack) -> List[Dict[str, str]]:
-    now_iso, tz_default = make_now_iso_and_tzdefault(user_tz)
-    sys_suffix = f"\nNOW_ISO={now_iso}\nTZ_DEFAULT={tz_default}\n"
-    msgs: List[Dict[str, str]] = [{"role": "system", "content": pp.system + sys_suffix}]
-    msgs.extend(pp.parse)
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
-
-async def call_llm(user_text: str, user_tz: Optional[str]) -> Dict[str, Any]:
-    """
-    Возвращает JSON (dict) от LLM по нашему промту
-    """
-    msgs = build_llm_messages(user_text, user_tz, PROMPTS)
-    resp = oi.chat.completions.create(
-        model=MODEL,
-        messages=msgs,
-        temperature=0.2,
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.2
     )
-    content = resp.choices[0].message.content.strip()
-    # LLM обязан вернуть JSON — парсим
+    txt = resp.choices[0].message.content.strip()
+    # строго JSON
     try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        # на крайняк — выдернем JSON через жадный матч
-        m = re.search(r"\{.*\}", content, re.S)
-        if not m:
-            raise
-        data = json.loads(m.group(0))
-    return data
-
-# ========= Онбординг TZ =========
-ASYNC_TZ_FLAG = "awaiting_tz"
-
-async def ensure_tz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
-    uid = update.effective_user.id
-    tz = db_get_tz(uid)
-    if tz:
-        return tz
-    context.user_data[ASYNC_TZ_FLAG] = True
-    await update.effective_chat.send_message(
-        "Для начала укажи свой часовой пояс.\n"
-        "Можешь прислать:\n"
-        "• смещение: +03:00\n"
-        "• или IANA-зону: Europe/Moscow"
-    )
-    return None
-
-def normalize_tz(raw: str) -> Optional[str]:
-    raw = (raw or "").strip()
-    if re.match(r"^[\+\-]\d{2}:\d{2}$", raw):
-        return raw
-    # попробуем IANA
-    try:
-        ZoneInfo(raw)
-        return raw
+        return json.loads(txt)
     except Exception:
-        return None
+        # попытка достать json из текста
+        m = re.search(r"\{[\s\S]+\}", txt)
+        if m:
+            return json.loads(m.group(0))
+        raise
 
-# ========= Планирование (простое) =========
-async def fire_reminder(app: Application, user_id: int, rem_id: int, title: str):
-    try:
-        await app.bot.send_message(
-            chat_id=user_id,
-            text=f"🔔 {title}",
-        )
-        db_mark_done(rem_id)
-    except Exception as e:
-        log.exception("send reminder failed: %s", e)
+# ---------- Scheduler -------
+scheduler = AsyncIOScheduler()
 
-def schedule_once(app: Application, when_dt: datetime, user_id: int, rem_id: int, title: str):
-    SCHED.add_job(
+async def fire_reminder(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    data = job.data  # dict with fields
+    chat_id = data["chat_id"]
+    rem_id = data["rem_id"]
+    title = data["title"]
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Через 10 мин", callback_data=f"snooze:10:{rem_id}"),
+        InlineKeyboardButton("Через 1 час", callback_data=f"snooze:60:{rem_id}")
+    ],[
+        InlineKeyboardButton("✅", callback_data=f"done:{rem_id}")
+    ]])
+
+    await context.bot.send_message(chat_id, f"🔔 «{title}»", reply_markup=kb)
+
+# helper to schedule
+def schedule_job(app: Application, rem_id: int, user_id: int, when_iso: str, title: str):
+    dt = parse_iso_flexible(when_iso)  # aware
+    scheduler.add_job(
         fire_reminder,
-        trigger=DateTrigger(run_date=when_dt),
-        args=(app, user_id, rem_id, title),
-        id=f"once:{rem_id}",
+        trigger=DateTrigger(run_date=dt),
+        args=[],
+        kwargs={},
+        id=f"rem-{rem_id}",
         replace_existing=True,
         misfire_grace_time=60,
+        coalesce=True,
+        name=f"rem {rem_id}",
+        jobstore=None
     )
+    # attach data via job modification
+    job = scheduler.get_job(f"rem-{rem_id}")
+    if job:
+        job.modify(kwargs=None, args=None, misfire_grace_time=60)
+        job.data = {"chat_id": user_id, "rem_id": rem_id, "title": title}
 
-# ========= Handlers =========
-async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PROMPTS
-    try:
-        PROMPTS = load_prompts()
-        await update.message.reply_text("Промпты перезагружены ✅")
-    except Exception as e:
-        await update.message.reply_text(f"Не удалось перезагрузить: {e}")
-
+# ---------- Handlers --------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop(ASYNC_TZ_FLAG, None)
-    tz = db_get_tz(update.effective_user.id)
+    user_id = update.effective_user.id
+    tz = db_get_user_tz(user_id)
     if not tz:
-        await ensure_tz(update, context)
+        await update.message.reply_text(
+            "Для начала укажи свой часовой пояс.\n"
+            "Можешь выбрать кнопкой или прислать:\n"
+            "• смещение: +03:00\n"
+            "• или IANA-зону: Europe/Moscow",
+            reply_markup=TZ_KB
+        )
         return
     await update.message.reply_text(
-        f"Часовой пояс установлен: {tz}\n"
-        "Теперь напиши что и когда напомнить."
+        f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
+        reply_markup=MAIN_MENU_KB
     )
+
+async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.message or not update.message.text:
+        return False
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    if text in CITY_TO_OFFSET:
+        tz = CITY_TO_OFFSET[text]
+    elif text == "Другой…":
+        await update.message.reply_text("Пришли смещение вида +03:00 или IANA зону (Europe/Moscow).")
+        return True
+    else:
+        # может быть смещение или IANA
+        try:
+            _ = tzinfo_from_user(text)
+            tz = text
+        except Exception:
+            return False
+
+    db_set_user_tz(user_id, tz)
+    await update.message.reply_text(
+        f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
+        reply_markup=MAIN_MENU_KB
+    )
+    return True
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    rows = db_list_future(uid)
+    user_id = update.effective_user.id
+    rows = db_future(user_id)
     if not rows:
-        await update.message.reply_text("Будущих напоминаний нет.")
+        await update.message.reply_text("Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
         return
 
-    lines = ["🗒️ Ближайшие:"]
-    kb = []
+    # Формат: «дата — «название»» + сразу кнопка удалить
+    lines = ["🗓 Ближайшие напоминания —"]
+    kb_rows = []
     for r in rows:
-        iso = r["iso"]
-        tz = r["tz"] or db_get_tz(uid)
-        dt = datetime.fromisoformat(iso)
-        lines.append(f"• {fmt_user_dt(dt, tz)} — «{r['title']}»")
-        kb.append([
-            InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{r['id']}")
-        ])
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
+        dt = parse_iso_flexible(r["when_iso"])
+        # показать в TZ пользователя
+        tz = db_get_user_tz(user_id) or "+03:00"
+        dt_local = dt.astimezone(tzinfo_from_user(tz))
+        line = f"• {dt_local.strftime('%d.%m в %H:%M')} — «{r['title']}»"
+        lines.append(line)
+        kb_rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{r['id']}")])
 
-async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "\n".join(lines)
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb_rows))
+
+async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data or ""
+    chat_id = q.message.chat_id
+
     if data.startswith("del:"):
-        rem_id = int(data.split(":", 1)[1])
-        db_mark_done(rem_id)
+        rem_id = int(data.split(":")[1])
+        db_delete(rem_id)
         await q.edit_message_text("Удалено ✅")
         return
 
+    if data.startswith("snooze:"):
+        _, mins, rem_id = data.split(":")
+        rem_id = int(rem_id)
+        mins = int(mins)
+        dt = db_snooze(rem_id, mins)
+        if dt:
+            # перезапланировать
+            row = db().execute("select user_id,title,when_iso from reminders where id=?", (rem_id,)).fetchone()
+            if row:
+                schedule_job(context.application, rem_id, row["user_id"], row["when_iso"], row["title"])
+                await q.edit_message_text(f"⏲ Отложено на {mins} мин.")
+        return
+
+    if data.startswith("done:"):
+        rem_id = int(data.split(":")[1])
+        db_mark_done(rem_id)
+        await q.edit_message_text("✅ Выполнено")
+        return
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    txt = (update.message.text or "").strip()
-
-    # ждём TZ?
-    if context.user_data.get(ASYNC_TZ_FLAG):
-        tz = normalize_tz(txt)
-        if not tz:
-            await update.message.reply_text("Не понял. Введи смещение (+03:00) или зону (Europe/Moscow).")
-            return
-        db_set_tz(uid, tz)
-        context.user_data.pop(ASYNC_TZ_FLAG, None)
-        await update.message.reply_text(f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.")
+    if await try_handle_tz_input(update, context):
         return
 
-    user_tz = db_get_tz(uid)
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    # нижнее меню
+    if text == "📝 Список напоминаний" or text.lower() == "/list":
+        return await cmd_list(update, context)
+    if text == "⚙️ Настройки" or text.lower() == "/settings":
+        return await update.message.reply_text("Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
+
+    user_tz = db_get_user_tz(user_id)
     if not user_tz:
-        tz = await ensure_tz(update, context)
+        await update.message.reply_text("Сначала укажи часовой пояс.", reply_markup=TZ_KB)
         return
 
-    # зовём LLM
     try:
-        parsed = await call_llm(txt, user_tz)
+        result = await call_llm(text, user_tz)
     except Exception as e:
-        log.exception("LLM error: %s", e)
-        await update.message.reply_text("Я не понял, попробуй ещё раз.")
+        await update.message.reply_text("Что-то не понял. Скажи, например: «завтра в 15 позвонить маме».")
         return
 
-    intent = parsed.get("intent")
-    if intent == "chat":
-        # фолбек — просто ответим
-        await update.message.reply_text("Я не понял, скажи, например: «завтра в 15 позвонить маме».")
-        return
-
+    intent = result.get("intent")
     if intent == "ask_clarification":
-        # упрощённо — покажем опции, если они есть
-        options = parsed.get("options") or []
-        if not options:
-            await update.message.reply_text("Нужно уточнение.")
+        # свободный ввод — как договорились
+        opts = result.get("options") or []
+        if not opts:
+            await update.message.reply_text("Уточни, пожалуйста (например «сегодня 19:00»).")
             return
-        btns = []
-        for op in options[:3]:
-            iso = op.get("iso_datetime")
-            label = op.get("label") or iso
-            btns.append([InlineKeyboardButton(label, callback_data=f"pick:{iso}")])
-        await update.message.reply_text("Уточни, пожалуйста:", reply_markup=InlineKeyboardMarkup(btns))
+        # если модель вернула кнопки — всё же покажем (но не обязательно)
+        rows = [[InlineKeyboardButton(o.get("label",""), callback_data=f"pick:{o.get('iso_datetime','')}")] for o in opts[:4]]
+        await update.message.reply_text("Уточни, пожалуйста:", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if intent == "create_reminder":
-        title = parsed.get("title") or parsed.get("description") or "Напоминание"
-        iso = parsed.get("fixed_datetime")
-        if not iso:
-            await update.message.reply_text("Не нашёл времени. Попробуй точнее.")
+        title = result.get("title") or "Напоминание"
+        body = result.get("description")
+        dt_iso = result.get("fixed_datetime")
+        if not dt_iso:
+            await update.message.reply_text("Не понял время. Напиши, например: «сегодня 18:30».")
             return
-        # поддержим оба формата: без секунд (наш) и с секундами — LLM иногда шлёт с секундами
-        try:
-            dt = datetime.fromisoformat(iso)
-        except Exception:
-            # поправим, если пришло "YYYY-MM-DD HH:MM:SS+03"
-            iso_fixed = iso.replace(" ", "T")
-            if re.match(r".*\+\d{2}$", iso_fixed):
-                iso_fixed += ":00"
-            dt = datetime.fromisoformat(iso_fixed)
 
-        # сохраняем и планируем
-        rem_id = db_add_reminder(uid, title, to_rfc3339_no_seconds(dt), user_tz)
-        schedule_once(context.application, dt, uid, rem_id, title)
+        # гарантируем tz-aware и нормальный формат без секунд
+        dt = parse_iso_flexible(dt_iso)
+        dt_iso_clean = iso_no_seconds(dt)
+        rem_id = db_add_reminder(user_id, title, body, dt_iso_clean)
+        schedule_job(context.application, rem_id, user_id, dt_iso_clean, title)
 
-        pretty = fmt_user_dt(dt, user_tz)
-        await update.message.reply_text(f"📅 Окей, напомню «{title}» {pretty}")
+        # ответ — краткий, красивый
+        tz = db_get_user_tz(user_id) or "+03:00"
+        dt_local = parse_iso_flexible(dt_iso_clean).astimezone(tzinfo_from_user(tz))
+        await update.message.reply_text(
+            f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
+            reply_markup=MAIN_MENU_KB
+        )
         return
 
-    # неизвестный интент
-    await update.message.reply_text("Я не понял, попробуй ещё раз.")
+    # fallback: болталка
+    await update.message.reply_text("Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
-
-# CB для выбора из ask_clarification
-async def on_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# pick from clarification inline
+async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data or ""
     if not data.startswith("pick:"):
         return
-    iso = data.split(":", 1)[1]
-    uid = q.from_user.id
-    tz = db_get_tz(uid)
+    iso = data.split("pick:")[1]
+    user_id = q.message.chat_id
+
+    # создаём напоминание с дефолтным заголовком
     title = "Напоминание"
+    rem_id = db_add_reminder(user_id, title, None, iso)
+    schedule_job(context.application, rem_id, user_id, iso, title)
 
-    # распарсим дату
-    iso_fixed = iso.replace(" ", "T")
-    if re.match(r".*\+\d{2}$", iso_fixed):
-        iso_fixed += ":00"
-    dt = datetime.fromisoformat(iso_fixed)
+    tz = db_get_user_tz(user_id) or "+03:00"
+    dt_local = parse_iso_flexible(iso).astimezone(tzinfo_from_user(tz))
+    await q.edit_message_text(f"📅 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}")
 
-    rem_id = db_add_reminder(uid, title, to_rfc3339_no_seconds(dt), tz)
-    schedule_once(context.application, dt, uid, rem_id, title)
-
-    pretty = fmt_user_dt(dt, tz)
-    await q.edit_message_text(f"📅 Окей, напомню «{title}» {pretty}")
-
-
-# =========================
-# APP & ENTRYPOINT (PTB v20)
-# =========================
-
-def build_app() -> Application:
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # Хэндлеры команд
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("reload", cmd_reload))
-    app.add_handler(CommandHandler("list", cmd_list))
-
-    # Callback-кнопки
-    app.add_handler(CallbackQueryHandler(on_cb,   pattern=r"^del:"))
-    app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
-
-    # Текстовые сообщения
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    return app
-
-
+# ---------- main -----------
 def main():
-    app = build_app()
-    # Если у тебя где-то есть SCHED.start(), оставь его выше по файлу (он уже стартует)
-    # Запуск PTB v20: без asyncio.run/initialize/updater.start_polling
-    log.info("Bot starting… polling enabled")
-    app.run_polling(close_loop=False)  # close_loop=False чтобы не закрывать уже существующий loop
+    db_init()
 
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Scheduler
+    scheduler.start()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("settings", lambda u,c: u.message.reply_text("Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)))
+
+    app.add_handler(CallbackQueryHandler(cb_inline, pattern=r"^(del:|done:|snooze:)"))
+    app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
+
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
