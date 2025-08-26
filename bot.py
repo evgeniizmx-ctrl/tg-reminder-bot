@@ -8,8 +8,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import asyncio
+import subprocess
 import tempfile
-import uuid
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -164,7 +164,6 @@ def now_in_user_tz(tz_str: str) -> datetime:
 
 def iso_utc(dt: datetime) -> str:
     if dt.tzinfo is None: raise ValueError("aware dt required")
-    # не обнуляем секунды, чтобы не попасть в прошлое и не словить misfire
     dt = dt.astimezone(timezone.utc).replace(microsecond=0)
     return dt.isoformat()
 
@@ -313,7 +312,6 @@ scheduler: AsyncIOScheduler | None = None
 TG_BOT = None  # PTB bot instance для отправки сообщений из APScheduler
 
 async def fire_reminder(*, chat_id: int, rem_id: int, title: str, kind: str = "oneoff"):
-    """Колбэк APScheduler — получает kwargs, без PTB context."""
     try:
         kb_rows = [[
             InlineKeyboardButton("Через 10 мин", callback_data=f"snooze:10:{rem_id}"),
@@ -536,6 +534,59 @@ def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
     if state is None: context.user_data.pop("clarify_state", None)
     else: context.user_data["clarify_state"] = state
 
+# ---------- VOICE -> text (ffmpeg + Whisper) ----------
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скачиваем voice(.oga/.ogg) → ffmpeg → wav → Whisper → подставляем как текст и
+    переиспользуем обычный пайплайн handle_text.
+    """
+    try:
+        voice = update.message.voice
+        if not voice:
+            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        # 1) скачать файл
+        tg_file = await voice.get_file()
+        with tempfile.TemporaryDirectory() as td:
+            in_path = os.path.join(td, f"voice_{update.message.message_id}.oga")
+            out_path = os.path.join(td, f"voice_{update.message.message_id}.wav")
+            await tg_file.download_to_drive(custom_path=in_path)
+
+            # 2) ffmpeg → wav (mono 16kHz)
+            cmd = ["ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", "16000", out_path]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+            )
+            rc = await proc.wait()
+            if rc != 0 or not os.path.exists(out_path):
+                log.error("ffmpeg convert failed rc=%s", rc)
+                return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+            # 3) Whisper
+            client = get_openai()
+            with open(out_path, "rb") as f:
+                try:
+                    tr = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        response_format="text"
+                    )
+                    text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+                except Exception as e:
+                    log.exception("Whisper transcription error: %s", e)
+                    return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        text = (text or "").strip()
+        if not text:
+            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        # 4) подставляем как будто это обычное текстовое сообщение
+        update.message.text = text
+        return await handle_text(update, context)
+
+    except Exception as e:
+        log.exception("handle_voice failed: %s", e)
+        return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await try_handle_tz_input(update, context): return
@@ -625,57 +676,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
-# ---------- Voice -> Text ----------
-# ---------- Voice -> Text ----------
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Распознаём voice и передаём результат в ту же логику, что и текст."""
-    try:
-        voice = update.message.voice if update.message else None
-        if not voice:
-            return
-
-        file = await voice.get_file()
-
-        # Скачиваем во временный файл (OGG/OPUS от Telegram — ок для whisper-1)
-        tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.ogg")
-        await file.download_to_drive(tmp_path)
-
-        client = get_openai()
-        text = ""
-
-        # 1) Надёжный путь: whisper-1 через audio.transcriptions
-        try:
-            with open(tmp_path, "rb") as f:
-                tr = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    response_format="json",
-                    temperature=0,
-                    language="ru"  # можно убрать, но так стабильнее на русской речи
-                )
-            text = (getattr(tr, "text", "") or "").strip()
-        except Exception as e:
-            log.exception("Whisper transcription error: %s", e)
-            text = ""
-
-        # Убираем временный файл
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-        if not text:
-            await update.message.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
-            return
-
-        # Подменяем текст и прогоняем обычный пайплайн
-        update.message.text = text
-        await handle_text(update, context)
-
-    except Exception as e:
-        log.exception("Voice recognition failed: %s", e)
-        await update.message.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
-
 # ---------- Startup: APScheduler в PTB loop ----------
 async def on_startup(app: Application):
     global scheduler, TG_BOT
@@ -709,8 +709,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
 
-    # текст + войс
+    # <— новый voice-хэндлер
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
