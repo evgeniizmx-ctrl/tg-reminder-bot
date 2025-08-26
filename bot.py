@@ -534,57 +534,125 @@ def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
     if state is None: context.user_data.pop("clarify_state", None)
     else: context.user_data["clarify_state"] = state
 
-# ---------- VOICE -> text (ffmpeg + Whisper) ----------
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Скачиваем voice(.oga/.ogg) → ffmpeg → wav → Whisper → подставляем как текст и
-    переиспользуем обычный пайплайн handle_text.
-    Требует установленный ffmpeg и OPENAI_API_KEY.
+# ---------- VOICE/AUDIO -> text (direct to Whisper + ffmpeg fallback) ----------
+async def _download_tg_file(tg_file, path: str):
+    await tg_file.download_to_drive(custom_path=path)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(f"Downloaded file is empty: {path}")
+
+def _guess_ext(file_unique_id: str, mime: str | None) -> str:
+    # простая эвристика для расширения
+    if mime:
+        if "ogg" in mime or "opus" in mime:
+            return ".ogg"
+        if "mpeg" in mime or "mp3" in mime:
+            return ".mp3"
+        if "mp4" in mime or "m4a" in mime:
+            return ".m4a"
+        if "wav" in mime:
+            return ".wav"
+    return ".ogg"
+
+async def handle_any_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Принимаем voice/audio/video_note.
+    1) шлём оригинал в Whisper
+    2) при ошибке — ffmpeg -> wav и ещё раз
     """
     try:
-        voice = update.message.voice
-        if not voice:
+        msg = update.message
+        voice = getattr(msg, "voice", None)
+        audio = getattr(msg, "audio", None)
+        vnote = getattr(msg, "video_note", None)
+
+        if not (voice or audio or vnote):
+            log.error("audio: no payload (voice/audio/video_note) on message")
             return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
-        # 1) скачать файл
-        tg_file = await context.bot.get_file(voice.file_id)
+        tg_file = None
+        mime = None
+        unique_id = None
+        if voice:
+            tg_file = await voice.get_file()
+            mime = getattr(voice, "mime_type", None)
+            unique_id = voice.file_unique_id
+        elif audio:
+            tg_file = await audio.get_file()
+            mime = getattr(audio, "mime_type", None)
+            unique_id = audio.file_unique_id
+        else:  # video_note
+            tg_file = await vnote.get_file()
+            mime = "video/ogg"
+            unique_id = vnote.file_unique_id
+
         with tempfile.TemporaryDirectory() as td:
-            in_path = os.path.join(td, f"voice_{update.message.message_id}.oga")
-            out_path = os.path.join(td, f"voice_{update.message.message_id}.wav")
-            await tg_file.download_to_drive(custom_path=in_path)
+            ext = _guess_ext(unique_id or "x", mime)
+            src_path = os.path.join(td, f"tg_{update.message.message_id}{ext}")
+            wav_path = os.path.join(td, f"tg_{update.message.message_id}.wav")
 
-            # 2) ffmpeg → wav (mono 16kHz)
-            cmd = ["ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", "16000", out_path]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-            )
-            rc = await proc.wait()
-            if rc != 0 or not os.path.exists(out_path):
-                log.error("ffmpeg convert failed rc=%s", rc)
-                return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+            # 0) скачиваем
+            await _download_tg_file(tg_file, src_path)
+            log.info("audio: downloaded %s (%d bytes), mime=%s", src_path, os.path.getsize(src_path), mime)
 
-            # 3) Whisper
             client = get_openai()
-            with open(out_path, "rb") as f:
-                try:
+
+            # 1) пробуем отправить исходник как есть
+            try:
+                log.info("audio: Whisper try (original) -> %s", src_path)
+                with open(src_path, "rb") as f:
                     tr = client.audio.transcriptions.create(
                         model="whisper-1",
-                        file=f
+                        file=f,
+                        response_format="text",
                     )
-                    text = getattr(tr, "text", "") if tr else ""
-                except Exception as e:
-                    log.exception("Whisper transcription error: %s", e)
+                text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+                text = (text or "").strip()
+                if text:
+                    update.message.text = text
+                    log.info("audio: transcribed (original): %s", text)
+                    return await handle_text(update, context)
+                else:
+                    log.warning("audio: Whisper returned empty text from original, fallback to ffmpeg")
+            except Exception as e:
+                log.exception("audio: Whisper (original) failed, fallback to ffmpeg: %s", e)
+
+            # 2) ffmpeg → wav (mono 16k)
+            cmd = ["ffmpeg", "-y", "-i", src_path, "-ac", "1", "-ar", "16000", wav_path]
+            log.info("audio: ffmpeg cmd: %s", " ".join(cmd))
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+                log.error("audio: ffmpeg failed rc=%s; stderr=%s",
+                          proc.returncode, (stderr or b"").decode("utf-8", "ignore"))
+                return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+            # 3) пробуем снова — уже WAV
+            try:
+                log.info("audio: Whisper try (wav) -> %s", wav_path)
+                with open(wav_path, "rb") as f:
+                    tr = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        response_format="text",
+                    )
+                text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+                text = (text or "").strip()
+                if not text:
+                    log.error("audio: Whisper returned empty text for wav")
                     return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
-
-        text = (text or "").strip()
-        if not text:
-            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
-
-        # 4) подставляем как будто это обычное текстовое сообщение
-        update.message.text = text
-        return await handle_text(update, context)
+                update.message.text = text
+                log.info("audio: transcribed (wav): %s", text)
+                return await handle_text(update, context)
+            except Exception as e:
+                log.exception("audio: Whisper (wav) failed: %s", e)
+                return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
     except Exception as e:
-        log.exception("handle_voice failed: %s", e)
+        log.exception("audio: unexpected failure: %s", e)
         return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
 # ---------- main text ----------
@@ -710,7 +778,11 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
 
     # voice-хэндлер (ffmpeg + whisper)
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+        # аудио/войс/видеонота
+    app.add_handler(MessageHandler(filters.VOICE, handle_any_audio))
+    app.add_handler(MessageHandler(filters.AUDIO, handle_any_audio))
+    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_any_audio))
+
 
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
