@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import asyncio
 import tempfile
+import traceback
+from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -17,7 +19,7 @@ from dateutil import parser as dparser
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, File
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -37,6 +39,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
 PROMPTS_PATH = os.environ.get("PROMPTS_PATH", "prompts.yaml")
 DB_PATH = os.environ.get("DB_PATH", "reminders.db")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+# Доп. опции для диагностики войсов
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # опционально
+FAILED_DIR = Path(os.environ.get("FAILED_DIR", "/app/failed"))
+FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
 missing = []
 if not BOT_TOKEN: missing.append("BOT_TOKEN")
@@ -77,17 +84,6 @@ def db_init():
         try: conn.execute("alter table reminders add column recurrence_json text")
         except Exception: pass
         conn.commit()
-
-def try_acquire_singleton_lock() -> bool:
-    """Простейший лок на уровне SQLite. True — мы лидер; False — уже есть запущенный бот."""
-    with db() as conn:
-        conn.execute("create table if not exists meta (k text primary key, v text)")
-        try:
-            conn.execute("insert into meta(k, v) values('singleton', strftime('%Y-%m-%dT%H:%M:%S','now'))")
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
 
 def db_get_user_tz(user_id: int) -> str | None:
     with db() as conn:
@@ -317,7 +313,7 @@ def rule_parse(text: str, now_local: datetime):
         return {"intent": "create", "title": title, "when_local": when_local}
     return None
 
-# ---------- Scheduler (APScheduler inside PTB loop) ----------
+# ---------- Scheduler (APScheduler внутри PTB loop) ----------
 scheduler: AsyncIOScheduler | None = None
 TG_BOT = None  # PTB bot instance для отправки сообщений из APScheduler
 
@@ -416,131 +412,13 @@ def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
     day = rec.get("day")
     return f"каждое {day}-е число в {time_str} — «{title}»"
 
-# ---------- Clarification memory ----------
-def get_clarify_state(context: ContextTypes.DEFAULT_TYPE):
-    return context.user_data.get("clarify_state")
-def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
-    if state is None: context.user_data.pop("clarify_state", None)
-    else: context.user_data["clarify_state"] = state
-
-# ---------- AUDIO → text (voice/audio/video_note; Whisper + ffmpeg fallback) ----------
-async def _download_tg_file(f: File, dest_path: str):
-    await f.download_to_drive(custom_path=dest_path)
-
-ADMIN_IDS = { }  # при желании добавь сюда свой telegram id, например: {123456789}
-
-async def handle_any_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Helpers ----------
+async def notify_admin(text: str):
     try:
-        msg = update.message
-        voice = msg.voice
-        audio = msg.audio
-        vnote = msg.video_note
-
-        if not (voice or audio or vnote):
-            return
-
-        tgfile: File
-        if voice:
-            tgfile = await voice.get_file()
-            kind = "voice"
-        elif audio:
-            tgfile = await audio.get_file()
-            kind = "audio"
-        else:
-            tgfile = await vnote.get_file()
-            kind = "video_note"
-
-        with tempfile.TemporaryDirectory() as td:
-            src = os.path.join(td, f"in_{msg.message_id}")
-            dst = os.path.join(td, f"out_{msg.message_id}.wav")
-
-            await _download_tg_file(tgfile, src)
-            log.info("audio: downloaded kind=%s path=%s", kind, src)
-
-            client = get_openai()
-
-            async def _send_diag(text: str):
-                log.warning(text)
-                if ADMIN_IDS and update.effective_user.id in ADMIN_IDS:
-                    try:
-                        await msg.reply_text("🛠 " + text)
-                    except Exception:
-                        pass
-
-            # — 1. Пытаемся скормить как есть (часто .oga тоже ест)
-            try:
-                with open(src, "rb") as f:
-                    try:
-                        tr = client.audio.transcriptions.create(
-                            model="gpt-4o-mini-transcribe",
-                            file=f,
-                            response_format="text",
-                        )
-                    except Exception as e:
-                        await _send_diag(f"audio: 4o-mini-transcribe failed: {e!s}")
-                        tr = None
-                if tr:
-                    text = tr if isinstance(tr, str) else getattr(tr, "text", "")
-                    text = (text or "").strip()
-                    if text:
-                        log.info("audio: transcribed via 4o-mini-transcribe: %s", text)
-                        msg.text = text
-                        return await handle_text(update, context)
-            except Exception as e:
-                await _send_diag(f"audio: direct 4o-mini-transcribe exception: {e!s}")
-
-            # — 2. Пробуем сразу whisper-1 без конвертации
-            try:
-                with open(src, "rb") as f:
-                    trw = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=f,
-                        response_format="text",
-                    )
-                text = trw if isinstance(trw, str) else getattr(trw, "text", "")
-                text = (text or "").strip()
-                if text:
-                    log.info("audio: transcribed via whisper-1 (raw): %s", text)
-                    msg.text = text
-                    return await handle_text(update, context)
-            except Exception as e:
-                await _send_diag(f"audio: whisper-1 raw failed: {e!s}")
-
-            # — 3. Конвертируем в wav 16k mono → whisper-1
-            cmd = ["ffmpeg", "-y", "-i", src, "-ac", "1", "-ar", "16000", dst]
-            log.info("audio: ffmpeg cmd: %s", " ".join(cmd))
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            rc = await proc.wait()
-            if rc != 0 or not os.path.exists(dst):
-                await _send_diag(f"audio: ffmpeg convert failed rc={rc}")
-                return await msg.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
-
-            try:
-                with open(dst, "rb") as f:
-                    tr = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=f,
-                        response_format="text",
-                    )
-                text = tr if isinstance(tr, str) else getattr(tr, "text", "")
-                text = (text or "").strip()
-                if not text:
-                    await _send_diag("audio: whisper-1 (wav) returned empty text")
-                    return await msg.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
-                log.info("audio: transcribed via whisper-1 (wav): %s", text)
-                msg.text = text
-                return await handle_text(update, context)
-            except Exception as e:
-                await _send_diag(f"audio: whisper-1 after ffmpeg failed: {e!s}")
-                return await msg.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
-
-    except Exception as e:
-        log.exception("handle_any_audio failed: %s", e)
-        return await update.message.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+        if ADMIN_CHAT_ID:
+            await TG_BOT.send_message(chat_id=int(ADMIN_CHAT_ID), text=text[:4000])
+    except Exception:
+        log.exception("notify_admin failed")
 
 # ---------- Handlers ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -587,6 +465,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_rows = []
     for r in rows:
         line = format_reminder_line(r, tz)
+        # сохраняем время полностью, текст обрезать позволит сам Telegram
         kb_rows.append([InlineKeyboardButton(f"🗑 {line}", callback_data=f"del:{r['id']}")])
 
     await safe_reply(update, header, reply_markup=InlineKeyboardMarkup(kb_rows))
@@ -663,6 +542,106 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     reply_markup=kb)
     context.user_data["__auto_answer"] = choice
     await handle_text(update, context)
+
+def get_clarify_state(context: ContextTypes.DEFAULT_TYPE):
+    return context.user_data.get("clarify_state")
+def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
+    if state is None: context.user_data.pop("clarify_state", None)
+    else: context.user_data["clarify_state"] = state
+
+# ---------- VOICE/AUDIO -> text (ffmpeg + Whisper) ----------
+async def handle_any_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимает voice (.oga/.ogg) и обычное audio, конвертирует в wav (16k mono),
+    отправляет в Whisper и пробрасывает текст в handle_text.
+    """
+    msg = update.message
+    voice = msg.voice
+    audio = msg.audio
+    if not voice and not audio:
+        return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+    try:
+        tg_file = await (voice.get_file() if voice else audio.get_file())
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            # определить расширение
+            ext = ".oga"
+            if audio and audio.mime_type:
+                mt = (audio.mime_type or "").lower()
+                if "mpeg" in mt or "mp3" in mt: ext = ".mp3"
+                elif "x-wav" in mt or "wav" in mt: ext = ".wav"
+                elif "ogg" in mt: ext = ".ogg"
+
+            in_path = td / f"in_{msg.message_id}{ext}"
+            wav_path = td / f"out_{msg.message_id}.wav"
+            await tg_file.download_to_drive(custom_path=str(in_path))
+
+            try:
+                size_kb = in_path.stat().st_size / 1024
+            except Exception:
+                size_kb = -1
+            log.info("Audio in: %s (%.1f KB) mime=%s", in_path, size_kb, (audio.mime_type if audio else "voice/ogg"))
+
+            # ffmpeg → wav 16k mono
+            cmd = ["ffmpeg", "-y", "-i", str(in_path), "-ac", "1", "-ar", "16000", str(wav_path)]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out_b, err_b = await proc.communicate()
+            if proc.returncode != 0 or not wav_path.exists():
+                err_text = (err_b or b"").decode(errors="ignore")[:2000]
+                log.error("ffmpeg failed rc=%s; stderr=%s", proc.returncode, err_text)
+                # сохранить входной файл
+                fail_in = FAILED_DIR / f"ffmpeg_fail_{int(datetime.now().timestamp())}{ext}"
+                try: in_path.replace(fail_in)
+                except Exception: pass
+                await notify_admin(f"FFmpeg error rc={proc.returncode}\n{err_text}")
+                return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+            try:
+                wav_kb = wav_path.stat().st_size / 1024
+            except Exception:
+                wav_kb = -1
+            log.info("Audio wav: %s (%.1f KB)", wav_path, wav_kb)
+
+            # Whisper
+            client = get_openai()
+            text = ""
+            with open(wav_path, "rb") as f:
+                try:
+                    tr = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        response_format="text",
+                        language="ru"
+                    )
+                    text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    log.error("Whisper error: %s\n%s", e, tb)
+                    ts = int(datetime.now().timestamp())
+                    try: (FAILED_DIR / f"whisper_in_{ts}{ext}").write_bytes(in_path.read_bytes())
+                    except Exception: pass
+                    try: (FAILED_DIR / f"whisper_wav_{ts}.wav").write_bytes(wav_path.read_bytes())
+                    except Exception: pass
+                    await notify_admin(f"Whisper error:\n{e}\n\n{tb}")
+                    return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        text = (text or "").strip()
+        if not text:
+            log.warning("Whisper returned empty text")
+            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        # подменяем текст и идём обычным путём
+        update.message.text = text
+        return await handle_text(update, context)
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        log.error("handle_any_audio fatal: %s\n%s", e, tb)
+        await notify_admin(f"Audio handler fatal:\n{e}\n\n{tb}")
+        return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -772,11 +751,6 @@ def main():
     log.info("Starting PlannerBot...")
     db_init()
 
-    # singleton lock — не даём подняться второй копии
-    if not try_acquire_singleton_lock():
-        log.error("Другой экземпляр бота уже запущен (singleton lock). Выходим.")
-        sys.exit(1)
-
     app = (Application.builder()
            .token(BOT_TOKEN)
            .post_init(on_startup)
@@ -791,11 +765,11 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
 
-    # Аудио/войс/видео-нота — стоят ПЕРЕД текстовым хэндлером
+    # Хэндлеры аудио/войсов
     app.add_handler(MessageHandler(filters.VOICE, handle_any_audio))
     app.add_handler(MessageHandler(filters.AUDIO, handle_any_audio))
-    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_any_audio))
 
+    # Текст
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
