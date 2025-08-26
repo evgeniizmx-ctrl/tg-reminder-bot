@@ -283,7 +283,7 @@ def _extract_title(text: str) -> str:
 
 def rule_parse(text: str, now_local: datetime):
     s = text.strip().lower()
-    m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)", s)
+    m = re.search(r"через\s+(полчаса|минуту|\д+\s*мин(?:ут)?|\д+\s*час(?:а|ов)?)", s)
     if m:
         delta = timedelta()
         ch = m.group(1)
@@ -538,6 +538,7 @@ def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Скачиваем voice(.oga/.ogg) → ffmpeg → wav → Whisper → подставляем как текст и
     переиспользуем обычный пайплайн handle_text.
+    Требует установленный ffmpeg и OPENAI_API_KEY.
     """
     try:
         voice = update.message.voice
@@ -545,7 +546,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
         # 1) скачать файл
-        tg_file = await voice.get_file()
+        tg_file = await context.bot.get_file(voice.file_id)
         with tempfile.TemporaryDirectory() as td:
             in_path = os.path.join(td, f"voice_{update.message.message_id}.oga")
             out_path = os.path.join(td, f"voice_{update.message.message_id}.wav")
@@ -567,10 +568,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     tr = client.audio.transcriptions.create(
                         model="whisper-1",
-                        file=f,
-                        response_format="text"
+                        file=f
                     )
-                    text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+                    text = getattr(tr, "text", "") if tr else ""
                 except Exception as e:
                     log.exception("Whisper transcription error: %s", e)
                     return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
@@ -613,7 +613,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
             dt_local = to_user_local(when_iso_utc, user_tz)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%м в %H:%M')}",
+            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
                                     reply_markup=kb)
         if r["intent"] == "ask":
             set_clarify_state(context, {
@@ -709,7 +709,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
 
-    # <— новый voice-хэндлер
+    # voice-хэндлер (ffmpeg + whisper)
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
