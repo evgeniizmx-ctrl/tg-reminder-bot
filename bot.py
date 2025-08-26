@@ -13,7 +13,7 @@ import tempfile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.interval import IntervalTrigger  # NEW
 from dateutil import parser as dparser
 
 from telegram import (
@@ -27,7 +27,7 @@ from telegram.ext import (
 
 # ---------- Logging ----------
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # DEBUG для более подробных логов
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     stream=sys.stdout,
 )
@@ -41,9 +41,11 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 missing = []
 if not BOT_TOKEN: missing.append("BOT_TOKEN")
-if not OPENAI_API_KEY: missing.append("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    # Не падаем: препарсер покрывает базовые кейсы, но предупредим
+    log.warning("OPENAI_API_KEY не задан — парсер LLM недоступен, но препарсер покроет типовые кейсы.")
 if not os.path.exists(PROMPTS_PATH): missing.append(f"{PROMPTS_PATH} (prompts.yaml)")
-if missing:
+if missing and "BOT_TOKEN" in missing:
     log.error("Missing required environment/files: %s", ", ".join(missing))
     sys.exit(1)
 
@@ -70,7 +72,7 @@ def db_init():
                 when_iso text,                   -- UTC ISO
                 status text default 'scheduled',
                 kind text default 'oneoff',      -- 'oneoff' | 'recurring'
-                recurrence_json text             -- JSON {type,weekday,day,time,tz,...}
+                recurrence_json text             -- JSON {type,weekday,day,month,time,unit,n,start_at,tz}
             )
         """)
         try: conn.execute("alter table reminders add column kind text default 'oneoff'")
@@ -208,8 +210,11 @@ def build_tz_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 async def safe_reply(update: Update, text: str, reply_markup=None):
-    if update and update.message:
-        return await update.message.reply_text(text, reply_markup=reply_markup)
+    if update and getattr(update, "message", None):
+        try:
+            return await update.message.reply_text(text, reply_markup=reply_markup)
+        except Exception:
+            pass
     chat = update.effective_chat if update else None
     if chat:
         return await chat.send_message(text, reply_markup=reply_markup)
@@ -241,10 +246,11 @@ _client = None
 def get_openai():
     global _client
     if _client is None:
-        _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        _client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     return _client
 
 async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = None) -> dict:
+    # NOW_ISO — либо замороженный из clarify_state, либо текущий локальный
     now_local = now_in_user_tz(user_tz)
     if now_iso_override:
         try: now_local = dparser.isoparse(now_iso_override)
@@ -263,90 +269,67 @@ async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = 
         messages=messages,
         temperature=0.2
     )
-    txt = resp.choices[0].message.content.strip()
+    txt = (resp.choices[0].message.content or "").strip()
+    log.debug("LLM raw response: %s", txt)  # Логируем сырое содержимое
     m = re.search(r"\{[\s\S]+\}", txt)
-    return json.loads(m.group(0) if m else txt)
+    payload = m.group(0) if m else txt
+    try:
+        return json.loads(payload)
+    except Exception:
+        log.exception("LLM JSON parse failed. Raw: %s", txt)
+        raise
 
 # ---------- Rule-based quick parse ----------
 def _clean_spaces(s: str) -> str: return re.sub(r"\s+", " ", s).strip()
-
 def _extract_title(text: str) -> str:
     t = text
-    # убираем стандартные маркеры времени
     t = re.sub(r"\b(сегодня|завтра|послезавтра)\b", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\bчерез\b\s+[^,;.]+", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\bв\s+\d{1,2}(:\d{2})?\s*(час(?:а|ов)?|ч)?\b", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"\bв\s+\d{1,2}\b", " ", t, flags=re.IGNORECASE)
-    # HHMM без двоеточия
-    t = re.sub(r"\b([01]?\d|2[0-3])[ .:]?([0-5]\d)\b", " ", t)
     t = _clean_spaces(t.strip(" ,.;—-"))
     return t.capitalize() if t else "Напоминание"
-
-def _plural(n: int, forms: tuple[str, str, str]) -> str:
-    n = abs(n) % 100
-    n1 = n % 10
-    if 11 <= n <= 19: return forms[2]
-    if 1 == n1: return forms[0]
-    if 2 <= n1 <= 4: return forms[1]
-    return forms[2]
 
 def rule_parse(text: str, now_local: datetime):
     s = text.strip().lower()
 
-    # 1) интервалы: каждую минуту / каждые 2 минуты / каждые 30 сек / каждый час / каждые N часов
-    m = re.search(r"\bкажд(ую|ые|ый)\s+(\d+)?\s*(секунд(?:у|ы)?|сек|минут(?:у|ы)?|мин|час(?:а|ов)?|ч)\b", s)
-    if m:
-        q = m.group(2)
-        unit = m.group(3)
-        n = int(q) if q else 1
-        if "сек" in unit: seconds = n
-        elif "мин" in unit: seconds = n * 60
-        else: seconds = n * 3600
-        return {"intent": "create_interval", "title": _extract_title(text), "every_seconds": seconds}
+    # интервальные разговорные (минимально)
+    m_int = re.search(r"\bкажды(е|й|е)\s+(\d+)\s*(сек|секунд|секунды|мин|минут|минуты|час|часа|часов)\b", s)
+    if m_int:
+        n = int(m_int.group(2))
+        unit_raw = m_int.group(3)
+        unit = "second" if unit_raw.startswith("сек") else ("minute" if unit_raw.startswith("мин") else "hour")
+        return {"intent": "create_interval", "title": _extract_title(text), "unit": unit, "n": n, "start_at": now_local}
 
-    # 2) через N минут/часов/секунд
-    m = re.search(r"\bчерез\s+(\d+)\s*(секунд(?:у|ы)?|сек|минут(?:у|ы)?|мин|час(?:а|ов)?|ч)\b", s)
-    if m:
-        n = int(m.group(1)); unit = m.group(2)
-        if "сек" in unit: delta = timedelta(seconds=n)
-        elif "мин" in unit: delta = timedelta(minutes=n)
-        else: delta = timedelta(hours=n)
+    if re.search(r"\bкажд(ую|ый)\s+минут(у|ы)?\b", s):
+        return {"intent": "create_interval", "title": _extract_title(text), "unit": "minute", "n": 1, "start_at": now_local}
+
+    if re.search(r"\bчерез\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)\b", s):
+        m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)", s)
+        delta = timedelta()
+        ch = m.group(1)
+        if "полчаса" in ch: delta = timedelta(minutes=30)
+        elif "минуту" in ch: delta = timedelta(minutes=1)
+        elif "мин" in ch: delta = timedelta(minutes=int(re.search(r"\d+", ch).group()))
+        else: delta = timedelta(hours=int(re.search(r"\d+", ch).group()))
         when_local = now_local + delta
         return {"intent": "create", "title": _extract_title(text), "when_local": when_local}
 
-    # 3) сегодня/завтра/послезавтра в HH[:MM]?
     md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s)
-    # HH:MM или HHMM
-    mt = re.search(r"\b(?:в\s+)?((?:[01]?\d|2[0-3])(?::?([0-5]\d))?)\b", s)
+    mt = re.search(r"\bв\s+(\d{1,2})(?::?(\d{2}))?\s*(час(?:а|ов)?|ч)?\b", s)
     if md and mt:
         base = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[md.group(1)]
         day = (now_local + timedelta(days=base)).date()
-        raw = mt.group(1)
-        if ":" in raw:
-            hh, mm = map(int, raw.split(":"))
-        else:
-            hh = int(raw[:-2]); mm = int(raw[-2:])
+        hh = int(mt.group(1)); mm = int(mt.group(2) or 0)
         title = _extract_title(text)
-        # двусмысленно ТОЛЬКО если нет минут и 1..12
-        if ":" not in raw and len(raw) <= 2 and 1 <= hh <= 12:
+        if mt.group(2) is None and 1 <= hh <= 12:
             return {"intent":"ask","title":title,"base_date":day.isoformat(),"question":"Уточни, пожалуйста, время",
                     "variants":[f"{hh:02d}:00", f"{(hh%12)+12:02d}:00"]}
         when_local = datetime(day.year, day.month, day.day, hh, mm, tzinfo=now_local.tzinfo)
         return {"intent": "create", "title": title, "when_local": when_local}
-
-    # 4) просто HHMM без «сегодня/завтра»
-    m = re.search(r"\b([01]?\d|2[0-3])([0-5]\d)\b", s)
-    if m:
-        hh, mm = int(m.group(1)), int(m.group(2))
-        day = now_local.date()
-        when_local = datetime(day.year, day.month, day.day, hh, mm, tzinfo=now_local.tzinfo)
-        if when_local <= now_local:
-            when_local += timedelta(days=1)
-        return {"intent":"create", "title":_extract_title(text), "when_local":when_local}
-
     return None
 
-# ---------- Scheduler ----------
+# ---------- Scheduler (APScheduler внутри PTB loop) ----------
 scheduler: AsyncIOScheduler | None = None
 TG_BOT = None  # PTB bot instance для отправки сообщений из APScheduler
 
@@ -383,31 +366,40 @@ def schedule_oneoff(rem_id: int, user_id: int, when_iso_utc: str, title: str, ki
 
 def schedule_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, tz_str: str):
     sch = ensure_scheduler()
-    tzinfo = tzinfo_from_user(tz_str)
     rtype = (recurrence.get("type") or "").lower()
 
     if rtype == "interval":
-        # seconds приоритетен; поддержим minutes/hours для удобства
-        seconds = recurrence.get("every_seconds")
-        if seconds is None:
-            if recurrence.get("every_minutes") is not None:
-                seconds = int(recurrence["every_minutes"]) * 60
-            elif recurrence.get("every_hours") is not None:
-                seconds = int(recurrence["every_hours"]) * 3600
-        seconds = int(seconds or 60)
-        trigger = IntervalTrigger(seconds=seconds, timezone=tzinfo)
-
-    elif rtype == "daily":
-        hh, mm = map(int, (recurrence.get("time") or "00:00").split(":"))
-        trigger = CronTrigger(hour=hh, minute=mm, timezone=tzinfo)
-
-    elif rtype == "weekly":
-        hh, mm = map(int, (recurrence.get("time") or "00:00").split(":"))
-        trigger = CronTrigger(day_of_week=recurrence.get("weekday"), hour=hh, minute=mm, timezone=tzinfo)
-
-    else:  # monthly by day
-        hh, mm = map(int, (recurrence.get("time") or "00:00").split(":"))
-        trigger = CronTrigger(day=int(recurrence.get("day")), hour=hh, minute=mm, timezone=tzinfo)
+        unit = (recurrence.get("unit") or "").lower()
+        n = int(recurrence.get("n") or 1)
+        start_at = recurrence.get("start_at")
+        # start_date в UTC
+        start_dt_local = dparser.isoparse(start_at) if start_at else now_in_user_tz(tz_str)
+        start_dt_utc = start_dt_local.astimezone(timezone.utc)
+        kwargs = {}
+        if unit == "second":
+            kwargs["seconds"] = n
+        elif unit == "minute":
+            kwargs["minutes"] = n
+        else:
+            kwargs["hours"] = n
+        trigger = IntervalTrigger(start_date=start_dt_utc, **kwargs)
+    else:
+        # daily/weekly/monthly/yearly
+        tzinfo = tzinfo_from_user(tz_str)
+        time_str = recurrence.get("time") or "00:00"
+        hh, mm = map(int, time_str.split(":"))
+        if rtype == "daily":
+            trigger = CronTrigger(hour=hh, minute=mm, timezone=tzinfo)
+        elif rtype == "weekly":
+            trigger = CronTrigger(day_of_week=recurrence.get("weekday"), hour=hh, minute=mm, timezone=tzinfo)
+        elif rtype == "monthly":
+            trigger = CronTrigger(day=int(recurrence.get("day")), hour=hh, minute=mm, timezone=tzinfo)
+        elif rtype == "yearly":
+            month = int(recurrence.get("month")); day = int(recurrence.get("day"))
+            trigger = CronTrigger(month=month, day=day, hour=hh, minute=mm, timezone=tzinfo)
+        else:
+            # fallback на daily
+            trigger = CronTrigger(hour=hh, minute=mm, timezone=tzinfo)
 
     sch.add_job(
         fire_reminder, trigger,
@@ -415,7 +407,7 @@ def schedule_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, 
         kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "kind": "recurring"},
         name=f"rem {rem_id}",
     )
-    log.info("Scheduled recurring id=%s (%s)", rem_id, recurrence)
+    log.info("Scheduled recurring id=%s (%s %s)", rem_id, rtype, json.dumps(recurrence, ensure_ascii=False))
     sch.print_jobs()
 
 def reschedule_all():
@@ -433,7 +425,7 @@ def reschedule_all():
     log.info("Rescheduled %d reminders from DB", len(rows))
 
 # ---------- RU wording ----------
-def ru_weekday(word_code: str) -> str:
+def ru_weekly_phrase(weekday_code: str) -> str:
     mapping = {
         "mon": ("каждый", "понедельник"),
         "tue": ("каждый", "вторник"),
@@ -443,21 +435,18 @@ def ru_weekday(word_code: str) -> str:
         "sat": ("каждую", "субботу"),
         "sun": ("каждое", "воскресенье"),
     }
-    det, word = mapping.get((word_code or "").lower(), ("каждый", word_code or "день"))
+    det, word = mapping.get((weekday_code or "").lower(), ("каждый", weekday_code or "день"))
     return f"{det} {word}"
 
-def human_interval(seconds: int) -> str:
-    if seconds % 3600 == 0:
-        h = seconds // 3600
-        if h == 1: return "каждый час"
-        return f"каждые {h} " + _plural(h, ("час", "часа", "часов"))
-    if seconds % 60 == 0:
-        m = seconds // 60
-        if m == 1: return "каждую мин"
-        return f"каждые {m} " + _plural(m, ("мин", "мин", "мин"))
-    s = seconds
-    if s == 1: return "каждую сек"
-    return f"каждые {s} " + _plural(s, ("сек", "сек", "сек"))
+def _format_interval_phrase(unit: str, n: int) -> str:
+    unit = (unit or "").lower()
+    n = int(n or 1)
+    if unit == "second":
+        return "каждую сек" if n == 1 else f"каждые {n} сек"
+    if unit == "minute":
+        return "каждую мин" if n == 1 else f"каждые {n} мин"
+    # hour
+    return "каждый час" if n == 1 else f"каждые {n} часов"
 
 def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
     title = row["title"]
@@ -468,17 +457,18 @@ def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
     rec = json.loads(row["recurrence_json"]) if row["recurrence_json"] else {}
     rtype = (rec.get("type") or "").lower()
     if rtype == "interval":
-        sec = rec.get("every_seconds")
-        if sec is None:
-            if rec.get("every_minutes") is not None: sec = int(rec["every_minutes"]) * 60
-            elif rec.get("every_hours") is not None: sec = int(rec["every_hours"]) * 3600
-        sec = int(sec or 60)
-        return f"{human_interval(sec)} — «{title}»"
+        phrase = _format_interval_phrase(rec.get("unit"), rec.get("n"))
+        return f"{phrase} — «{title}»"
     time_str = rec.get("time") or "00:00"
     if rtype == "daily":
         return f"каждый день в {time_str} — «{title}»"
     if rtype == "weekly":
-        return f"{ru_weekday(rec.get('weekday', ''))} в {time_str} — «{title}»"
+        wd = ru_weekly_phrase(rec.get("weekday", ""))
+        return f"{wd} в {time_str} — «{title}»"
+    if rtype == "yearly":
+        day = rec.get("day"); month = rec.get("month")
+        return f"каждый год {int(day):02d}.{int(month):02d} в {time_str} — «{title}»"
+    # monthly (или прочее)
     day = rec.get("day")
     return f"каждое {day}-е число в {time_str} — «{title}»"
 
@@ -527,7 +517,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_rows = []
     for r in rows:
         line = format_reminder_line(r, tz)
+        # одна кнопка в строке — максимум ширины
         kb_rows.append([InlineKeyboardButton(f"🗑 {line}", callback_data=f"del:{r['id']}")])
+
     await safe_reply(update, header, reply_markup=InlineKeyboardMarkup(kb_rows))
 
 async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -577,7 +569,7 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
     dt_local = to_user_local(when_iso_utc, tz)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+    await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -585,12 +577,16 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception: pass
     data = q.data or ""
     if not data.startswith("answer:"): return
-    choice = data.split("answer:",1)[1]
+    choice = data.split("answer:",1)[1].strip()
     cstate = context.user_data.get("clarify_state") or {}
-    base_date = cstate.get("base_date"); title = cstate.get("title") or "Напоминание"
-    user_id = q.message.chat.id; tz = db_get_user_tz(user_id) or "+03:00"
+    base_date = cstate.get("base_date")
+    title = cstate.get("title") or "Напоминание"
+    user_id = q.message.chat.id
+    tz = db_get_user_tz(user_id) or "+03:00"
+
+    # Если ждали время и есть зафиксированная дата — создаём сразу, без LLM
     if base_date:
-        m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?$", choice.strip())
+        m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?$", choice)
         if m:
             hh = int(m.group(1)); mm = int(m.group(2) or 0)
             when_local = datetime.fromisoformat(base_date).replace(hour=hh, minute=mm, tzinfo=tzinfo_from_user(tz))
@@ -598,13 +594,17 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
             schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
-                                    reply_markup=kb)
+            await safe_reply(update, f"⏰ Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+            set_clarify_state(context, None)
+            return
+
+    # Иначе проталкиваем ответ в общий пайплайн
     context.user_data["__auto_answer"] = choice
     await handle_text(update, context)
 
 def get_clarify_state(context: ContextTypes.DEFAULT_TYPE):
     return context.user_data.get("clarify_state")
+
 def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
     if state is None: context.user_data.pop("clarify_state", None)
     else: context.user_data["clarify_state"] = state
@@ -627,7 +627,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", "16000", wav_path,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
             rc = await proc.wait()
             if rc != 0 or not os.path.exists(wav_path):
@@ -661,110 +662,141 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await try_handle_tz_input(update, context): return
-    user_id = update.effective_user.id
-    incoming_text = (context.user_data.pop("__auto_answer", None)
-                     or (update.message.text.strip() if update.message and update.message.text else ""))
+    try:
+        if await try_handle_tz_input(update, context): return
+        user_id = update.effective_user.id
+        incoming_text = (context.user_data.pop("__auto_answer", None)
+                        or (update.message.text.strip() if update.message and update.message.text else ""))
 
-    if incoming_text == "📝 Список напоминаний" or incoming_text.lower() == "/list":
-        return await cmd_list(update, context)
-    if incoming_text == "⚙️ Настройки" or incoming_text.lower() == "/settings":
-        return await safe_reply(update, "Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
+        if incoming_text == "📝 Список напоминаний" or incoming_text.lower() == "/list":
+            return await cmd_list(update, context)
+        if incoming_text == "⚙️ Настройки" or incoming_text.lower() == "/settings":
+            return await safe_reply(update, "Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
 
-    user_tz = db_get_user_tz(user_id)
-    if not user_tz:
-        await safe_reply(update, "Сначала укажи часовой пояс.", reply_markup=MAIN_MENU_KB)
-        await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb()); return
+        user_tz = db_get_user_tz(user_id)
+        if not user_tz:
+            await safe_reply(update, "Сначала укажи часовой пояс.", reply_markup=MAIN_MENU_KB)
+            await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
+            return
 
-    now_local = now_in_user_tz(user_tz)
-    r = rule_parse(incoming_text, now_local)
-    if r:
-        if r["intent"] == "create":
-            title = r["title"]; when_iso_utc = iso_utc(r["when_local"])
-            rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+        now_local = now_in_user_tz(user_tz)
+        r = rule_parse(incoming_text, now_local)
+        if r:
+            # Быстрые интервалы (rule-based)
+            if r.get("intent") == "create_interval":
+                title = r["title"]
+                unit = r["unit"]; n = r["n"]; start_at_local = r["start_at"]
+                recurrence = {"type":"interval","unit":unit,"n":int(n),"start_at":start_at_local.replace(microsecond=0).isoformat()}
+                rem_id = db_add_reminder_recurring(user_id, title, None, recurrence, user_tz)
+                schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
+                phrase = _format_interval_phrase(unit, n)
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+                await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {phrase}", reply_markup=kb)
+                return
+
+            if r["intent"] == "create":
+                title = r["title"]; when_iso_utc = iso_utc(r["when_local"])
+                rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+                schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+                dt_local = to_user_local(when_iso_utc, user_tz)
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+                await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+                return
+
+            if r["intent"] == "ask":
+                # зафиксируем «замороженное» NOW_ISO на момент первого уточнения
+                set_clarify_state(context, {
+                    "original": incoming_text,
+                    "base_date": r["base_date"],
+                    "title": r["title"],
+                    "now_iso": now_local.replace(microsecond=0).isoformat()
+                })
+                kb_rows = [[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in r["variants"]]
+                await safe_reply(update, r["question"], reply_markup=InlineKeyboardMarkup(kb_rows))
+                return  # ВАЖНО: прерываем пайплайн после уточнения
+
+        # LLM
+        cstate = get_clarify_state(context)
+        now_iso_for_state = (cstate.get("now_iso") if cstate else None)
+        user_text_for_llm = f"Исходная заявка: {cstate['original']}\nОтвет на уточнение: {incoming_text}" if cstate else incoming_text
+
+        result = await call_llm(user_text_for_llm, user_tz, now_iso_override=now_iso_for_state)
+        intent = result.get("intent")
+
+        if intent == "ask_clarification":
+            question = result.get("question") or "Уточни, пожалуйста."
+            variants = result.get("variants") or []
+            # сохраняем original + ЗАМОРОЖЕННЫЙ NOW_ISO
+            set_clarify_state(context, {
+                "original": (get_clarify_state(context) or {}).get("original") or (result.get("text_original") or incoming_text),
+                "now_iso": now_iso_for_state or now_in_user_tz(user_tz).replace(microsecond=0).isoformat()
+            })
+            kb_rows = []
+            for v in variants[:6]:
+                if isinstance(v, dict):
+                    label = v.get("label") or v.get("text") or v.get("iso_datetime") or "Выбрать"
+                    iso = v.get("iso_datetime")
+                    kb_rows.append([InlineKeyboardButton(label, callback_data=(f"pick:{iso}" if iso else f"answer:{label}"))])
+                else:
+                    kb_rows.append([InlineKeyboardButton(str(v), callback_data=f"answer:{v}")])
+            await safe_reply(update, question, reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None)
+            return  # ВАЖНО: прерываем пайплайн после уточнения
+
+        if intent == "create_reminder":
+            title = result.get("title") or "Напоминание"
+            body = result.get("description")
+            dt_iso_local = result.get("fixed_datetime")
+            recurrence = result.get("recurrence")
+
+            if recurrence:
+                rem_id = db_add_reminder_recurring(user_id, title, body, recurrence, user_tz)
+                schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
+                rtype = (recurrence.get("type") or "").lower()
+                if rtype == "interval":
+                    phrase = _format_interval_phrase(recurrence.get("unit"), recurrence.get("n"))
+                    text = f"⏰ Окей, буду напоминать «{title}» {phrase}"
+                elif rtype == "daily":
+                    text = f"⏰ Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
+                elif rtype == "weekly":
+                    text = f"⏰ Окей, буду напоминать «{title}» {ru_weekly_phrase(recurrence.get('weekday'))} в {recurrence.get('time')}"
+                elif rtype == "yearly":
+                    text = f"⏰ Окей, буду напоминать «{title}» каждый год {int(recurrence.get('day')):02d}.{int(recurrence.get('month')):02d} в {recurrence.get('time')}"
+                else:
+                    text = f"⏰ Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+                await safe_reply(update, text, reply_markup=kb)
+                set_clarify_state(context, None)
+                return
+
+            if not dt_iso_local:
+                await safe_reply(update, "Не понял время. Напиши, например: «сегодня 18:30».")
+                return
+            when_local = dparser.isoparse(dt_iso_local)
+            if when_local.tzinfo is None:
+                when_local = when_local.replace(tzinfo=tzinfo_from_user(user_tz))
+            when_iso_utc = iso_utc(when_local)
+            rem_id = db_add_reminder_oneoff(user_id, title, body, when_iso_utc)
             schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
             dt_local = to_user_local(when_iso_utc, user_tz)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
-                                    reply_markup=kb)
-        if r["intent"] == "ask":
-            set_clarify_state(context, {
-                "original": incoming_text,
-                "base_date": r["base_date"],
-                "title": r["title"],
-            })
-            kb_rows = [[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in r["variants"]]
-            return await safe_reply(update, r["question"], reply_markup=InlineKeyboardMarkup(kb_rows))
-        if r["intent"] == "create_interval":
-            title = r["title"]; seconds = int(r["every_seconds"])
-            rec = {"type":"interval", "every_seconds": seconds}
-            rem_id = db_add_reminder_recurring(user_id, title, None, rec, user_tz)
-            schedule_recurring(rem_id, user_id, title, rec, user_tz)
-            text = f"⏰ Окей, буду напоминать «{title}» {human_interval(seconds)}"
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, text, reply_markup=kb)
+            await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
+                             reply_markup=kb)
+            set_clarify_state(context, None)
+            return
 
-    # LLM
-    result = await call_llm(incoming_text, user_tz)
-    intent = result.get("intent")
+        await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+    except Exception:
+        log.exception("handle_text fatal")
+        await safe_reply(update, "Упс, что-то пошло не так. Напиши ещё раз, пожалуйста.")
 
-    if intent == "ask_clarification":
-        question = result.get("question") or "Уточни, пожалуйста."
-        variants = result.get("variants") or []
-        set_clarify_state(context, {"original": result.get("text_original") or incoming_text})
-        kb_rows = []
-        for v in variants[:6]:
-            if isinstance(v, dict):
-                label = v.get("label") or v.get("text") or v.get("iso_datetime") or "Выбрать"
-                iso = v.get("iso_datetime")
-                kb_rows.append([InlineKeyboardButton(label, callback_data=(f"pick:{iso}" if iso else f"answer:{label}"))])
-            else:
-                kb_rows.append([InlineKeyboardButton(str(v), callback_data=f"answer:{v}")])
-        return await safe_reply(update, question, reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None)
-
-    if intent == "create_reminder":
-        title = result.get("title") or "Напоминание"
-        body = result.get("description")
-        dt_iso_local = result.get("fixed_datetime")
-        recurrence = result.get("recurrence")
-
-        if recurrence:
-            # поддержим, если LLM вернул interval в любом из полей
-            rtype = (recurrence.get("type") or "").lower()
-            if rtype == "interval":
-                if "every_seconds" not in recurrence:
-                    if recurrence.get("every_minutes") is not None:
-                        recurrence["every_seconds"] = int(recurrence["every_minutes"]) * 60
-                    elif recurrence.get("every_hours") is not None:
-                        recurrence["every_seconds"] = int(recurrence["every_hours"]) * 3600
-            rem_id = db_add_reminder_recurring(user_id, title, body, recurrence, user_tz)
-            schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
-            if (recurrence.get("type") or "").lower() == "interval":
-                seconds = int(recurrence.get("every_seconds") or 60)
-                text = f"⏰ Окей, буду напоминать «{title}» {human_interval(seconds)}"
-            elif (recurrence.get("type") or "").lower() == "weekly":
-                text = f"⏰ Окей, буду напоминать «{title}» {ru_weekday(recurrence.get('weekday'))} в {recurrence.get('time')}"
-            elif (recurrence.get("type") or "").lower() == "daily":
-                text = f"⏰ Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
-            else:
-                text = f"⏰ Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, text, reply_markup=kb)
-
-        if not dt_iso_local:
-            return await safe_reply(update, "Не понял время. Напиши, например: «сегодня 18:30».")
-        when_local = dparser.isoparse(dt_iso_local)
-        if when_local.tzinfo is None:
-            when_local = when_local.replace(tzinfo=tzinfo_from_user(user_tz))
-        when_iso_utc = iso_utc(when_local)
-        rem_id = db_add_reminder_oneoff(user_id, title, body, when_iso_utc)
-        schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
-        dt_local = to_user_local(when_iso_utc, user_tz)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-        return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
-                                reply_markup=kb)
-
-    await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+# ---------- Error handler (глобальный) ----------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error in PTB")
+    try:
+        if isinstance(update, Update):
+            await safe_reply(update, "Случилась ошибка. Попробуй ещё раз 🙏")
+    except Exception:
+        pass
 
 # ---------- Startup ----------
 async def on_startup(app: Application):
@@ -789,6 +821,9 @@ def main():
            .token(BOT_TOKEN)
            .post_init(on_startup)
            .build())
+
+    # Глобальный error-handler
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
