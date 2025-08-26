@@ -39,8 +39,7 @@ app.add_handler(MessageHandler(
     F.Document.FileExtension("webm") |
     F.Document.FileExtension("mp4"),
     handle_any_audio
-))
-
+)
 # ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
