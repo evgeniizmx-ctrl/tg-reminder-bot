@@ -571,7 +571,7 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
     dt_local = to_user_local(when_iso_utc, tz)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+    await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -592,7 +592,7 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
             schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
+            return await safe_reply(update, f"⏰ Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
                                     reply_markup=kb)
     context.user_data["__auto_answer"] = choice
     await handle_text(update, context)
