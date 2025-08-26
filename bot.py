@@ -507,20 +507,26 @@ async def cb_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"Часовой пояс установлен: {value}\nТеперь напиши что и когда напомнить.")
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показываем список: каждый элемент отдельным сообщением со своей кнопкой 'Удалить'."""
     user_id = update.effective_user.id
     rows = db_future(user_id)
     if not rows:
         return await safe_reply(update, "Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
 
     tz = db_get_user_tz(user_id) or "+03:00"
-    header = "🗓 Ближайшие напоминания —"
-    kb_rows = []
+
+    # Заголовок без клавиатуры (чтобы не сужал ширину кнопок элементов)
+    await safe_reply(update, "🗓 Ближайшие напоминания —")
+
+    # Каждый элемент — отдельное сообщение + своя кнопка "Удалить"
     for r in rows:
         line = format_reminder_line(r, tz)
-        # одна кнопка в строке — максимум ширины
-        kb_rows.append([InlineKeyboardButton(f"🗑 {line}", callback_data=f"del:{r['id']}")])
-
-    await safe_reply(update, header, reply_markup=InlineKeyboardMarkup(kb_rows))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{r['id']}")]
+        ])
+        await safe_reply(update, line, reply_markup=kb)
+        # Небольшая пауза, чтобы не поймать flood limit
+        await asyncio.sleep(0.05)
 
 async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
