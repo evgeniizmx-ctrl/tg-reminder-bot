@@ -24,22 +24,23 @@ from telegram import (
 # Хэндлеры аудио/войсов/документов/кружков
 from telegram.ext import filters as F
 
-app.add_handler(MessageHandler)
-    F.VOICE | F.AUDIO | F.VIDEO_NOTE |
-    F.Document.MimeType("audio/ogg") |
-    F.Document.MimeType("audio/mpeg") |
-    F.Document.MimeType("audio/mp4") |
-    F.Document.MimeType("audio/x-m4a") |
-    F.Document.MimeType("audio/webm") |
-    F.Document.FileExtension("ogg") |
-    F.Document.FileExtension("oga") |
-    F.Document.FileExtension("mp3") |
-    F.Document.FileExtension("m4a") |
-    F.Document.FileExtension("wav") |
-    F.Document.FileExtension("webm") |
-    F.Document.FileExtension("mp4"),
+app.add_handler(MessageHandler(
+    F.VOICE | F.AUDIO | F.VIDEO_NOTE
+    | F.Document.MimeType("audio/ogg")
+    | F.Document.MimeType("audio/mpeg")
+    | F.Document.MimeType("audio/mp4")
+    | F.Document.MimeType("audio/x-m4a")
+    | F.Document.MimeType("audio/webm")
+    | F.Document.FileExtension("ogg")
+    | F.Document.FileExtension("oga")
+    | F.Document.FileExtension("mp3")
+    | F.Document.FileExtension("m4a")
+    | F.Document.FileExtension("wav")
+    | F.Document.FileExtension("webm")
+    | F.Document.FileExtension("mp4"),
     handle_any_audio
-)
+))
+
 # ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO,
