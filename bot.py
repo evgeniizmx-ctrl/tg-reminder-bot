@@ -442,9 +442,9 @@ def _format_interval_phrase(unit: str, n: int) -> str:
     unit = (unit or "").lower()
     n = int(n or 1)
     if unit == "second":
-        return "каждую сек" if n == 1 else f"каждые {n} сек"
+        return "каждую секунду" if n == 1 else f"каждые {n} сек"
     if unit == "minute":
-        return "каждую мин" if n == 1 else f"каждые {n} мин"
+        return "каждую минуту" if n == 1 else f"каждые {n} мин"
     # hour
     return "каждый час" if n == 1 else f"каждые {n} часов"
 
