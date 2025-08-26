@@ -523,7 +523,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         line = format_reminder_line(r, tz)
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🗑 Удалить напоминание{PAD}", callback_data=f"del:{r['id']}")]
+            [InlineKeyboardButton(f"🗑 Удалить {PAD}", callback_data=f"del:{r['id']}")]
         ])
         await safe_reply(update, line, reply_markup=kb)
         await asyncio.sleep(0.05)
