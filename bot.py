@@ -13,6 +13,7 @@ import tempfile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger  # ✅ добавлено
 from dateutil import parser as dparser
 
 from telegram import (
@@ -69,7 +70,7 @@ def db_init():
                 when_iso text,                   -- UTC ISO
                 status text default 'scheduled',
                 kind text default 'oneoff',      -- 'oneoff' | 'recurring'
-                recurrence_json text             -- JSON {type,weekday,day,time,tz}
+                recurrence_json text             -- JSON {type,weekday,day,month,time,unit,n,start_at,tz}
             )
         """)
         try: conn.execute("alter table reminders add column kind text default 'oneoff'")
@@ -341,20 +342,58 @@ def schedule_oneoff(rem_id: int, user_id: int, when_iso_utc: str, title: str, ki
 def schedule_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, tz_str: str):
     sch = ensure_scheduler()
     tzinfo = tzinfo_from_user(tz_str)
-    rtype = recurrence.get("type"); time_str = recurrence.get("time"); hh, mm = map(int, time_str.split(":"))
+    rtype = recurrence.get("type")
+    time_str = recurrence.get("time")
+
+    trigger = None
+
     if rtype == "daily":
+        hh, mm = map(int, time_str.split(":"))
         trigger = CronTrigger(hour=hh, minute=mm, timezone=tzinfo)
     elif rtype == "weekly":
+        hh, mm = map(int, time_str.split(":"))
         trigger = CronTrigger(day_of_week=recurrence.get("weekday"), hour=hh, minute=mm, timezone=tzinfo)
-    else:
+    elif rtype == "monthly":
+        hh, mm = map(int, time_str.split(":"))
         trigger = CronTrigger(day=int(recurrence.get("day")), hour=hh, minute=mm, timezone=tzinfo)
+    elif rtype == "yearly":
+        hh, mm = map(int, time_str.split(":"))
+        trigger = CronTrigger(month=int(recurrence.get("month")), day=int(recurrence.get("day")),
+                              hour=hh, minute=mm, timezone=tzinfo)
+    elif rtype == "interval":
+        # поддержка интервальных напоминаний
+        unit = (recurrence.get("unit") or "minute").lower()
+        n = int(recurrence.get("n") or 1)
+        start_at_iso = recurrence.get("start_at")
+        start_dt = dparser.isoparse(start_at_iso) if start_at_iso else datetime.now(tzinfo)
+        # IntervalTrigger принимает отдельные параметры
+        kwargs = {"start_date": start_dt, "timezone": tzinfo}
+        if unit == "second":
+            kwargs["seconds"] = n
+        elif unit == "minute":
+            kwargs["minutes"] = n
+        elif unit == "hour":
+            kwargs["hours"] = n
+        else:
+            raise ValueError(f"Unsupported interval unit: {unit}")
+        trigger = IntervalTrigger(**kwargs)
+    else:
+        # fallback: пытаемся как monthly
+        if time_str:
+            hh, mm = map(int, time_str.split(":"))
+            trigger = CronTrigger(day=int(recurrence.get("day", 1)), hour=hh, minute=mm, timezone=tzinfo)
+
+    if trigger is None:
+        log.error("Unsupported recurrence: %s", recurrence)
+        return
+
     sch.add_job(
         fire_reminder, trigger,
         id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=600, coalesce=True,
         kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "kind": "recurring"},
         name=f"rem {rem_id}",
     )
-    log.info("Scheduled recurring id=%s (%s %s, tz=%s)", rem_id, rtype, time_str, tz_str)
+    log.info("Scheduled recurring id=%s (%s), tz=%s", rem_id, rtype, tz_str)
     sch.print_jobs()
 
 def reschedule_all():
@@ -385,6 +424,30 @@ def ru_weekly_phrase(weekday_code: str) -> str:
     det, word = mapping.get((weekday_code or "").lower(), ("каждый", weekday_code or "день"))
     return f"{det} {word}"
 
+def _ru_month_genitive(m: int) -> str:
+    names = {
+        1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
+        7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"
+    }
+    return names.get(int(m), str(m))
+
+def _ru_interval_phrase(unit: str, n: int) -> str:
+    unit = (unit or "minute").lower()
+    n = int(n or 1)
+    if unit == "second":
+        if n == 1: return "каждую секунду"
+        if 2 <= n % 100 <= 4 and not 12 <= n % 100 <= 14: return f"каждые {n} секунды"
+        return f"каждые {n} секунд"
+    if unit == "minute":
+        if n == 1: return "каждую минуту"
+        if 2 <= n % 100 <= 4 and not 12 <= n % 100 <= 14: return f"каждые {n} минуты"
+        return f"каждые {n} минут"
+    if unit == "hour":
+        if n == 1: return "каждый час"
+        if 2 <= n % 100 <= 4 and not 12 <= n % 100 <= 14: return f"каждые {n} часа"
+        return f"каждые {n} часов"
+    return f"каждые {n} {unit}"
+
 def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
     title = row["title"]
     kind = row["kind"] or "oneoff"
@@ -394,11 +457,23 @@ def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
     rec = json.loads(row["recurrence_json"]) if row["recurrence_json"] else {}
     rtype = rec.get("type")
     time_str = rec.get("time") or "00:00"
+
     if rtype == "daily":
         return f"каждый день в {time_str} — «{title}»"
     if rtype == "weekly":
         wd = ru_weekly_phrase(rec.get("weekday", ""))
         return f"{wd} в {time_str} — «{title}»"
+    if rtype == "monthly":
+        day = rec.get("day")
+        return f"каждое {day}-е число в {time_str} — «{title}»"
+    if rtype == "yearly":
+        day = rec.get("day")
+        month = rec.get("month")
+        return f"каждый {int(day)} { _ru_month_genitive(int(month)) } в {time_str} — «{title}»"
+    if rtype == "interval":
+        phrase = _ru_interval_phrase(rec.get("unit"), rec.get("n"))
+        return f"{phrase} — «{title}»"
+    # fallback (старые записи)
     day = rec.get("day")
     return f"каждое {day}-е число в {time_str} — «{title}»"
 
@@ -447,6 +522,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_rows = []
     for r in rows:
         line = format_reminder_line(r, tz)
+        # одна ШИРОКАЯ кнопка на строку — «корзина как часть текста» (единое действие: удалить)
         kb_rows.append([InlineKeyboardButton(f"🗑 {line}", callback_data=f"del:{r['id']}")])
 
     await safe_reply(update, header, reply_markup=InlineKeyboardMarkup(kb_rows))
@@ -655,8 +731,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = f"🔔🔔 Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
             elif rtype == "weekly":
                 text = f"🔔🔔 Окей, буду напоминать «{title}» {ru_weekly_phrase(recurrence.get('weekday'))} в {recurrence.get('time')}"
-            else:
+            elif rtype == "monthly":
                 text = f"🔔🔔 Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
+            elif rtype == "yearly":
+                text = f"🔔🔔 Окей, буду напоминать «{title}» каждый {int(recurrence.get('day'))} { _ru_month_genitive(int(recurrence.get('month'))) } в {recurrence.get('time')}"
+            elif rtype == "interval":
+                text = f"🔔🔔 Окей, буду напоминать «{title}» { _ru_interval_phrase(recurrence.get('unit'), recurrence.get('n')) }"
+            else:
+                text = f"🔔🔔 Окей, напоминание «{title}» создано"
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
             return await safe_reply(update, text, reply_markup=kb)
 
