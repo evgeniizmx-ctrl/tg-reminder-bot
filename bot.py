@@ -427,86 +427,120 @@ def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
 async def _download_tg_file(f: File, dest_path: str):
     await f.download_to_drive(custom_path=dest_path)
 
+ADMIN_IDS = { }  # при желании добавь сюда свой telegram id, например: {123456789}
+
 async def handle_any_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        message = update.message
-        voice = message.voice
-        audio = message.audio
-        vnote = message.video_note
+        msg = update.message
+        voice = msg.voice
+        audio = msg.audio
+        vnote = msg.video_note
 
         if not (voice or audio or vnote):
             return
 
         tgfile: File
-        mime = None
         if voice:
             tgfile = await voice.get_file()
-            mime = "audio/ogg"  # Telegram voice обычно .oga/ogg (Opus)
+            kind = "voice"
         elif audio:
             tgfile = await audio.get_file()
-            mime = audio.mime_type or "application/octet-stream"
+            kind = "audio"
         else:
             tgfile = await vnote.get_file()
-            mime = "video/mp4"  # Telegram circle video; аудиодорожка есть
+            kind = "video_note"
 
         with tempfile.TemporaryDirectory() as td:
-            src = os.path.join(td, f"in_{message.message_id}")
-            dst = os.path.join(td, f"out_{message.message_id}.wav")
+            src = os.path.join(td, f"in_{msg.message_id}")
+            dst = os.path.join(td, f"out_{msg.message_id}.wav")
 
             await _download_tg_file(tgfile, src)
-            log.info("audio: downloaded to %s mime=%s", src, mime)
+            log.info("audio: downloaded kind=%s path=%s", kind, src)
 
             client = get_openai()
 
-            # 1) Попытка скормить как есть (OpenAI сам много умеет)
+            async def _send_diag(text: str):
+                log.warning(text)
+                if ADMIN_IDS and update.effective_user.id in ADMIN_IDS:
+                    try:
+                        await msg.reply_text("🛠 " + text)
+                    except Exception:
+                        pass
+
+            # — 1. Пытаемся скормить как есть (часто .oga тоже ест)
             try:
                 with open(src, "rb") as f:
-                    tr = client.audio.transcriptions.create(
+                    try:
+                        tr = client.audio.transcriptions.create(
+                            model="gpt-4o-mini-transcribe",
+                            file=f,
+                            response_format="text",
+                        )
+                    except Exception as e:
+                        await _send_diag(f"audio: 4o-mini-transcribe failed: {e!s}")
+                        tr = None
+                if tr:
+                    text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+                    text = (text or "").strip()
+                    if text:
+                        log.info("audio: transcribed via 4o-mini-transcribe: %s", text)
+                        msg.text = text
+                        return await handle_text(update, context)
+            except Exception as e:
+                await _send_diag(f"audio: direct 4o-mini-transcribe exception: {e!s}")
+
+            # — 2. Пробуем сразу whisper-1 без конвертации
+            try:
+                with open(src, "rb") as f:
+                    trw = client.audio.transcriptions.create(
                         model="whisper-1",
                         file=f,
-                        response_format="text"
+                        response_format="text",
                     )
-                text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+                text = trw if isinstance(trw, str) else getattr(trw, "text", "")
                 text = (text or "").strip()
                 if text:
-                    log.info("audio: transcribed (as-is): %s", text)
-                    update.message.text = text
+                    log.info("audio: transcribed via whisper-1 (raw): %s", text)
+                    msg.text = text
                     return await handle_text(update, context)
             except Exception as e:
-                log.warning("audio: direct Whisper failed, will ffmpeg. err=%s", e)
+                await _send_diag(f"audio: whisper-1 raw failed: {e!s}")
 
-            # 2) Конверсия в wav 16k mono через ffmpeg
+            # — 3. Конвертируем в wav 16k mono → whisper-1
             cmd = ["ffmpeg", "-y", "-i", src, "-ac", "1", "-ar", "16000", dst]
             log.info("audio: ffmpeg cmd: %s", " ".join(cmd))
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
             )
             rc = await proc.wait()
             if rc != 0 or not os.path.exists(dst):
-                log.error("audio: ffmpeg convert failed rc=%s", rc)
-                return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+                await _send_diag(f"audio: ffmpeg convert failed rc={rc}")
+                return await msg.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
-            with open(dst, "rb") as f:
-                try:
+            try:
+                with open(dst, "rb") as f:
                     tr = client.audio.transcriptions.create(
                         model="whisper-1",
                         file=f,
-                        response_format="text"
+                        response_format="text",
                     )
-                    text = tr if isinstance(tr, str) else getattr(tr, "text", "")
-                    text = (text or "").strip()
-                    if not text:
-                        return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
-                    log.info("audio: transcribed (ffmpeg): %s", text)
-                    update.message.text = text
-                    return await handle_text(update, context)
-                except Exception as e:
-                    log.exception("audio: Whisper after ffmpeg failed: %s", e)
-                    return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+                text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+                text = (text or "").strip()
+                if not text:
+                    await _send_diag("audio: whisper-1 (wav) returned empty text")
+                    return await msg.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+                log.info("audio: transcribed via whisper-1 (wav): %s", text)
+                msg.text = text
+                return await handle_text(update, context)
+            except Exception as e:
+                await _send_diag(f"audio: whisper-1 after ffmpeg failed: {e!s}")
+                return await msg.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
     except Exception as e:
         log.exception("handle_any_audio failed: %s", e)
-        return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+        return await update.message.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
 # ---------- Handlers ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
