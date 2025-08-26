@@ -1,890 +1,739 @@
+# bot.py
 import os
 import re
 import json
-import yaml
 import sqlite3
-import asyncio
 import logging
+import sys
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List
 from zoneinfo import ZoneInfo
-
-import pytz  # noqa: F401  (оставлено как в исходнике)
-from pydantic import BaseModel  # noqa: F401
-from openai import OpenAI
+import asyncio
+import tempfile
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.triggers.cron import CronTrigger
+from dateutil import parser as dparser
 
 from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 
-# --------------------------- logging ---------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("reminder-bot")
-
-# --------------------------- env ---------------------------
-TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or ""
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_APIKEY") or ""
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-PROMPTS_PATH = os.getenv("PROMPTS_PATH", "prompts.yaml")
-DEFAULT_TZ = os.getenv("DEFAULT_TZ", "+03:00")  # как и раньше
-
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN missing")
-if not OPENAI_API_KEY:
-    log.warning("OPENAI_API_KEY missing — LLM parsing will fail.")
-if not BOT_TOKEN:
-    raise RuntimeError("No BOT_TOKEN set")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-openai_client = client  # алиас для совместимости с исходником
-
-# --------------------------- scheduler & db ---------------------------
-scheduler = AsyncIOScheduler(timezone="UTC")
-
-# --------------------------- DB ---------------------------
-DB_PATH = os.getenv("DB_PATH", "reminders.db")
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-conn.row_factory = sqlite3.Row
-cur = conn.cursor()
-
-# Приведён к валидному SQL: в исходнике было несколько перепутанных execute/кавычек.
-cur.execute(
-    """
-CREATE TABLE IF NOT EXISTS reminders (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  chat_id INTEGER NOT NULL,
-  title TEXT NOT NULL,
-  when_ts INTEGER,               -- unix ts для одноразовых и "время суток" старта для периодики
-  tz TEXT,                       -- "+03:00"
-  repeat TEXT DEFAULT 'none',    -- 'none'|'daily'|'weekly'|'monthly'
-  day_of_week INTEGER,           -- 1..7 (Пн..Вс) для weekly
-  day_of_month INTEGER,          -- 1..31 для monthly
-  state TEXT DEFAULT 'active',   -- 'active'|'done'|'cancelled'
-  iso TEXT,                      -- для one-shot в ISO
-  recurrence TEXT,               -- json: {"type": "...", "weekday": "...", "day": 5, "time":"HH:MM", "tz":"+03:00"}
-  created_at TEXT
-);
-"""
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
 )
-conn.commit()
+log = logging.getLogger("planner-bot")
 
-# --------------------------- Меню ---------------------------
-MAIN_MENU = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("📋 Список напоминаний")],
-        [KeyboardButton("⚙️ Настройки")],
-    ],
-    resize_keyboard=True,
-)
+# ---------- ENV ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+PROMPTS_PATH = os.environ.get("PROMPTS_PATH", "prompts.yaml")
+DB_PATH = os.environ.get("DB_PATH", "reminders.db")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")  # можно выставить gpt-4o-mini-transcribe
 
-# --------------------------- PROMPTS ---------------------------
-class PromptPack:
-    def __init__(self, data: dict):
-        # В исходнике было две разные версии; объединил безопасно
-        self.system = data.get("system", "")
-        parse = data.get("parse", {}) or {}
-        self.parse_system = parse.get("system", "")
-        self.fewshot = data.get("fewshot", []) or []
-        self.parse = parse  # чтобы старые обращения PROMPTS.parse.get(...) не падали
+missing = []
+if not BOT_TOKEN: missing.append("BOT_TOKEN")
+if not OPENAI_API_KEY: missing.append("OPENAI_API_KEY")
+if not os.path.exists(PROMPTS_PATH): missing.append(f"{PROMPTS_PATH} (prompts.yaml)")
+if missing:
+    log.error("Missing required environment/files: %s", ", ".join(missing))
+    sys.exit(1)
 
+# ---------- DB ----------
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def load_prompts() -> PromptPack:
-    path = PROMPTS_PATH
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
-    pp = PromptPack(raw)
-    log.info("Prompts loaded: system=%s... | fewshot=%d", (pp.system or "")[:30], len(pp.fewshot))
-    return pp
+def db_init():
+    with db() as conn:
+        conn.execute("""
+            create table if not exists users (
+                user_id integer primary key,
+                tz text
+            )
+        """)
+        conn.execute("""
+            create table if not exists reminders (
+                id integer primary key autoincrement,
+                user_id integer not null,
+                title text not null,
+                body text,
+                when_iso text,                   -- UTC ISO
+                status text default 'scheduled',
+                kind text default 'oneoff',      -- 'oneoff' | 'recurring'
+                recurrence_json text             -- JSON {type,weekday,day,time,tz}
+            )
+        """)
+        try: conn.execute("alter table reminders add column kind text default 'oneoff'")
+        except Exception: pass
+        try: conn.execute("alter table reminders add column recurrence_json text")
+        except Exception: pass
+        conn.commit()
 
+def db_get_user_tz(user_id: int) -> str | None:
+    with db() as conn:
+        row = conn.execute("select tz from users where user_id=?", (user_id,)).fetchone()
+        return row["tz"] if row and row["tz"] else None
 
-PROMPTS = load_prompts()
+def db_set_user_tz(user_id: int, tz: str):
+    with db() as conn:
+        conn.execute(
+            "insert into users(user_id, tz) values(?, ?) "
+            "on conflict(user_id) do update set tz=excluded.tz",
+            (user_id, tz)
+        )
+        conn.commit()
 
-# --------------------------- ДАТЫ/ВРЕМЯ ---------------------------
-def ensure_tz_offset(s: Optional[str]) -> str:
-    if not s:
-        return "+03:00"
-    m = re.fullmatch(r"[+-]\d{2}:\d{2}", s.strip())
-    return s.strip() if m else "+03:00"
+def db_add_reminder_oneoff(user_id: int, title: str, body: str | None, when_iso_utc: str) -> int:
+    with db() as conn:
+        cur = conn.execute(
+            "insert into reminders(user_id,title,body,when_iso,kind) values(?,?,?,?,?)",
+            (user_id, title, body, when_iso_utc, 'oneoff')
+        )
+        conn.commit()
+        return cur.lastrowid
 
+def db_add_reminder_recurring(user_id: int, title: str, body: str | None, recurrence: dict, tz: str) -> int:
+    rec = dict(recurrence or {})
+    rec["tz"] = tz
+    with db() as conn:
+        cur = conn.execute(
+            "insert into reminders(user_id,title,body,when_iso,kind,recurrence_json) values(?,?,?,?,?,?)",
+            (user_id, title, body, None, 'recurring', json.dumps(rec, ensure_ascii=False))
+        )
+        conn.commit()
+        return cur.lastrowid
 
-def now_iso_with_tz(tz_offset: str) -> str:
-    sign = 1 if tz_offset.startswith("+") else -1
-    hh, mm = map(int, tz_offset[1:].split(":"))
-    off = timezone(timedelta(minutes=sign * (hh * 60 + mm)))
-    return datetime.now(off).replace(microsecond=0).isoformat()
+def db_mark_done(rem_id: int):
+    with db() as conn:
+        conn.execute("update reminders set status='done' where id=?", (rem_id,))
+        conn.commit()
 
+def db_snooze(rem_id: int, minutes: int):
+    with db() as conn:
+        row = conn.execute("select when_iso, kind from reminders where id=?", (rem_id,)).fetchone()
+        if not row:
+            return None, None
+        if row["kind"] == "recurring":
+            return "recurring", None
+        dt = parse_iso(row["when_iso"]) + timedelta(minutes=minutes)
+        new_iso = iso_utc(dt)
+        conn.execute("update reminders set when_iso=?, status='scheduled' where id=?", (new_iso, rem_id))
+        conn.commit()
+        return "oneoff", dt
 
-def iso_to_unix(iso_str: str) -> int:
-    dt = datetime.fromisoformat(iso_str)
-    return int(dt.timestamp())
+def db_delete(rem_id: int):
+    with db() as conn:
+        conn.execute("delete from reminders where id=?", (rem_id,))
+        conn.commit()
 
+def db_future(user_id: int):
+    with db() as conn:
+        return conn.execute(
+            "select * from reminders where user_id=? and status='scheduled' order by id desc",
+            (user_id,)
+        ).fetchall()
 
-def unix_to_local_str(ts: int, tz_offset: str) -> str:
-    sign = 1 if tz_offset.startswith("+") else -1
-    hh, mm = map(int, tz_offset[1:].split(":"))
-    off = timezone(timedelta(minutes=sign * (hh * 60 + mm)))
-    dt = datetime.fromtimestamp(ts, tz=off)
-    return dt.strftime("%d.%m %H:%M")
+def db_get_reminder(rem_id: int):
+    with db() as conn:
+        return conn.execute("select * from reminders where id=?", (rem_id,)).fetchone()
 
+# ---------- TZ / ISO ----------
+def tzinfo_from_user(tz_str: str) -> timezone | ZoneInfo:
+    tz_str = (tz_str or "+03:00").strip()
+    if tz_str[0] in "+-":
+        m = re.fullmatch(r"([+-])(\d{1,2})(?::?(\d{2}))?$", tz_str)
+        if not m: raise ValueError("invalid offset")
+        sign, hh, mm = m.group(1), int(m.group(2)), int(m.group(3) or 0)
+        delta = timedelta(hours=hh, minutes=mm)
+        if sign == "-": delta = -delta
+        return timezone(delta)
+    return ZoneInfo(tz_str)
 
-def build_today_time_iso(tz_offset: str, hhmm: str) -> str:
-    sign = 1 if tz_offset.startswith("+") else -1
-    hh_off, mm_off = map(int, tz_offset[1:].split(":"))
-    off = timezone(timedelta(minutes=sign * (hh_off * 60 + mm_off)))
-    now = datetime.now(off)
-    h, m = map(int, hhmm.split(":"))
-    dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    if dt <= now:
-        dt += timedelta(days=1)
+def now_in_user_tz(tz_str: str) -> datetime:
+    return datetime.now(tzinfo_from_user(tz_str))
+
+def iso_utc(dt: datetime) -> str:
+    if dt.tzinfo is None: raise ValueError("aware dt required")
+    dt = dt.astimezone(timezone.utc).replace(microsecond=0)
     return dt.isoformat()
 
+def parse_iso(s: str) -> datetime:
+    return dparser.isoparse(s)
 
-def now_iso_with_offset(offset_str: str) -> str:
-    now_utc = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
-    sign = 1 if offset_str.startswith("+") else -1
-    hh, mm = map(int, offset_str[1:].split(":"))
-    delta = timedelta(hours=hh, minutes=mm)
-    local = now_utc + sign * delta
-    return local.isoformat(timespec="seconds")
+def to_user_local(utc_iso: str, user_tz: str) -> datetime:
+    return parse_iso(utc_iso).astimezone(tzinfo_from_user(user_tz))
 
+# ---------- UI ----------
+MAIN_MENU_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📝 Список напоминаний"), KeyboardButton("⚙️ Настройки")]],
+    resize_keyboard=True, one_time_keyboard=False
+)
 
-def parse_weekday_to_cron(weekday: str) -> str:
-    # APS CronTrigger поддерживает 'mon,tue,...'
-    return weekday
-
-# --------------------------- Отправка уведомления ---------------------------
-async def send_reminder(bot, chat_id: int, title: str):
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Через 10 мин", callback_data="snz:10"),
-                InlineKeyboardButton("Через 1 час", callback_data="snz:60"),
-            ],
-            [InlineKeyboardButton("✅", callback_data="done")],
-        ]
-    )
-    await bot.send_message(chat_id, f"🔔 «{title}»", reply_markup=kb)
-
-# --------------------------- Планировщик добавления задач ---------------------------
-def add_one_shot_job(app: Application, chat_id: int, title: str, iso: str):
-    dt = datetime.fromisoformat(iso)
-    trigger = DateTrigger(run_date=dt)
-    scheduler.add_job(
-        send_reminder,
-        trigger=trigger,
-        args=[app.bot, chat_id, title],
-        id=f"one:{chat_id}:{iso}:{title}",
-        replace_existing=True,
-        misfire_grace_time=60,
-    )
-
-def add_recurrence_job(app: Application, chat_id: int, title: str, rec: dict, tz: str):
-    t = rec.get("type")
-    time_str = rec.get("time")
-    hh, mm = map(int, time_str.split(":"))
-    if t == "daily":
-        trig = CronTrigger(hour=hh, minute=mm)
-    elif t == "weekly":
-        dow = parse_weekday_to_cron(rec.get("weekday"))
-        trig = CronTrigger(day_of_week=dow, hour=hh, minute=mm)
-    elif t == "monthly":
-        day = int(rec.get("day"))
-        trig = CronTrigger(day=day, hour=hh, minute=mm)
-    else:
-        return
-
-    scheduler.add_job(
-        send_reminder,
-        trigger=trig,
-        args=[app.bot, chat_id, title],
-        id=f"rec:{chat_id}:{title}:{json.dumps(rec, ensure_ascii=False)}",
-        replace_existing=False,
-        misfire_grace_time=300,
-    )
-
-# --------------------------- LLM ---------------------------
-async def call_llm(user_text: str, tz: str, followup: bool = False) -> dict:
-    tz = ensure_tz_offset(tz)
-    now_iso = now_iso_with_offset(tz)
-
-    messages = []
-    if PROMPTS.system:
-        messages.append({"role": "system", "content": PROMPTS.system})
-    messages.append({"role": "system", "content": f"NOW_ISO={now_iso}  TZ_DEFAULT={tz}"})
-    if PROMPTS.parse_system:
-        messages.append({"role": "system", "content": PROMPTS.parse_system})
-    for ex in PROMPTS.fewshot:
-        messages.append(ex)
-
-    if followup:
-        messages.append(
-            {
-                "role": "system",
-                "content": "Это продолжение с ответом на уточняющий вопрос. Верни чистый JSON.",
-            }
-        )
-
-    messages.append({"role": "user", "content": user_text})
-
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
-        temperature=0.2,
-        response_format={"type": "json_object"},
-    )
-    try:
-        data = json.loads(resp.choices[0].message.content)
-        return data
-    except Exception as e:
-        log.exception("LLM parse error: %s", e)
-        return {
-            "intent": "chat",
-            "title": "Напоминание",
-            "fixed_datetime": None,
-            "recurrence": None,
-        }
-
-# --------------------------- Уточнения ---------------------------
-PENDING: Dict[int, Dict[str, Any]] = {}  # user_id -> {"pending":{}, "clarify_count":int}
-MAX_CLARIFY = 2
-
-def upsert_pending(user_id: int, payload: dict):
-    d = PENDING.get(user_id, {"pending": {}, "clarify_count": 0})
-    pen = d["pending"]
-    for k in ["title", "description", "timezone", "fixed_datetime", "repeat", "day_of_week", "day_of_month"]:
-        if payload.get(k) is not None:
-            pen[k] = payload[k]
-    PENDING[user_id] = {"pending": pen, "clarify_count": d["clarify_count"]}
-
-
-def inc_clarify(user_id: int):
-    d = PENDING.get(user_id, {"pending": {}, "clarify_count": 0})
-    d["clarify_count"] += 1
-    PENDING[user_id] = d
-
-
-def render_options_keyboard(options: List[dict], cb_prefix: str = "clarify") -> InlineKeyboardMarkup:
-    rows, row = [], []
-    for i, opt in enumerate(options):
-        data = {
-            "iso": opt.get("iso_datetime") or "",
-            "dow": str(opt.get("day_of_week") or ""),
-            "dom": str(opt.get("day_of_month") or ""),
-        }
-        cb_data = f"{cb_prefix}:{data['iso']}:{data['dow']}:{data['dom']}"
-        label = opt.get("label", "…")
-        row.append(InlineKeyboardButton(label, callback_data=cb_data))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+_TZ_ROWS = [
+    ["Калининград (+2)", "Москва (+3)"],
+    ["Самара (+4)", "Екатеринбург (+5)"],
+    ["Омск (+6)", "Новосибирск (+7)"],
+    ["Иркутск (+8)", "Якутск (+9)"],
+    ["Хабаровск (+10)", "Другой…"],
+]
+CITY_TO_OFFSET = {
+    "Калининград (+2)": "+02:00",
+    "Москва (+3)": "+03:00",
+    "Самара (+4)": "+04:00",
+    "Екатеринбург (+5)": "+05:00",
+    "Омск (+6)": "+06:00",
+    "Новосибирск (+7)": "+07:00",
+    "Иркутск (+8)": "+08:00",
+    "Якутск (+9)": "+09:00",
+    "Хабаровск (+10)": "+10:00",
+}
+def build_tz_inline_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for row in _TZ_ROWS:
+        btns = []
+        for label in row:
+            if label == "Другой…":
+                btns.append(InlineKeyboardButton(label, callback_data="tz:other"))
+            else:
+                off = CITY_TO_OFFSET[label]
+                btns.append(InlineKeyboardButton(label, callback_data=f"tz:{off}"))
+        rows.append(btns)
     return InlineKeyboardMarkup(rows)
 
-# --------------------------- CRUD ---------------------------
-def save_reminder_row(
-    user_id: Optional[int],
-    chat_id: int,
-    title: str,
-    when_iso: Optional[str],
-    tz_offset: str,
-    repeat: str = "none",
-    day_of_week: Optional[int] = None,
-    day_of_month: Optional[int] = None,
-    iso: Optional[str] = None,
-    recurrence: Optional[dict] = None,
-) -> int:
-    when_ts = iso_to_unix(when_iso) if when_iso else None
-    cur.execute(
-        """
-        INSERT INTO reminders (user_id, chat_id, title, when_ts, tz, repeat, day_of_week, day_of_month, state, iso, recurrence, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            user_id,
-            chat_id,
-            title,
-            when_ts,
-            tz_offset,
-            repeat,
-            day_of_week,
-            day_of_month,
-            "active",
-            iso,
-            json.dumps(recurrence, ensure_ascii=False) if recurrence else None,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def save_reminder(chat_id: int, title: str, iso: Optional[str], rec: Optional[dict], tz: str) -> bool:
-    conn.execute(
-        "INSERT INTO reminders (chat_id, title, iso, recurrence, created_at) VALUES (?,?,?,?,?)",
-        (
-            chat_id,
-            title,
-            iso,
-            json.dumps({**(rec or {}), "tz": tz}, ensure_ascii=False) if rec else None,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-    conn.commit()
-    return True
-
-
-def snooze_reminder(rem_id: int, minutes: int) -> Optional[int]:
-    cur.execute("SELECT * FROM reminders WHERE id=? AND state='active'", (rem_id,))
-    row = cur.fetchone()
-    if not row:
-        return None
-    new_ts = (row["when_ts"] or int(datetime.utcnow().timestamp())) + minutes * 60
-    cur.execute("UPDATE reminders SET when_ts=? WHERE id=?", (new_ts, rem_id))
-    conn.commit()
-    return new_ts
-
-
-def delete_reminder_row(rem_id: int) -> bool:
-    cur.execute("UPDATE reminders SET state='cancelled' WHERE id=?", (rem_id,))
-    conn.commit()
-    return True
-
-
-def delete_reminder(rem_id: int, chat_id: int) -> bool:
-    c = conn.execute("DELETE FROM reminders WHERE id=? AND chat_id=?", (rem_id, chat_id))
-    conn.commit()
-    return c.rowcount > 0
-
-
-def list_future(chat_id: int):
-    rows = conn.execute(
-        "SELECT id, title, iso, recurrence FROM reminders WHERE chat_id=? ORDER BY id DESC",
-        (chat_id,),
-    ).fetchall()
-    return rows
-
-# --------------------------- Периодика: вычисление next ---------------------------
-def compute_next_fire(row: sqlite3.Row) -> Optional[int]:
-    repeat = row["repeat"]
-    if repeat == "none":
-        return None
-
-    tz_off = ensure_tz_offset(row["tz"] or "+03:00")
-    sign = 1 if tz_off.startswith("+") else -1
-    hh, mm = map(int, tz_off[1:].split(":"))
-    off_minutes = sign * (hh * 60 + mm)
-    off = timezone(timedelta(minutes=off_minutes))
-
-    now_local = datetime.now(off).replace(second=0, microsecond=0)
-    base_time = datetime.fromtimestamp(row["when_ts"], tz=off) if row["when_ts"] else now_local
-
-    if repeat == "daily":
-        nxt = now_local.replace(hour=base_time.hour, minute=base_time.minute, second=0, microsecond=0)
-        if nxt <= now_local:
-            nxt += timedelta(days=1)
-        return int(nxt.astimezone(timezone.utc).timestamp())
-
-    if repeat == "weekly":
-        target_dow = int(row["day_of_week"] or 1)  # 1..7
-        current_dow = now_local.isoweekday()
-        delta = (target_dow - current_dow) % 7
-        nxt = now_local.replace(hour=base_time.hour, minute=base_time.minute, second=0, microsecond=0)
-        if delta == 0 and nxt <= now_local:
-            delta = 7
-        nxt = nxt + timedelta(days=delta)
-        return int(nxt.astimezone(timezone.utc).timestamp())
-
-    if repeat == "monthly":
-        dom = int(row["day_of_month"] or 1)
-        y, m = now_local.year, now_local.month
-        import calendar
-        last = calendar.monthrange(y, m)[1]
-        d = dom if dom <= last else last
-        candidate = now_local.replace(day=d, hour=base_time.hour, minute=base_time.minute, second=0, microsecond=0)
-        if candidate <= now_local:
-            if m == 12:
-                y, m = y + 1, 1
-            else:
-                m += 1
-            last = calendar.monthrange(y, m)[1]
-            d = dom if dom <= last else last
-            candidate = candidate.replace(year=y, month=m, day=d)
-        return int(candidate.astimezone(timezone.utc).timestamp())
-
+async def safe_reply(update: Update, text: str, reply_markup=None):
+    if update and update.message:
+        return await update.message.reply_text(text, reply_markup=reply_markup)
+    chat = update.effective_chat if update else None
+    if chat:
+        return await chat.send_message(text, reply_markup=reply_markup)
     return None
 
+def normalize_offset(sign: str, hh: str, mm: str | None) -> str:
+    return f"{sign}{int(hh):02d}:{int(mm or 0):02d}"
 
-def bump_next(row_id: int, next_ts: Optional[int]):
-    if next_ts:
-        cur.execute("UPDATE reminders SET when_ts=? WHERE id=?", (next_ts, row_id))
-    else:
-        cur.execute("UPDATE reminders SET state='done' WHERE id=?", (row_id,))
-    conn.commit()
+def parse_tz_input(text: str) -> str | None:
+    t = (text or "").strip()
+    if t in CITY_TO_OFFSET: return CITY_TO_OFFSET[t]
+    m = re.fullmatch(r"([+-])(\d{1,2})(?::?(\d{2}))?$", t)
+    if m: return normalize_offset(m.group(1), m.group(2), m.group(3))
+    if "/" in t and " " not in t:
+        try: ZoneInfo(t); return t
+        except Exception: return None
+    return None
 
-# --------------------------- UI helpers ---------------------------
-def format_period_suffix(row: sqlite3.Row) -> str:
-    if row["repeat"] == "none":
-        return ""
-    if row["repeat"] == "daily":
-        return " (каждый день)"
-    if row["repeat"] == "weekly":
-        map_dow = {1: "Пн", 2: "Вт", 3: "Ср", 4: "Чт", 5: "Пт", 6: "Сб", 7: "Вс"}
-        lbl = map_dow.get(row["day_of_week"] or 1, "?")
-        return f" (еженедельно, {lbl})"
-    if row["repeat"] == "monthly":
-        dom = row["day_of_month"] or 1
-        return f" (ежемесячно, {dom} числа)"
-    return ""
+# ---------- Prompts ----------
+import yaml
+def load_prompts():
+    with open(PROMPTS_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+PROMPTS = load_prompts()
 
-# --------------------------- HANDLERS ---------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я напоминалка. Напиши что и когда напомнить.\n"
-        "Например: «завтра в 11 падел», «через 10 минут позвонить», «каждый день в 9 пить таблетки».",
-        reply_markup=MAIN_MENU,
+# ---------- OpenAI ----------
+from openai import OpenAI
+_client = None
+def get_openai():
+    global _client
+    if _client is None:
+        _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    return _client
+
+async def call_llm(user_text: str, user_tz: str, now_iso_override: str | None = None) -> dict:
+    now_local = now_in_user_tz(user_tz)
+    if now_iso_override:
+        try: now_local = dparser.isoparse(now_iso_override)
+        except Exception: pass
+    header = f"NOW_ISO={now_local.replace(microsecond=0).isoformat()}\nTZ_DEFAULT={user_tz or '+03:00'}"
+    messages = [
+        {"role": "system", "content": PROMPTS["system"]},
+        {"role": "system", "content": header},
+        {"role": "system", "content": PROMPTS["parse"]["system"]},
+    ]
+    messages.extend(PROMPTS.get("fewshot") or [])
+    messages.append({"role": "user", "content": user_text})
+    client = get_openai()
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.2
     )
+    txt = resp.choices[0].message.content.strip()
+    m = re.search(r"\{[\s\S]+\}", txt)
+    return json.loads(m.group(0) if m else txt)
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Примеры:\n"
-        "• завтра в 11 падел\n"
-        "• через 10 минут позвонить\n"
-        "• каждый день в 9 пить таблетки\n"
-        "• раз в неделю в среду в 19 — зал\n"
-        "• каждое 5 число месяца в 18 — баня\n",
-        reply_markup=MAIN_MENU,
-    )
+# ---------- Rule-based quick parse ----------
+def _clean_spaces(s: str) -> str: return re.sub(r"\s+", " ", s).strip()
+def _extract_title(text: str) -> str:
+    t = text
+    t = re.sub(r"\b(сегодня|завтра|послезавтра)\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bчерез\b\s+[^,;.]+", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bв\s+\d{1,2}(:\d{2})?\s*(час(?:а|ов)?|ч)?\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\bв\s+\d{1,2}\b", " ", t, flags=re.IGNORECASE)
+    t = _clean_spaces(t.strip(" ,.;—-"))
+    return t.capitalize() if t else "Напоминание"
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tz = context.user_data.get("tz") or DEFAULT_TZ
-    context.user_data["tz"] = tz
-    await update.message.reply_text(
-        "Примеры:\n"
-        "• завтра в 11 падел\n"
-        "• через 10 минут позвонить\n"
-        "• каждый день в 9 пить таблетки\n"
-        "• раз в неделю в среду в 19 — зал\n"
-        "• каждое 5 число месяца в 18 — баня\n\n"
-        f"Часовой пояс установлен: UTC{tz}\nТеперь напиши что и когда напомнить.\n\n"
-        f"Кнопки меню снизу активированы. Можешь нажать или просто написать задачу 👇",
-        reply_markup=ReplyKeyboardMarkup(
-            [[KeyboardButton("📋 Список напоминаний")], [KeyboardButton("⚙️ Настройки")]],
-            resize_keyboard=True,
-        ),
-    )
+def rule_parse(text: str, now_local: datetime):
+    s = text.strip().lower()
+    m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)", s)
+    if m:
+        delta = timedelta()
+        ch = m.group(1)
+        if "полчаса" in ch: delta = timedelta(minutes=30)
+        elif "минуту" in ch: delta = timedelta(minutes=1)
+        elif "мин" in ch: delta = timedelta(minutes=int(re.search(r"\d+", ch).group()))
+        else: delta = timedelta(hours=int(re.search(r"\d+", ch).group()))
+        when_local = now_local + delta
+        return {"intent": "create", "title": _extract_title(text), "when_local": when_local}
+    md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s)
+    mt = re.search(r"\bв\s+(\d{1,2})(?::?(\d{2}))?\s*(час(?:а|ов)?|ч)?\b", s)
+    if md and mt:
+        base = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[md.group(1)]
+        day = (now_local + timedelta(days=base)).date()
+        hh = int(mt.group(1)); mm = int(mt.group(2) or 0)
+        title = _extract_title(text)
+        if mt.group(2) is None and 1 <= hh <= 12:
+            return {"intent":"ask","title":title,"base_date":day.isoformat(),"question":"Уточни, пожалуйста, время",
+                    "variants":[f"{hh:02d}:00", f"{(hh%12)+12:02d}:00"]}
+        when_local = datetime(day.year, day.month, day.day, hh, mm, tzinfo=now_local.tzinfo)
+        return {"intent": "create", "title": title, "when_local": when_local}
+    return None
 
-async def reload_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PROMPTS
+# ---------- Scheduler (APScheduler внутри PTB loop) ----------
+scheduler: AsyncIOScheduler | None = None
+TG_BOT = None  # PTB bot instance для отправки сообщений из APScheduler
+
+async def fire_reminder(*, chat_id: int, rem_id: int, title: str, kind: str = "oneoff"):
     try:
-        PROMPTS = load_prompts()
-        await update.message.reply_text("🔄 Промпты перезагружены.")
+        kb_rows = [[
+            InlineKeyboardButton("Через 10 мин", callback_data=f"snooze:10:{rem_id}"),
+            InlineKeyboardButton("Через 1 час", callback_data=f"snooze:60:{rem_id}")
+        ]]
+        if kind == "oneoff":
+            kb_rows.append([InlineKeyboardButton("✅", callback_data=f"done:{rem_id}")])
+
+        await TG_BOT.send_message(chat_id, f"🔔 «{title}»", reply_markup=InlineKeyboardMarkup(kb_rows))
+        log.info("Fired reminder id=%s to chat=%s", rem_id, chat_id)
     except Exception as e:
-        await update.message.reply_text(f"Ошибка загрузки промптов: {e}")
+        log.exception("fire_reminder failed: %s", e)
 
-async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    cur.execute(
-        "SELECT * FROM reminders WHERE user_id=? AND state='active' ORDER BY when_ts IS NULL, when_ts ASC",
-        (user_id,),
+def ensure_scheduler() -> AsyncIOScheduler:
+    if scheduler is None:
+        raise RuntimeError("Scheduler not initialized yet")
+    return scheduler
+
+def schedule_oneoff(rem_id: int, user_id: int, when_iso_utc: str, title: str, kind: str = "oneoff"):
+    sch = ensure_scheduler()
+    dt_utc = parse_iso(when_iso_utc)
+    sch.add_job(
+        fire_reminder, DateTrigger(run_date=dt_utc),
+        id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=300, coalesce=True,
+        kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "kind": kind},
+        name=f"rem {rem_id}",
     )
-    rows = cur.fetchall()
-    if not rows:
-        await update.message.reply_text("Пока нет активных напоминаний.")
-        return
-    for r in rows:
-        tz = r["tz"] or "+03:00"
-        when_s = "-" if r["when_ts"] is None else unix_to_local_str(r["when_ts"], tz)
-        suffix = format_period_suffix(r)
-        text = f"• {r['title']}\n   ⏱ {when_s}{suffix}"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{r['id']}")]])
-        await update.message.reply_text(text, reply_markup=kb)
+    log.info("Scheduled oneoff id=%s at %s UTC (title=%s)", rem_id, dt_utc.isoformat(), title)
+    sch.print_jobs()
 
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    rows = list_future(chat_id)
-    if not rows:
-        await update.message.reply_text("Будущих напоминаний нет.")
-        return
-
-    lines = ["🗒 Ближайшие напоминания:"]
-    kb_rows = []
-    for rid, title, iso, rec_json in rows:
-        if iso:
-            lines.append(f"• {iso} — «{title}»")
-        else:
-            r = json.loads(rec_json)
-            t = r.get("time")
-            typ = r.get("type")
-            if typ == "daily":
-                lines.append(f"• каждый день в {t} — «{title}»")
-            elif typ == "weekly":
-                lines.append(f"• по {r.get('weekday')} в {t} — «{title}»")
-            else:
-                lines.append(f"• каждое {r.get('day')} в {t} — «{title}»")
-        kb_rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{rid}")])
-    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_rows))
-
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    if txt.startswith("📋"):
-        await cmd_list(update, context)
-    elif txt.startswith("⚙️"):
-        await update.message.reply_text("Настройки пока в разработке.", reply_markup=MAIN_MENU)
+def schedule_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, tz_str: str):
+    sch = ensure_scheduler()
+    tzinfo = tzinfo_from_user(tz_str)
+    rtype = recurrence.get("type"); time_str = recurrence.get("time"); hh, mm = map(int, time_str.split(":"))
+    if rtype == "daily":
+        trigger = CronTrigger(hour=hh, minute=mm, timezone=tzinfo)
+    elif rtype == "weekly":
+        trigger = CronTrigger(day_of_week=recurrence.get("weekday"), hour=hh, minute=mm, timezone=tzinfo)
     else:
-        await handle_text(update, context)
+        trigger = CronTrigger(day=int(recurrence.get("day")), hour=hh, minute=mm, timezone=tzinfo)
+    sch.add_job(
+        fire_reminder, trigger,
+        id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=600, coalesce=True,
+        kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "kind": "recurring"},
+        name=f"rem {rem_id}",
+    )
+    log.info("Scheduled recurring id=%s (%s %s, tz=%s)", rem_id, rtype, time_str, tz_str)
+    sch.print_jobs()
 
-async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    chat_id = query.message.chat_id
-    await query.answer()
-    if data == "done":
-        await query.edit_message_text("✅ Выполнено")
-        return
-    if data.startswith("snz:"):
-        mins = int(data.split(":")[1])
-        await query.edit_message_text(f"⏰ Отложено на {mins} мин")
-        asyncio.create_task(context.bot.send_message(chat_id, f"Напомню через {mins} мин."))
-        return
-    if data.startswith("del:"):
-        rid = int(data.split(":")[1])
-        if delete_reminder(rid, chat_id):
-            await query.edit_message_text("🗑 Удалено")
+def reschedule_all():
+    sch = ensure_scheduler()
+    with db() as conn:
+        rows = conn.execute("select * from reminders where status='scheduled'").fetchall()
+    for r in rows:
+        if (r["kind"] or "oneoff") == "oneoff" and r["when_iso"]:
+            schedule_oneoff(r["id"], r["user_id"], r["when_iso"], r["title"], kind="oneoff")
         else:
-            await query.edit_message_text("Не нашёл напоминание")
-        return
-    if data.startswith("clar:"):
-        idx = int(data.split(":")[1])
-        c = context.user_data.get("clarify")
-        if not c:
-            return
-        variants = c.get("variants") or []
-        picked = variants[idx]
-        original = c["original_text"]
-        merged = f"{original}\nОтвет на уточнение ({c['expects']}): {picked}"
-        result = await call_llm(merged, context.user_data.get("tz", DEFAULT_TZ), followup=True)
-        context.user_data.pop("clarify", None)
-        await apply_llm_result(result, update, context, by_callback=True)
+            rec = json.loads(r["recurrence_json"] or "{}")
+            tz = rec.get("tz") or "+03:00"
+            if rec:
+                schedule_recurring(r["id"], r["user_id"], r["title"], rec, tz)
+    log.info("Rescheduled %d reminders from DB", len(rows))
 
+# ---------- RU wording for weekly + list formatting ----------
+def ru_weekly_phrase(weekday_code: str) -> str:
+    mapping = {
+        "mon": ("каждый", "понедельник"),
+        "tue": ("каждый", "вторник"),
+        "wed": ("каждую", "среду"),
+        "thu": ("каждый", "четверг"),
+        "fri": ("каждую", "пятницу"),
+        "sat": ("каждую", "субботу"),
+        "sun": ("каждое", "воскресенье"),
+    }
+    det, word = mapping.get((weekday_code or "").lower(), ("каждый", weekday_code or "день"))
+    return f"{det} {word}"
+
+def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
+    title = row["title"]
+    kind = row["kind"] or "oneoff"
+    if kind == "oneoff" and row["when_iso"]:
+        dt_local = to_user_local(row["when_iso"], user_tz)
+        return f"{dt_local.strftime('%d.%m в %H:%M')} — «{title}»"
+    rec = json.loads(row["recurrence_json"]) if row["recurrence_json"] else {}
+    rtype = rec.get("type")
+    time_str = rec.get("time") or "00:00"
+    if rtype == "daily":
+        return f"каждый день в {time_str} — «{title}»"
+    if rtype == "weekly":
+        wd = ru_weekly_phrase(rec.get("weekday", ""))
+        return f"{wd} в {time_str} — «{title}»"
+    day = rec.get("day")
+    return f"каждое {day}-е число в {time_str} — «{title}»"
+
+# ---------- VOICE/AUDIO/VIDEO_NOTE -> text (прямо в Whisper, иначе через ffmpeg) ----------
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Скачиваем voice/audio/video_note, сначала пытаемся отдать как есть в Whisper.
+    Если не получилось или текст пустой — конвертируем ffmpeg -> WAV (mono,16k) и пробуем снова.
+    После распознавания подставляем текст и пускаем через обычный handle_text.
+    """
+    try:
+        msg = update.message
+        if not msg:
+            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        media = msg.voice or msg.audio or msg.video_note
+        if not media:
+            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        tg_file = await media.get_file()
+
+        with tempfile.TemporaryDirectory() as td:
+            file_url = getattr(tg_file, "file_path", "") or ""
+            ext = os.path.splitext(file_url)[1].lower() or ".oga"
+            in_path = os.path.join(td, f"media{ext}")
+            await tg_file.download_to_drive(custom_path=in_path)
+
+            client = get_openai()
+
+            def _whisper_transcribe(path: str) -> str:
+                with open(path, "rb") as f:
+                    resp = client.audio.transcriptions.create(
+                        model=WHISPER_MODEL,
+                        file=f,
+                        response_format="text",
+                    )
+                return resp if isinstance(resp, str) else getattr(resp, "text", "")
+
+            text = ""
+            # 1) Пробуем исходный контейнер
+            try:
+                text = (_whisper_transcribe(in_path) or "").strip()
+            except Exception as e:
+                log.warning("Direct Whisper transcribe failed on %s: %s", ext, e)
+
+            # 2) Если не вышло — ffmpeg -> wav mono 16k
+            if not text:
+                out_path = os.path.join(td, "audio.wav")
+                cmd = ["ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", "16000", "-loglevel", "error", out_path]
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode != 0 or not os.path.exists(out_path):
+                    log.error("ffmpeg failed rc=%s stderr=%s", proc.returncode, stderr.decode("utf-8", "ignore"))
+                    return await safe_reply(update, "Ошибка обработки аудио")
+
+                try:
+                    text = (_whisper_transcribe(out_path) or "").strip()
+                except Exception as e:
+                    log.exception("Whisper after ffmpeg failed: %s", e)
+                    return await safe_reply(update, "Ошибка обработки аудио")
+
+        if not text:
+            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        update.message.text = text
+        return await handle_text(update, context)
+
+    except Exception as e:
+        log.exception("handle_voice failed: %s", e)
+        return await safe_reply(update, "Ошибка обработки аудио")
+
+# ---------- Clarify memory ----------
+def get_clarify_state(context: ContextTypes.DEFAULT_TYPE):
+    return context.user_data.get("clarify_state")
+def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
+    if state is None: context.user_data.pop("clarify_state", None)
+    else: context.user_data["clarify_state"] = state
+
+# ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip()
-    tz_offset = ensure_tz_offset(context.user_data.get("tz_offset") or DEFAULT_TZ)
+    if await try_handle_tz_input(update, context): return
+    user_id = update.effective_user.id
+    incoming_text = (context.user_data.pop("__auto_answer", None)
+                     or (update.message.text.strip() if update.message and update.message.text else ""))
 
-    # быстрые команды меню
-    if text in ("📋 Список напоминаний", "/list"):
-        await cmd_list(update, context)
-        return
-    if text in ("⚙️ Настройки", "/settings"):
-        await update.message.reply_text("Раздел «Настройки» в разработке.")
-        return
+    if incoming_text == "📝 Список напоминаний" or incoming_text.lower() == "/list":
+        return await cmd_list(update, context)
+    if incoming_text == "⚙️ Настройки" or incoming_text.lower() == "/settings":
+        return await safe_reply(update, "Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
 
-    data = await call_llm(text, tz_offset)
-    if not data:
-        await update.message.reply_text("Не понял. Пример: «завтра в 6 падел».")
-        return
+    user_tz = db_get_user_tz(user_id)
+    if not user_tz:
+        await safe_reply(update, "Сначала укажи часовой пояс.", reply_markup=MAIN_MENU_KB)
+        await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb()); return
 
-    # если это ответ на предыдущее уточнение
-    c = context.user_data.get("clarify")
-    if c:
-        answer = text
-        original = c["original_text"]
-        merged = f"{original}\nОтвет на уточнение ({c['expects']}): {answer}"
-        result = await call_llm(merged, context.user_data.get("tz", DEFAULT_TZ), followup=True)
-        if result.get("intent") == "ask_clarification":
-            q = result.get("question") or "Уточни, пожалуйста"
-            variants = result.get("variants") or []
-            context.user_data["clarify"] = {
-                "original_text": original,
-                "expects": result.get("expects"),
-                "question": q,
-                "variants": variants,
-            }
-            if variants:
-                keyboard = [[InlineKeyboardButton(v, callback_data=f"clar:{i}")] for i, v in enumerate(variants)]
-                await update.message.reply_text(q, reply_markup=InlineKeyboardMarkup(keyboard))
-            else:
-                await update.message.reply_text(q)
-            return
-        context.user_data.pop("clarify", None)
-        await apply_llm_result(result, update, context)
-        return
+    now_local = now_in_user_tz(user_tz)
+    r = rule_parse(incoming_text, now_local)
+    if r:
+        if r["intent"] == "create":
+            title = r["title"]; when_iso_utc = iso_utc(r["when_local"])
+            rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+            schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+            dt_local = to_user_local(when_iso_utc, user_tz)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
+                                    reply_markup=kb)
+        if r["intent"] == "ask":
+            set_clarify_state(context, {
+                "original": incoming_text,
+                "base_date": r["base_date"],
+                "title": r["title"],
+            })
+            kb_rows = [[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in r["variants"]]
+            return await safe_reply(update, r["question"], reply_markup=InlineKeyboardMarkup(kb_rows))
 
-    intent = data.get("intent", "create_reminder")
-    title = data.get("title") or "Напоминание"
-    fixed = data.get("fixed_datetime")
-    repeat = data.get("repeat", "none")
-    day_of_week = data.get("day_of_week")
-    day_of_month = data.get("day_of_month")
-    timezone_str = ensure_tz_offset(data.get("timezone") or tz_offset)
+    # LLM
+    result = await call_llm(incoming_text, user_tz)
+    intent = result.get("intent")
 
     if intent == "ask_clarification":
-        upsert_pending(user.id, data)
-        d = PENDING.get(user.id, {"clarify_count": 0})
-        if d["clarify_count"] >= MAX_CLARIFY:
-            pen = PENDING[user.id]["pending"]
-            rem_id = save_reminder_row(
-                user.id,
-                chat_id,
-                pen.get("title", title),
-                pen.get("fixed_datetime"),
-                ensure_tz_offset(pen.get("timezone") or timezone_str),
-                pen.get("repeat", "none"),
-                pen.get("day_of_week"),
-                pen.get("day_of_month"),
-                iso=pen.get("fixed_datetime"),
-            )
-            PENDING.pop(user.id, None)
-            pretty = (
-                unix_to_local_str(iso_to_unix(pen["fixed_datetime"]), ensure_tz_offset(pen.get("timezone") or timezone_str))
-                if pen.get("fixed_datetime")
-                else "—"
-            )
-            await update.message.reply_text(
-                f"📅 Окей, записал: {pen.get('title','Напоминание')} — {pretty}", reply_markup=MAIN_MENU
-            )
-            return
+        question = result.get("question") or "Уточни, пожалуйста."
+        variants = result.get("variants") or []
+        set_clarify_state(context, {"original": result.get("text_original") or incoming_text})
+        kb_rows = []
+        for v in variants[:6]:
+            if isinstance(v, dict):
+                label = v.get("label") or v.get("text") or v.get("iso_datetime") or "Выбрать"
+                iso = v.get("iso_datetime")
+                kb_rows.append([InlineKeyboardButton(label, callback_data=(f"pick:{iso}" if iso else f"answer:{label}"))])
+            else:
+                kb_rows.append([InlineKeyboardButton(str(v), callback_data=f"answer:{v}")])
+        return await safe_reply(update, question, reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None)
 
-        d["clarify_count"] += 1
-        PENDING[user.id] = d
-        opts = data.get("options") or []
-        if not opts:
-            std = ["08:00", "12:00", "19:00"]
-            opts = [{"iso_datetime": build_today_time_iso(timezone_str, hh), "label": hh} for hh in std]
-        kb = render_options_keyboard(opts, cb_prefix="clarify")
-        await update.message.reply_text("Уточни, пожалуйста:", reply_markup=kb)
-        return
+    if intent == "create_reminder":
+        title = result.get("title") or "Напоминание"
+        body = result.get("description")
+        dt_iso_local = result.get("fixed_datetime")
+        recurrence = result.get("recurrence")
 
-    # обычная новая команда
-    result = data
-    await apply_llm_result(result, update, context)
+        if recurrence:
+            rem_id = db_add_reminder_recurring(user_id, title, body, recurrence, user_tz)
+            schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
+            rtype = recurrence.get("type")
+            if rtype == "daily":
+                text = f"🔔🔔 Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
+            elif rtype == "weekly":
+                text = f"🔔🔔 Окей, буду напоминать «{title}» {ru_weekly_phrase(recurrence.get('weekday'))} в {recurrence.get('time')}"
+            else:
+                text = f"🔔🔔 Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+            return await safe_reply(update, text, reply_markup=kb)
 
-async def apply_llm_result(result: dict, update: Update, context: ContextTypes.DEFAULT_TYPE, by_callback: bool = False):
-    chat_id = update.effective_chat.id if not by_callback else update.callback_query.message.chat_id
-    tz = context.user_data.get("tz", DEFAULT_TZ)
+        if not dt_iso_local:
+            return await safe_reply(update, "Не понял время. Напиши, например: «сегодня 18:30».")
+        when_local = dparser.isoparse(dt_iso_local)
+        if when_local.tzinfo is None:
+            when_local = when_local.replace(tzinfo=tzinfo_from_user(user_tz))
+        when_iso_utc = iso_utc(when_local)
+        rem_id = db_add_reminder_oneoff(user_id, title, body, when_iso_utc)
+        schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+        dt_local = to_user_local(when_iso_utc, user_tz)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+        return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}",
+                                reply_markup=kb)
 
-    title = result.get("title") or "Напоминание"
-    iso = result.get("fixed_datetime")
-    rec = result.get("recurrence")
+    await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
-    # одноразовое
-    if iso:
-        save_reminder(chat_id, title, iso, None, tz)
-        add_one_shot_job(context.application, chat_id, title, iso)
-        dt_short = iso.replace("T", " ")[:-3]
-        send_fn = update.callback_query.message.edit_text if by_callback else update.message.reply_text
-        await send_fn(f"📅 Окей, напомню «{title}» {dt_short}")
-        return
-
-    # периодическое
-    if rec:
-        save_reminder(chat_id, title, None, rec, tz)
-        add_recurrence_job(context.application, chat_id, title, rec, tz)
-        if rec["type"] == "daily":
-            when = f"каждый день в {rec['time']}"
-        elif rec["type"] == "weekly":
-            when = f"по {rec['weekday']} в {rec['time']}"
-        else:
-            when = f"каждое {rec['day']} число в {rec['time']}"
-        send_fn = update.callback_query.message.edit_text if by_callback else update.message.reply_text
-        await send_fn(f"📅 Окей, буду напоминать «{title}» {when}")
-        return
-
-    # fallback
-    send_fn = update.callback_query.message.edit_text if by_callback else update.message.reply_text
-    await send_fn("Я не понял, попробуй ещё раз.")
-
-# --------------------------- Callback (snooze/done/del/clarify) ---------------------------
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    data = q.data or ""
-    await q.answer()
-    if data.startswith("snooze:"):
-        try:
-            _, mins, rem_id = data.split(":", 2)
-            mins = int(mins)
-            rem_id = int(rem_id)
-        except Exception:
-            return
-        new_ts = snooze_reminder(rem_id, mins)
-        if new_ts:
-            cur.execute("SELECT tz, title FROM reminders WHERE id=?", (rem_id,))
-            row = cur.fetchone()
-            tz_off = row["tz"] or "+03:00"
-            new_local = unix_to_local_str(new_ts, tz_off)
-            await q.edit_message_text(f"🕒 Отложено до {new_local} — {row['title']}")
-    elif data.startswith("done:"):
-        try:
-            _, rem_id = data.split(":", 1)
-            rem_id = int(rem_id)
-        except Exception:
-            return
-        cur.execute("UPDATE reminders SET state='done' WHERE id=?", (rem_id,))
-        conn.commit()
-        await q.edit_message_text("✅ Выполнено")
-    elif data.startswith("del:"):
-        try:
-            _, rem_id = data.split(":", 1)
-            rem_id = int(rem_id)
-        except Exception:
-            return
-        ok = delete_reminder_row(rem_id)
-        if ok:
-            await q.edit_message_text("🗑 Удалено")
-    elif data.startswith("clarify:"):
-        try:
-            _, iso, dow, dom = data.split(":", 3)
-        except Exception:
-            return
-        user_id = q.from_user.id
-        d = PENDING.get(user_id, {"pending": {}, "clarify_count": 0})
-        pen = d["pending"]
-        if iso:
-            pen["fixed_datetime"] = iso
-        if dow:
-            try:
-                pen["day_of_week"] = int(dow)
-            except Exception:
-                pass
-        if dom:
-            try:
-                pen["day_of_month"] = int(dom)
-            except Exception:
-                pass
-        PENDING[user_id] = {"pending": pen, "clarify_count": d["clarify_count"]}
-
-        repeat = pen.get("repeat", "none")
-        ready = False
-        if repeat == "none":
-            ready = bool(pen.get("fixed_datetime"))
-        elif repeat == "daily":
-            ready = bool(pen.get("fixed_datetime"))
-        elif repeat == "weekly":
-            ready = bool(pen.get("fixed_datetime")) and bool(pen.get("day_of_week"))
-        elif repeat == "monthly":
-            ready = bool(pen.get("fixed_datetime")) and bool(pen.get("day_of_month"))
-
-        if ready:
-            save_reminder_row(
-                user_id,
-                q.message.chat_id,
-                pen.get("title", "Напоминание"),
-                pen.get("fixed_datetime"),
-                ensure_tz_offset(pen.get("timezone") or "+03:00"),
-                pen.get("repeat", "none"),
-                pen.get("day_of_week"),
-                pen.get("day_of_month"),
-                iso=pen.get("fixed_datetime"),
-            )
-            PENDING.pop(user_id, None)
-            pretty = (
-                unix_to_local_str(iso_to_unix(pen["fixed_datetime"]), ensure_tz_offset(pen.get("timezone") or "+03:00"))
-                if pen.get("fixed_datetime")
-                else "-"
-            )
-            await q.edit_message_text(f"✅ Записал: {pen.get('title','Напоминание')} — {pretty}")
-            return
-
-        # Если ещё не готовы все поля — задаём кнопки-уточнения
-        if not pen.get("fixed_datetime"):
-            opts = []
-            for hh in ["08:00", "12:00", "19:00"]:
-                iso_x = build_today_time_iso(ensure_tz_offset(pen.get("timezone") or "+03:00"), hh)
-                opts.append({"iso_datetime": iso_x, "label": hh, "day_of_week": None, "day_of_month": None})
-            await q.edit_message_text("Уточни время:", reply_markup=render_options_keyboard(opts))
-            return
-        if pen.get("repeat") == "weekly" and not pen.get("day_of_week"):
-            dows = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-            opts = [{"iso_datetime": "", "label": lbl, "day_of_week": i + 1, "day_of_month": None} for i, lbl in enumerate(dows)]
-            await q.edit_message_text("Выбери день недели:", reply_markup=render_options_keyboard(opts))
-            return
-        if pen.get("repeat") == "monthly" and not pen.get("day_of_month"):
-            dom_opts = [1, 5, 10, 15, 20, 25]
-            opts = [{"iso_datetime": "", "label": str(x), "day_of_week": None, "day_of_month": x} for x in dom_opts]
-            await q.edit_message_text("Выбери число месяца:", reply_markup=render_options_keyboard(opts))
-            return
-
-# --------------------------- TICKER (через JobQueue) ---------------------------
-async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
-    app = context.application
-    now_ts = int(datetime.utcnow().timestamp())
-    cur.execute(
-        "SELECT * FROM reminders WHERE state='active' AND when_ts IS NOT NULL AND when_ts <= ?",
-        (now_ts,),
-    )
-    due = cur.fetchall()
-    for row in due:
-        tz_off = row["tz"] or "+03:00"
-        when_str = unix_to_local_str(row["when_ts"], tz_off)
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("⏰ через 10 мин", callback_data=f"snooze:10:{row['id']}"),
-                    InlineKeyboardButton("🕒 через 1 час", callback_data=f"snooze:60:{row['id']}"),
-                    InlineKeyboardButton("✅ Готово", callback_data=f"done:{row['id']}"),
-                ]
-            ]
+# ---------- Handlers ----------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    tz = db_get_user_tz(user_id)
+    if not tz:
+        await safe_reply(update,
+            "Для начала укажи свой часовой пояс.\n"
+            "Выбери город или пришли вручную смещение (+03:00) или IANA (Europe/Moscow).",
+            reply_markup=MAIN_MENU_KB
         )
-        try:
-            await app.bot.send_message(
-                chat_id=row["chat_id"],
-                text=f"📅 Напоминание: {row['title']}\n⏱ {when_str}",
-                reply_markup=kb,
+        await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
+        return
+    await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
+                     reply_markup=MAIN_MENU_KB)
+
+async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.message or not update.message.text: return False
+    tz = parse_tz_input(update.message.text.strip())
+    if tz is None: return False
+    db_set_user_tz(update.effective_user.id, tz)
+    await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
+                     reply_markup=MAIN_MENU_KB)
+    return True
+
+async def cb_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data
+    if not data.startswith("tz:"): return
+    value = data.split(":",1)[1]; chat_id = q.message.chat.id
+    if value == "other":
+        await q.edit_message_text("Пришли смещение вида +03:00 или IANA-зону (Europe/Moscow)."); return
+    db_set_user_tz(chat_id, value)
+    await q.edit_message_text(f"Часовой пояс установлен: {value}\nТеперь напиши что и когда напомнить.")
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    rows = db_future(user_id)
+    if not rows:
+        return await safe_reply(update, "Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
+
+    tz = db_get_user_tz(user_id) or "+03:00"
+    header = "🗓 Ближайшие напоминания —"
+    kb_rows = []
+    for r in rows:
+        line = format_reminder_line(r, tz)
+        kb_rows.append([InlineKeyboardButton(f"🗑 {line}", callback_data=f"del:{r['id']}")])
+
+    await safe_reply(update, header, reply_markup=InlineKeyboardMarkup(kb_rows))
+
+async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data or ""
+    if data.startswith("del:"):
+        rem_id = int(data.split(":")[1]); db_delete(rem_id)
+        sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
+        if job: job.remove()
+        await q.edit_message_text("Удалено ✅"); return
+    if data.startswith("snooze:"):
+        _, mins, rem_id = data.split(":"); rem_id = int(rem_id); mins = int(mins)
+        kind, _ = db_snooze(rem_id, mins); row = db_get_reminder(rem_id)
+        if not row: return await q.edit_message_text("Ошибка: напоминание не найдено.")
+        if kind == "oneoff":
+            schedule_oneoff(rem_id, row["user_id"], row["when_iso"], row["title"], kind="oneoff")
+            await q.edit_message_text(f"⏲ Отложено на {mins} мин.")
+        else:
+            when = iso_utc(datetime.now(timezone.utc) + timedelta(minutes=mins))
+            sch = ensure_scheduler()
+            sch.add_job(
+                fire_reminder, DateTrigger(run_date=parse_iso(when)),
+                id=f"snooze-{rem_id}", replace_existing=True, misfire_grace_time=60, coalesce=True,
+                kwargs={"chat_id": row["user_id"], "rem_id": rem_id, "title": row["title"], "kind":"oneoff"},
+                name=f"snooze {rem_id}",
             )
-        except Exception as e:
-            log.error("Send reminder failed: %s", e, exc_info=False)
+            await q.edit_message_text(f"⏲ Отложено на {mins} мин. (одноразово)")
+        return
+    if data.startswith("done:"):
+        rem_id = int(data.split(":")[1]); db_mark_done(rem_id)
+        sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
+        if job: job.remove()
+        await q.edit_message_text("✅ Выполнено"); return
 
-        next_ts = compute_next_fire(row)
-        bump_next(row["id"], next_ts)
+async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    try: await q.edit_message_reply_markup(None)
+    except Exception: pass
+    data = q.data or ""
+    if not data.startswith("pick:"): return
+    iso_local = data.split("pick:")[1]; user_id = q.message.chat.id
+    tz = db_get_user_tz(user_id) or "+03:00"; title = "Напоминание"
+    when_local = dparser.isoparse(iso_local)
+    if when_local.tzinfo is None: when_local = when_local.replace(tzinfo=tzinfo_from_user(tz))
+    when_iso_utc = iso_utc(when_local)
+    rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+    schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+    dt_local = to_user_local(when_iso_utc, tz)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
-# --------------------------- APP ---------------------------
-def build_app() -> Application:
-    app = Application.builder().token(TOKEN).build()
+async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    try: await q.edit_message_reply_markup(None)
+    except Exception: pass
+    data = q.data or ""
+    if not data.startswith("answer:"): return
+    choice = data.split("answer:",1)[1]
+    cstate = context.user_data.get("clarify_state") or {}
+    base_date = cstate.get("base_date"); title = cstate.get("title") or "Напоминание"
+    user_id = q.message.chat.id; tz = db_get_user_tz(user_id) or "+03:00"
+    if base_date:
+        m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?$", choice.strip())
+        if m:
+            hh = int(m.group(1)); mm = int(m.group(2) or 0)
+            when_local = datetime.fromisoformat(base_date).replace(hour=hh, minute=mm, tzinfo=tzinfo_from_user(tz))
+            when_iso_utc = iso_utc(when_local)
+            rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+            schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
+                                    reply_markup=kb)
+    context.user_data["__auto_answer"] = choice
+    await handle_text(update, context)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("reload", reload_prompts))
-
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(snooze|done|del|clarify):"))
-    app.add_handler(MessageHandler(filters.Regex(r"^(📋 Список напоминаний|⚙️ Настройки)$"), handle_menu))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # 🔔 Планировщик через JobQueue: каждые 30 сек, первый запуск через 5 сек
-    app.job_queue.run_repeating(scheduler_tick, interval=30, first=5)
-
-    return app
-
-# --------------------------- main ---------------------------
-def main():
-    # запускаем отдельный AsyncIOScheduler (используем только для cron/date — задачи добавляем функциями выше)
+# ---------- Startup: APScheduler в PTB loop ----------
+async def on_startup(app: Application):
+    global scheduler, TG_BOT
+    TG_BOT = app.bot
+    loop = asyncio.get_running_loop()
+    scheduler = AsyncIOScheduler(
+        timezone=timezone.utc,
+        event_loop=loop,
+        job_defaults={"coalesce": True, "misfire_grace_time": 600}
+    )
     scheduler.start()
+    log.info("APScheduler started in PTB event loop")
+    reschedule_all()
 
-    # PTB v20+: run_polling()
-    app = build_app()
-    log.info("Bot starting… polling enabled")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+# ---------- main ----------
+def main():
+    log.info("Starting PlannerBot...")
+    db_init()
 
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .post_init(on_startup)
+           .build())
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("settings", lambda u,c: u.message.reply_text(
+        "Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)))
+    app.add_handler(CallbackQueryHandler(cb_tz, pattern=r"^tz:"))
+    app.add_handler(CallbackQueryHandler(cb_inline, pattern=r"^(del:|done:|snooze:)"))
+    app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
+    app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
+
+    # Обработчик голосовых/аудио/кружочков (единый)
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, handle_voice))
+
+    # Текст
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
