@@ -530,32 +530,55 @@ def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
     if state is None: context.user_data.pop("clarify_state", None)
     else: context.user_data["clarify_state"] = state
 
-# ---------- VOICE -> text (ffmpeg через Telegram сервер, Whisper) ----------
+# ---------- VOICE -> text (download + ffmpeg + Whisper) ----------
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Скачиваем voice(.oga/.ogg) → Telegram file URL → транскрипция Whisper → прокидываем текст."""
+    """Скачиваем voice(.oga/.ogg) → ffmpeg → wav → Whisper → передаём как обычный текст."""
     try:
         voice = update.message.voice
         if not voice:
             return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
-        # 1) получить прямую ссылку на файл у Telegram CDN
         tg_file = await voice.get_file()
-        file_url = tg_file.file_path  # уже полноценный URL
 
-        # 2) Отправляем в OpenAI Whisper по URL (без локального ffmpeg)
-        client = get_openai()
-        tr = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=file_url,                 # URL-файл, не двоичный
-            response_format="text",
-            language="ru"
-        )
-        text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+        import subprocess, os, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            in_path = os.path.join(td, f"voice_{update.message.message_id}.oga")
+            wav_path = os.path.join(td, f"voice_{update.message.message_id}.wav")
+
+            # 1) скачиваем файл с CDN Telegram
+            await tg_file.download_to_drive(custom_path=in_path)
+
+            # 2) ffmpeg → WAV (моно 16kHz) — максимально совместимо с Whisper
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", "16000", wav_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            rc = await proc.wait()
+            if rc != 0 or not os.path.exists(wav_path):
+                log.error("ffmpeg convert failed rc=%s", rc)
+                return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+            # 3) Whisper — отправляем ИМЕННО файл (не URL!)
+            client = get_openai()
+            with open(wav_path, "rb") as f:
+                try:
+                    tr = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        response_format="text",
+                        language="ru",
+                    )
+                    text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+                except Exception as e:
+                    log.exception("Whisper transcription error: %s", e)
+                    return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
         text = (text or "").strip()
         if not text:
             return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
 
-        # 3) Передаём текст в общий обработчик через user_data
+        # 4) Передаём распознанный текст в общий обработчик
         context.user_data["__auto_answer"] = text
         return await handle_text(update, context)
 
