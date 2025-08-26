@@ -626,34 +626,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
 # ---------- Voice -> Text ----------
+# ---------- Voice -> Text ----------
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Распознаём voice и передаём результат в ту же логику, что и текст."""
     try:
         voice = update.message.voice if update.message else None
         if not voice:
             return
+
         file = await voice.get_file()
-        # сохраняем во временный файл
-        tmpdir = tempfile.gettempdir()
-        path_ogg = os.path.join(tmpdir, f"{uuid.uuid4().hex}.ogg")
-        await file.download_to_drive(path_ogg)
+
+        # Скачиваем во временный файл (OGG/OPUS от Telegram — ок для whisper-1)
+        tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}.ogg")
+        await file.download_to_drive(tmp_path)
 
         client = get_openai()
-        with open(path_ogg, "rb") as f:
-            tr = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=f,
-            )
-        text = (getattr(tr, "text", "") or "").strip()
+        text = ""
+
+        # 1) Надёжный путь: whisper-1 через audio.transcriptions
         try:
-            os.remove(path_ogg)
+            with open(tmp_path, "rb") as f:
+                tr = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    response_format="json",
+                    temperature=0,
+                    language="ru"  # можно убрать, но так стабильнее на русской речи
+                )
+            text = (getattr(tr, "text", "") or "").strip()
+        except Exception as e:
+            log.exception("Whisper transcription error: %s", e)
+            text = ""
+
+        # Убираем временный файл
+        try:
+            os.remove(tmp_path)
         except Exception:
             pass
 
         if not text:
-            return await update.message.reply_text("Не расслышал голосовое. Скажи ещё раз текстом?")
+            await update.message.reply_text("Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+            return
 
-        # подменяем текст в апдейте и используем тот же пайплайн
+        # Подменяем текст и прогоняем обычный пайплайн
         update.message.text = text
         await handle_text(update, context)
 
