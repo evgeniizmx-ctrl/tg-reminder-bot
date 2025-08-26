@@ -37,7 +37,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
 PROMPTS_PATH = os.environ.get("PROMPTS_PATH", "prompts.yaml")
 DB_PATH = os.environ.get("DB_PATH", "reminders.db")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1")  # можно выставить gpt-4o-mini-transcribe
 
 missing = []
 if not BOT_TOKEN: missing.append("BOT_TOKEN")
@@ -125,7 +124,7 @@ def db_snooze(rem_id: int, minutes: int):
             return None, None
         if row["kind"] == "recurring":
             return "recurring", None
-        dt = parse_iso(row["when_iso"]) + timedelta(minutes=minutes)
+        dt = dparser.isoparse(row["when_iso"]) + timedelta(minutes=minutes)
         new_iso = iso_utc(dt)
         conn.execute("update reminders set when_iso=?, status='scheduled' where id=?", (new_iso, rem_id))
         conn.commit()
@@ -167,11 +166,8 @@ def iso_utc(dt: datetime) -> str:
     dt = dt.astimezone(timezone.utc).replace(microsecond=0)
     return dt.isoformat()
 
-def parse_iso(s: str) -> datetime:
-    return dparser.isoparse(s)
-
 def to_user_local(utc_iso: str, user_tz: str) -> datetime:
-    return parse_iso(utc_iso).astimezone(tzinfo_from_user(user_tz))
+    return dparser.isoparse(utc_iso).astimezone(tzinfo_from_user(user_tz))
 
 # ---------- UI ----------
 MAIN_MENU_KB = ReplyKeyboardMarkup(
@@ -332,7 +328,7 @@ def ensure_scheduler() -> AsyncIOScheduler:
 
 def schedule_oneoff(rem_id: int, user_id: int, when_iso_utc: str, title: str, kind: str = "oneoff"):
     sch = ensure_scheduler()
-    dt_utc = parse_iso(when_iso_utc)
+    dt_utc = dparser.isoparse(when_iso_utc)
     sch.add_job(
         fire_reminder, DateTrigger(run_date=dt_utc),
         id=f"rem-{rem_id}", replace_existing=True, misfire_grace_time=300, coalesce=True,
@@ -375,7 +371,7 @@ def reschedule_all():
                 schedule_recurring(r["id"], r["user_id"], r["title"], rec, tz)
     log.info("Rescheduled %d reminders from DB", len(rows))
 
-# ---------- RU wording for weekly + list formatting ----------
+# ---------- RU wording ----------
 def ru_weekly_phrase(weekday_code: str) -> str:
     mapping = {
         "mon": ("каждый", "понедельник"),
@@ -406,82 +402,166 @@ def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
     day = rec.get("day")
     return f"каждое {day}-е число в {time_str} — «{title}»"
 
-# ---------- VOICE/AUDIO/VIDEO_NOTE -> text (прямо в Whisper, иначе через ffmpeg) ----------
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Скачиваем voice/audio/video_note, сначала пытаемся отдать как есть в Whisper.
-    Если не получилось или текст пустой — конвертируем ffmpeg -> WAV (mono,16k) и пробуем снова.
-    После распознавания подставляем текст и пускаем через обычный handle_text.
-    """
-    try:
-        msg = update.message
-        if not msg:
-            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+# ---------- Handlers ----------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    tz = db_get_user_tz(user_id)
+    if not tz:
+        await safe_reply(update,
+            "Для начала укажи свой часовой пояс.\n"
+            "Выбери город или пришли вручную смещение (+03:00) или IANA (Europe/Moscow).",
+            reply_markup=MAIN_MENU_KB
+        )
+        await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
+        return
+    await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
+                     reply_markup=MAIN_MENU_KB)
 
-        media = msg.voice or msg.audio or msg.video_note
-        if not media:
-            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.message or not update.message.text: return False
+    tz = parse_tz_input(update.message.text.strip())
+    if tz is None: return False
+    db_set_user_tz(update.effective_user.id, tz)
+    await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
+                     reply_markup=MAIN_MENU_KB)
+    return True
 
-        tg_file = await media.get_file()
+async def cb_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data
+    if not data.startswith("tz:"): return
+    value = data.split(":",1)[1]; chat_id = q.message.chat.id
+    if value == "other":
+        await q.edit_message_text("Пришли смещение вида +03:00 или IANA-зону (Europe/Moscow)."); return
+    db_set_user_tz(chat_id, value)
+    await q.edit_message_text(f"Часовой пояс установлен: {value}\nТеперь напиши что и когда напомнить.")
 
-        with tempfile.TemporaryDirectory() as td:
-            file_url = getattr(tg_file, "file_path", "") or ""
-            ext = os.path.splitext(file_url)[1].lower() or ".oga"
-            in_path = os.path.join(td, f"media{ext}")
-            await tg_file.download_to_drive(custom_path=in_path)
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    rows = db_future(user_id)
+    if not rows:
+        return await safe_reply(update, "Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
 
-            client = get_openai()
+    tz = db_get_user_tz(user_id) or "+03:00"
+    header = "🗓 Ближайшие напоминания —"
+    kb_rows = []
+    for r in rows:
+        line = format_reminder_line(r, tz)
+        kb_rows.append([InlineKeyboardButton(f"🗑 {line}", callback_data=f"del:{r['id']}")])
 
-            def _whisper_transcribe(path: str) -> str:
-                with open(path, "rb") as f:
-                    resp = client.audio.transcriptions.create(
-                        model=WHISPER_MODEL,
-                        file=f,
-                        response_format="text",
-                    )
-                return resp if isinstance(resp, str) else getattr(resp, "text", "")
+    await safe_reply(update, header, reply_markup=InlineKeyboardMarkup(kb_rows))
 
-            text = ""
-            # 1) Пробуем исходный контейнер
-            try:
-                text = (_whisper_transcribe(in_path) or "").strip()
-            except Exception as e:
-                log.warning("Direct Whisper transcribe failed on %s: %s", ext, e)
+async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data or ""
+    if data.startswith("del:"):
+        rem_id = int(data.split(":")[1]); db_delete(rem_id)
+        sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
+        if job: job.remove()
+        await q.edit_message_text("Удалено ✅"); return
+    if data.startswith("snooze:"):
+        _, mins, rem_id = data.split(":"); rem_id = int(rem_id); mins = int(mins)
+        kind, _ = db_snooze(rem_id, mins); row = db_get_reminder(rem_id)
+        if not row: return await q.edit_message_text("Ошибка: напоминание не найдено.")
+        if kind == "oneoff":
+            schedule_oneoff(rem_id, row["user_id"], row["when_iso"], row["title"], kind="oneoff")
+            await q.edit_message_text(f"⏲ Отложено на {mins} мин.")
+        else:
+            when = iso_utc(datetime.now(timezone.utc) + timedelta(minutes=mins))
+            sch = ensure_scheduler()
+            sch.add_job(
+                fire_reminder, DateTrigger(run_date=dparser.isoparse(when)),
+                id=f"snooze-{rem_id}", replace_existing=True, misfire_grace_time=60, coalesce=True,
+                kwargs={"chat_id": row["user_id"], "rem_id": rem_id, "title": row["title"], "kind":"oneoff"},
+                name=f"snooze {rem_id}",
+            )
+            await q.edit_message_text(f"⏲ Отложено на {mins} мин. (одноразово)")
+        return
+    if data.startswith("done:"):
+        rem_id = int(data.split(":")[1]); db_mark_done(rem_id)
+        sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
+        if job: job.remove()
+        await q.edit_message_text("✅ Выполнено"); return
 
-            # 2) Если не вышло — ffmpeg -> wav mono 16k
-            if not text:
-                out_path = os.path.join(td, "audio.wav")
-                cmd = ["ffmpeg", "-y", "-i", in_path, "-ac", "1", "-ar", "16000", "-loglevel", "error", out_path]
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode != 0 or not os.path.exists(out_path):
-                    log.error("ffmpeg failed rc=%s stderr=%s", proc.returncode, stderr.decode("utf-8", "ignore"))
-                    return await safe_reply(update, "Ошибка обработки аудио")
+async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    try: await q.edit_message_reply_markup(None)
+    except Exception: pass
+    data = q.data or ""
+    if not data.startswith("pick:"): return
+    iso_local = data.split("pick:")[1]; user_id = q.message.chat.id
+    tz = db_get_user_tz(user_id) or "+03:00"; title = "Напоминание"
+    when_local = dparser.isoparse(iso_local)
+    if when_local.tzinfo is None: when_local = when_local.replace(tzinfo=tzinfo_from_user(tz))
+    when_iso_utc = iso_utc(when_local)
+    rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+    schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+    dt_local = to_user_local(when_iso_utc, tz)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
-                try:
-                    text = (_whisper_transcribe(out_path) or "").strip()
-                except Exception as e:
-                    log.exception("Whisper after ffmpeg failed: %s", e)
-                    return await safe_reply(update, "Ошибка обработки аудио")
+async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    try: await q.edit_message_reply_markup(None)
+    except Exception: pass
+    data = q.data or ""
+    if not data.startswith("answer:"): return
+    choice = data.split("answer:",1)[1]
+    cstate = context.user_data.get("clarify_state") or {}
+    base_date = cstate.get("base_date"); title = cstate.get("title") or "Напоминание"
+    user_id = q.message.chat.id; tz = db_get_user_tz(user_id) or "+03:00"
+    if base_date:
+        m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?$", choice.strip())
+        if m:
+            hh = int(m.group(1)); mm = int(m.group(2) or 0)
+            when_local = datetime.fromisoformat(base_date).replace(hour=hh, minute=mm, tzinfo=tzinfo_from_user(tz))
+            when_iso_utc = iso_utc(when_local)
+            rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+            schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
+                                    reply_markup=kb)
+    context.user_data["__auto_answer"] = choice
+    await handle_text(update, context)
 
-        if not text:
-            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
-
-        update.message.text = text
-        return await handle_text(update, context)
-
-    except Exception as e:
-        log.exception("handle_voice failed: %s", e)
-        return await safe_reply(update, "Ошибка обработки аудио")
-
-# ---------- Clarify memory ----------
 def get_clarify_state(context: ContextTypes.DEFAULT_TYPE):
     return context.user_data.get("clarify_state")
 def set_clarify_state(context: ContextTypes.DEFAULT_TYPE, state: dict | None):
     if state is None: context.user_data.pop("clarify_state", None)
     else: context.user_data["clarify_state"] = state
+
+# ---------- VOICE -> text (ffmpeg через Telegram сервер, Whisper) ----------
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скачиваем voice(.oga/.ogg) → Telegram file URL → транскрипция Whisper → прокидываем текст."""
+    try:
+        voice = update.message.voice
+        if not voice:
+            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        # 1) получить прямую ссылку на файл у Telegram CDN
+        tg_file = await voice.get_file()
+        file_url = tg_file.file_path  # уже полноценный URL
+
+        # 2) Отправляем в OpenAI Whisper по URL (без локального ffmpeg)
+        client = get_openai()
+        tr = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=file_url,                 # URL-файл, не двоичный
+            response_format="text",
+            language="ru"
+        )
+        text = tr if isinstance(tr, str) else getattr(tr, "text", "")
+        text = (text or "").strip()
+        if not text:
+            return await safe_reply(update, "Не смог распознать голосовое. Попробуй текстом, пожалуйста.")
+
+        # 3) Передаём текст в общий обработчик через user_data
+        context.user_data["__auto_answer"] = text
+        return await handle_text(update, context)
+
+    except Exception as e:
+        log.exception("handle_voice failed: %s", e)
+        return await safe_reply(update, "Ошибка обработки аудио")
 
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -572,129 +652,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
-# ---------- Handlers ----------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    tz = db_get_user_tz(user_id)
-    if not tz:
-        await safe_reply(update,
-            "Для начала укажи свой часовой пояс.\n"
-            "Выбери город или пришли вручную смещение (+03:00) или IANA (Europe/Moscow).",
-            reply_markup=MAIN_MENU_KB
-        )
-        await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
-        return
-    await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
-                     reply_markup=MAIN_MENU_KB)
-
-async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not update.message or not update.message.text: return False
-    tz = parse_tz_input(update.message.text.strip())
-    if tz is None: return False
-    db_set_user_tz(update.effective_user.id, tz)
-    await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
-                     reply_markup=MAIN_MENU_KB)
-    return True
-
-async def cb_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    data = q.data
-    if not data.startswith("tz:"): return
-    value = data.split(":",1)[1]; chat_id = q.message.chat.id
-    if value == "other":
-        await q.edit_message_text("Пришли смещение вида +03:00 или IANA-зону (Europe/Moscow)."); return
-    db_set_user_tz(chat_id, value)
-    await q.edit_message_text(f"Часовой пояс установлен: {value}\nТеперь напиши что и когда напомнить.")
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    rows = db_future(user_id)
-    if not rows:
-        return await safe_reply(update, "Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
-
-    tz = db_get_user_tz(user_id) or "+03:00"
-    header = "🗓 Ближайшие напоминания —"
-    kb_rows = []
-    for r in rows:
-        line = format_reminder_line(r, tz)
-        kb_rows.append([InlineKeyboardButton(f"🗑 {line}", callback_data=f"del:{r['id']}")])
-
-    await safe_reply(update, header, reply_markup=InlineKeyboardMarkup(kb_rows))
-
-async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    data = q.data or ""
-    if data.startswith("del:"):
-        rem_id = int(data.split(":")[1]); db_delete(rem_id)
-        sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
-        if job: job.remove()
-        await q.edit_message_text("Удалено ✅"); return
-    if data.startswith("snooze:"):
-        _, mins, rem_id = data.split(":"); rem_id = int(rem_id); mins = int(mins)
-        kind, _ = db_snooze(rem_id, mins); row = db_get_reminder(rem_id)
-        if not row: return await q.edit_message_text("Ошибка: напоминание не найдено.")
-        if kind == "oneoff":
-            schedule_oneoff(rem_id, row["user_id"], row["when_iso"], row["title"], kind="oneoff")
-            await q.edit_message_text(f"⏲ Отложено на {mins} мин.")
-        else:
-            when = iso_utc(datetime.now(timezone.utc) + timedelta(minutes=mins))
-            sch = ensure_scheduler()
-            sch.add_job(
-                fire_reminder, DateTrigger(run_date=parse_iso(when)),
-                id=f"snooze-{rem_id}", replace_existing=True, misfire_grace_time=60, coalesce=True,
-                kwargs={"chat_id": row["user_id"], "rem_id": rem_id, "title": row["title"], "kind":"oneoff"},
-                name=f"snooze {rem_id}",
-            )
-            await q.edit_message_text(f"⏲ Отложено на {mins} мин. (одноразово)")
-        return
-    if data.startswith("done:"):
-        rem_id = int(data.split(":")[1]); db_mark_done(rem_id)
-        sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
-        if job: job.remove()
-        await q.edit_message_text("✅ Выполнено"); return
-
-async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    try: await q.edit_message_reply_markup(None)
-    except Exception: pass
-    data = q.data or ""
-    if not data.startswith("pick:"): return
-    iso_local = data.split("pick:")[1]; user_id = q.message.chat.id
-    tz = db_get_user_tz(user_id) or "+03:00"; title = "Напоминание"
-    when_local = dparser.isoparse(iso_local)
-    if when_local.tzinfo is None: when_local = when_local.replace(tzinfo=tzinfo_from_user(tz))
-    when_iso_utc = iso_utc(when_local)
-    rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
-    schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
-    dt_local = to_user_local(when_iso_utc, tz)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-    await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
-
-async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    try: await q.edit_message_reply_markup(None)
-    except Exception: pass
-    data = q.data or ""
-    if not data.startswith("answer:"): return
-    choice = data.split("answer:",1)[1]
-    cstate = context.user_data.get("clarify_state") or {}
-    base_date = cstate.get("base_date"); title = cstate.get("title") or "Напоминание"
-    user_id = q.message.chat.id; tz = db_get_user_tz(user_id) or "+03:00"
-    if base_date:
-        m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?$", choice.strip())
-        if m:
-            hh = int(m.group(1)); mm = int(m.group(2) or 0)
-            when_local = datetime.fromisoformat(base_date).replace(hour=hh, minute=mm, tzinfo=tzinfo_from_user(tz))
-            when_iso_utc = iso_utc(when_local)
-            rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
-            schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"🔔🔔 Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}",
-                                    reply_markup=kb)
-    context.user_data["__auto_answer"] = choice
-    await handle_text(update, context)
-
-# ---------- Startup: APScheduler в PTB loop ----------
+# ---------- Startup ----------
 async def on_startup(app: Application):
     global scheduler, TG_BOT
     TG_BOT = app.bot
@@ -727,10 +685,10 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
 
-    # Обработчик голосовых/аудио/кружочков (единый)
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, handle_voice))
+    # Голосовые:
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    # Текст
+    # Текст:
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
