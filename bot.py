@@ -24,8 +24,10 @@ from telegram import (
 # Хэндлеры аудио/войсов/документов/кружков
 from telegram.ext import filters as F
 
-app.add_handler(MessageHandler)
-    F.VOICE | F.AUDIO | F.VIDEO_NOTE
+app.add_handler(MessageHandler(
+    F.VOICE
+    | F.AUDIO
+    | F.VIDEO_NOTE
     | F.Document.MimeType("audio/ogg")
     | F.Document.MimeType("audio/mpeg")
     | F.Document.MimeType("audio/mp4")
