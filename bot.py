@@ -44,8 +44,9 @@ DB_PATH = os.environ.get("DB_PATH", "reminders.db")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # Новое: берём URL к Postgres и выбираем диалект ДО блока DB
-DATABASE_URL = os.environ.get("DATABASE_URL")  # postgresql+psycopg://...@.../postgres?sslmode=require
-DB_DIALECT = (os.environ.get("DB_DIALECT") or ("postgres" if DATABASE_URL else "sqlite")).lower()
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+DB_DIALECT = ((os.environ.get("DB_DIALECT") or ("postgres" if DATABASE_URL else "sqlite")).strip().lower())
+log.info("DB mode pick: DB_DIALECT=%r, DATABASE_URL=%r", DB_DIALECT, DATABASE_URL)
 
 missing = []
 if not BOT_TOKEN: missing.append("BOT_TOKEN")
