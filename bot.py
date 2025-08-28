@@ -8,7 +8,7 @@ from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import psycopg
 from psycopg.rows import dict_row
 
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore  # NEW
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 import logging
 import sys
@@ -20,7 +20,7 @@ import tempfile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger  # NEW
+from apscheduler.triggers.interval import IntervalTrigger
 from dateutil import parser as dparser
 
 from telegram import (
@@ -69,7 +69,6 @@ def _url_with_ipv4_host(url: str) -> tuple[str, str | None, dict]:
     - ipv4: найденный IPv4 (или None)
     - parts: разобранные части (scheme, username, password, host, port, path, query)
     """
-    from urllib.parse import urlsplit, urlunsplit
     if not url:
         return url, None, {}
 
@@ -90,13 +89,11 @@ def _url_with_ipv4_host(url: str) -> tuple[str, str | None, dict]:
 
     # 1) ручной override
     ipv4_env = (os.environ.get("DB_HOST_IPV4") or "").strip() or None
-    ipv4 = None
-    if ipv4_env:
-        ipv4 = ipv4_env
-    else:
+    ipv4 = ipv4_env or None
+    if not ipv4:
         # 2) простой фоллбек
         try:
-            ipv4 = socket.gethostbyname(host)  # IPv4 только
+            ipv4 = socket.gethostbyname(host)  # IPv4
         except Exception:
             ipv4 = None
 
@@ -115,7 +112,6 @@ def _url_with_ipv4_host(url: str) -> tuple[str, str | None, dict]:
     new_url = urlunsplit((scheme, netloc, p.path, query, p.fragment))
     return new_url, ipv4, parts
 
-# ---------- DB ----------
 # ---------- DB ----------
 def db():
     """
@@ -137,6 +133,7 @@ def db():
              ipv4, parts.get("host"))
 
     # Попытка 1: прям URL с IPv4
+    last_err = None
     try:
         return psycopg.connect(conn_url_ipv4, autocommit=True, row_factory=dict_row)
     except Exception as e1:
@@ -166,6 +163,115 @@ def db():
     log.info("Postgres connect kwargs: %s", {k: kwargs[k] for k in ("hostaddr","host","port","dbname","sslmode")})
 
     return psycopg.connect(**kwargs)
+
+def db_get_user_tz(user_id: int) -> str | None:
+    with db() as conn:
+        q = "select tz from users where user_id=%s" if DB_DIALECT=="postgres" else "select tz from users where user_id=?"
+        cur = conn.execute(q, (user_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return (row["tz"] if isinstance(row, dict) else row["tz"])
+
+def db_set_user_tz(user_id: int, tz: str):
+    with db() as conn:
+        if DB_DIALECT == "postgres":
+            conn.execute("""
+                insert into users(user_id, tz) values(%s, %s)
+                on conflict (user_id) do update set tz=excluded.tz
+            """, (user_id, tz))
+        else:
+            conn.execute(
+                "insert into users(user_id, tz) values(?, ?) "
+                "on conflict(user_id) do update set tz=excluded.tz",
+                (user_id, tz)
+            )
+            conn.commit()
+
+def db_add_reminder_oneoff(user_id: int, title: str, body: str | None, when_iso_utc: str) -> int:
+    with db() as conn:
+        if DB_DIALECT == "postgres":
+            cur = conn.execute(
+                "insert into reminders(user_id,title,body,when_iso,kind) values(%s,%s,%s,%s,%s) returning id",
+                (user_id, title, body, when_iso_utc, 'oneoff')
+            )
+            return cur.fetchone()["id"]
+        else:
+            cur = conn.execute(
+                "insert into reminders(user_id,title,body,when_iso,kind) values(?,?,?,?,?)",
+                (user_id, title, body, when_iso_utc, 'oneoff')
+            )
+            conn.commit()
+            return cur.lastrowid
+
+def db_add_reminder_recurring(user_id: int, title: str, body: str | None, recurrence: dict, tz: str) -> int:
+    rec = dict(recurrence or {})
+    rec["tz"] = tz
+    rec_json = json.dumps(rec, ensure_ascii=False)
+    with db() as conn:
+        if DB_DIALECT == "postgres":
+            cur = conn.execute(
+                "insert into reminders(user_id,title,body,when_iso,kind,recurrence_json) values(%s,%s,%s,%s,%s,%s) returning id",
+                (user_id, title, body, None, 'recurring', rec_json)
+            )
+            return cur.fetchone()["id"]
+        else:
+            cur = conn.execute(
+                "insert into reminders(user_id,title,body,when_iso,kind,recurrence_json) values(?,?,?,?,?,?)",
+                (user_id, title, body, None, 'recurring', rec_json)
+            )
+            conn.commit()
+            return cur.lastrowid
+
+def db_mark_done(rem_id: int):
+    with db() as conn:
+        q = "update reminders set status='done' where id=%s" if DB_DIALECT=="postgres" else "update reminders set status='done' where id=?"
+        conn.execute(q, (rem_id,))
+
+def db_snooze(rem_id: int, minutes: int):
+    with db() as conn:
+        q = "select when_iso, kind from reminders where id=%s" if DB_DIALECT=="postgres" else "select when_iso, kind from reminders where id=?"
+        cur = conn.execute(q, (rem_id,))
+        row = cur.fetchone()
+        if not row:
+            return None, None
+        rowd = dict(row) if not isinstance(row, dict) else row
+        kind = (rowd.get("kind") or "oneoff").lower()
+        if kind == "recurring":
+            return "recurring", None
+        base = rowd.get("when_iso")
+        dt = dparser.isoparse(str(base)) + timedelta(minutes=minutes)
+        new_iso = iso_utc(dt)
+        q2 = "update reminders set when_iso=%s, status='scheduled' where id=%s" if DB_DIALECT=="postgres" else "update reminders set when_iso=?, status='scheduled' where id=?"
+        conn.execute(q2, (new_iso, rem_id))
+        return "oneoff", dt
+
+def db_delete(rem_id: int):
+    with db() as conn:
+        q = "delete from reminders where id=%s" if DB_DIALECT=="postgres" else "delete from reminders where id=?"
+        conn.execute(q, (rem_id,))
+
+def db_future(user_id: int):
+    with db() as conn:
+        q = (
+            "select * from reminders where user_id=%s and status='scheduled' order by id desc"
+            if DB_DIALECT == "postgres"
+            else "select * from reminders where user_id=? and status='scheduled' order by id desc"
+        )
+        try:
+            cur = conn.execute(q, (user_id,))
+            rows = cur.fetchall() or []
+            log.debug("db_future: got %d rows for user_id=%s", len(rows), user_id)
+            return rows
+        except Exception:
+            log.exception("db_future query failed")
+            return []
+
+def db_get_reminder(rem_id: int):
+    with db() as conn:
+        q = "select * from reminders where id=%s" if DB_DIALECT=="postgres" else "select * from reminders where id=?"
+        cur = conn.execute(q, (rem_id,))
+        return cur.fetchone()
 
 # ---------- TZ / ISO ----------
 def tzinfo_from_user(tz_str: str) -> timezone | ZoneInfo:
@@ -321,7 +427,7 @@ def rule_parse(text: str, now_local: datetime):
         return {"intent": "create_interval", "title": _extract_title(text), "unit": "minute", "n": 1, "start_at": now_local}
 
     if re.search(r"\bчерез\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)\b", s):
-        m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\д+\s*час(?:а|ов)?)", s)
+        m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)", s)
         delta = timedelta()
         ch = m.group(1)
         if "полчаса" in ch: delta = timedelta(minutes=30)
@@ -428,13 +534,14 @@ def reschedule_all():
     with db() as conn:
         rows = conn.execute("select * from reminders where status='scheduled'").fetchall()
     for r in rows:
-        if (r["kind"] or "oneoff") == "oneoff" and r["when_iso"]:
-            schedule_oneoff(r["id"], r["user_id"], r["when_iso"], r["title"], kind="oneoff")
+        row = dict(r) if not isinstance(r, dict) else r
+        if (row.get("kind") or "oneoff") == "oneoff" and row.get("when_iso"):
+            schedule_oneoff(row["id"], row["user_id"], row["when_iso"], row["title"], kind="oneoff")
         else:
-            rec = json.loads(r["recurrence_json"] or "{}")
+            rec = json.loads(row.get("recurrence_json") or "{}")
             tz = rec.get("tz") or "+03:00"
             if rec:
-                schedule_recurring(r["id"], r["user_id"], r["title"], rec, tz)
+                schedule_recurring(row["id"], row["user_id"], row["title"], rec, tz)
     log.info("Rescheduled %d reminders from DB", len(rows))
 
 # ---------- RU wording ----------
@@ -506,6 +613,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
                      reply_markup=MAIN_MENU_KB)
 
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_reply(update, "pong")
+
 async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.message or not update.message.text: return False
     tz = parse_tz_input(update.message.text.strip())
@@ -514,7 +624,6 @@ async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
                      reply_markup=MAIN_MENU_KB)
     return True
-    
 
 async def cb_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -525,22 +634,6 @@ async def cb_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Пришли смещение вида +03:00 или IANA-зону (Europe/Moscow)."); return
     db_set_user_tz(chat_id, value)
     await q.edit_message_text(f"Часовой пояс установлен: {value}\nТеперь напиши что и когда напомнить.")
-
-def db_future(user_id: int):
-    with db() as conn:
-        q = (
-            "select * from reminders where user_id=%s and status='scheduled' order by id desc"
-            if DB_DIALECT == "postgres"
-            else "select * from reminders where user_id=? and status='scheduled' order by id desc"
-        )
-        try:
-            cur = conn.execute(q, (user_id,))
-            rows = cur.fetchall() or []
-            log.debug("db_future: got %d rows for user_id=%s", len(rows), user_id)
-            return rows
-        except Exception:
-            log.exception("db_future query failed")
-            return []
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -554,35 +647,22 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tz = db_get_user_tz(user_id) or "+03:00"
         await safe_reply(update, "🗓 Ближайшие напоминания —")
 
-        PAD = "⠀" * 20
+        PAD = "⠀" * 20  # невидимые символы для растяжения
         for r in rows:
             try:
                 line = format_reminder_line(r, tz)
             except Exception:
                 log.exception("format_reminder_line failed on row=%r", r)
-                # максимально безопасная подстановка
                 title = r.get("title") if isinstance(r, dict) else (r["title"] if r else "Напоминание")
                 line = f"«{title}» (некорректные данные)"
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"🗑 Удалить {PAD}", callback_data=f"del:{r['id']}")]
+                [InlineKeyboardButton(f"🗑 Удалить {PAD}", callback_data=f"del:{(dict(r) if not isinstance(r,dict) else r)['id']}")]
             ])
             await safe_reply(update, line, reply_markup=kb)
             await asyncio.sleep(0.05)
     except Exception:
         log.exception("cmd_list fatal")
         return await safe_reply(update, "Не удалось получить список. Попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
-
-    tz = db_get_user_tz(user_id) or "+03:00"
-    await safe_reply(update, "🗓 Ближайшие напоминания —")
-
-    PAD = "⠀" * 20
-    for r in rows:
-        line = format_reminder_line(r, tz)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🗑 Удалить {PAD}", callback_data=f"del:{r['id']}")]
-        ])
-        await safe_reply(update, line, reply_markup=kb)
-        await asyncio.sleep(0.05)
 
 async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -596,8 +676,9 @@ async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, mins, rem_id = data.split(":"); rem_id = int(rem_id); mins = int(mins)
         kind, _ = db_snooze(rem_id, mins); row = db_get_reminder(rem_id)
         if not row: return await q.edit_message_text("Ошибка: напоминание не найдено.")
+        rowd = dict(row) if not isinstance(row, dict) else row
         if kind == "oneoff":
-            schedule_oneoff(rem_id, row["user_id"], row["when_iso"], row["title"], kind="oneoff")
+            schedule_oneoff(rem_id, rowd["user_id"], rowd["when_iso"], rowd["title"], kind="oneoff")
             await q.edit_message_text(f"⏲ Отложено на {mins} мин.")
         else:
             when = iso_utc(datetime.now(timezone.utc) + timedelta(minutes=mins))
@@ -605,7 +686,7 @@ async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sch.add_job(
                 fire_reminder, DateTrigger(run_date=dparser.isoparse(when)),
                 id=f"snooze-{rem_id}", replace_existing=True, misfire_grace_time=60, coalesce=True,
-                kwargs={"chat_id": row["user_id"], "rem_id": rem_id, "title": row["title"], "kind":"oneoff"},
+                kwargs={"chat_id": rowd["user_id"], "rem_id": rem_id, "title": rowd["title"], "kind":"oneoff"},
                 name=f"snooze {rem_id}",
             )
             await q.edit_message_text(f"⏲ Отложено на {mins} мин. (одноразово)")
@@ -631,7 +712,7 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
     dt_local = to_user_local(when_iso_utc, tz)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-    await safe_reply(update, f"⏰ Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+    await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -731,6 +812,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await cmd_list(update, context)
         if incoming_text == "⚙️ Настройки" or incoming_text.lower() == "/settings":
             return await safe_reply(update, "Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
+        if incoming_text.lower() == "/ping":
+            return await cmd_ping(update, context)
 
         user_tz = db_get_user_tz(user_id)
         if not user_tz:
@@ -765,7 +848,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_reply(update, "Уточни время, пожалуйста.")
                 return
 
-        # ... LLM часть без изменений (опущу для краткости)
+        # Если сюда дошли — LLM (упрощённо можно отключить)
         await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
     except Exception:
         log.exception("handle_text fatal")
@@ -789,9 +872,9 @@ async def on_startup(app: Application):
     jobstores = None
     if DB_DIALECT == "postgres" and DATABASE_URL:
         jobstore_url, _, _ = _url_with_ipv4_host(
-        DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-    )
-    jobstores = {"default": SQLAlchemyJobStore(url=jobstore_url)}
+            DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+        )
+        jobstores = {"default": SQLAlchemyJobStore(url=jobstore_url)}
 
     scheduler = AsyncIOScheduler(
         timezone=timezone.utc,
@@ -857,7 +940,6 @@ def db_init():
                 pass
             conn.commit()
 
-
 # ---------- MAIN ----------
 def main():
     log.info("Starting PlannerBot...")
@@ -875,6 +957,7 @@ def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("settings", lambda u,c: u.message.reply_text(
         "Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CallbackQueryHandler(cb_tz, pattern=r"^tz:"))
     app.add_handler(CallbackQueryHandler(cb_inline, pattern=r"^(del:|done:|snooze:)"))
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
@@ -887,7 +970,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
