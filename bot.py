@@ -439,6 +439,7 @@ def rule_parse(text: str, now_local: datetime):
 
         md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s)
     mt = re.search(r"\bв\s+(\d{1,2})(?::(\d{2}))?(?:\s*(?:час(?:а|ов)?|ч))?\b", s)
+    
     if md and mt:
         base = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[md.group(1)]
         day = (now_local + timedelta(days=base)).date()
@@ -825,7 +826,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
         return
 
-    # 1) Правила (rule-based)
+    # 1) Rule-based разбор
     now_local = now_in_user_tz(user_tz)
     parsed = None
     try:
@@ -861,7 +862,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("apply parsed result failed: %r", parsed)
             return await safe_reply(update, "Упс, что-то пошло не так. Напиши ещё раз, пожалуйста.")
-    
+
     # 2) Fallback → LLM
     try:
         res = await call_llm(incoming_text, user_tz)
@@ -878,7 +879,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
             dt_local = to_user_local(when_iso_utc, user_tz)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+            return await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%м в %H:%M')}", reply_markup=kb)
 
         if intent == "create_recurring":
             title = res.get("title") or "Напоминание"
@@ -886,17 +887,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rem_id = db_add_reminder_recurring(user_id, title, res.get("body"), recurrence, user_tz)
             schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            # короткое резюме:
-            phrase = _format_interval_phrase(recurrence.get("unit"), recurrence.get("n")) \
-                     if (recurrence.get("type") == "interval") else title
             return await safe_reply(update, f"⏰ Окей, буду напоминать «{title}».", reply_markup=kb)
 
-        # если LLM тоже не разобрал
         return await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
     except Exception:
         log.exception("LLM fallback failed")
         return await safe_reply(update, "Упс, что-то пошло не так. Напиши ещё раз, пожалуйста.")
-
 
 # ---------- Error handler ----------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
