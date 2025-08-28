@@ -438,7 +438,7 @@ def rule_parse(text: str, now_local: datetime):
         return {"intent": "create", "title": _extract_title(text), "when_local": when_local}
 
         md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s)
-    mt = re.search(r"\bв\s+(\d{1,2})(?::?(\d{2}))?\s*(час(?:а|ов)?|ч)?\b", s)
+    mt = re.search(r"\bв\s+(\d{1,2})(?::(\d{2}))?(?:\s*(?:час(?:а|ов)?|ч))?\b", s)
     if md and mt:
         base = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[md.group(1)]
         day = (now_local + timedelta(days=base)).date()
