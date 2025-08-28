@@ -848,8 +848,85 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_reply(update, "Уточни время, пожалуйста.")
                 return
 
-        # Если сюда дошли — LLM (упрощённо можно отключить)
-        await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+                # --- LLM ветка ---
+        # если ранее был вопрос-уточнение, "замораживаем" NOW и собираем составной текст
+        cstate = get_clarify_state(context)
+        now_iso_for_state = (cstate.get("now_iso") if cstate else None)
+        user_text_for_llm = (
+            f"Исходная заявка: {cstate['original']}\nОтвет на уточнение: {incoming_text}"
+            if cstate else incoming_text
+        )
+
+        try:
+            result = await call_llm(user_text_for_llm, user_tz, now_iso_override=now_iso_for_state)
+        except Exception:
+            log.exception("LLM call failed")
+            return await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+
+        intent = (result or {}).get("intent")
+
+        if intent == "ask_clarification":
+            question = result.get("question") or "Уточни, пожалуйста."
+            variants = result.get("variants") or []
+
+            # сохраняем исходную формулировку + замороженный NOW_ISO
+            set_clarify_state(context, {
+                "original": (get_clarify_state(context) or {}).get("original")
+                            or (result.get("text_original") or incoming_text),
+                "now_iso": now_iso_for_state or now_in_user_tz(user_tz).replace(microsecond=0).isoformat()
+            })
+
+            kb_rows = []
+            for v in variants[:6]:
+                if isinstance(v, dict):
+                    label = v.get("label") or v.get("text") or v.get("iso_datetime") or "Выбрать"
+                    iso = v.get("iso_datetime")
+                    kb_rows.append([InlineKeyboardButton(label, callback_data=(f"pick:{iso}" if iso else f"answer:{label}"))])
+                else:
+                    kb_rows.append([InlineKeyboardButton(str(v), callback_data=f"answer:{v}")])
+
+            return await safe_reply(update, question, reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None)
+
+        if intent == "create_reminder":
+            title = result.get("title") or "Напоминание"
+            body = result.get("description")
+            dt_iso_local = result.get("fixed_datetime")
+            recurrence = result.get("recurrence")
+
+            if recurrence:
+                rem_id = db_add_reminder_recurring(user_id, title, body, recurrence, user_tz)
+                schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
+                rtype = (recurrence.get("type") or "").lower()
+                if rtype == "interval":
+                    phrase = _format_interval_phrase(recurrence.get("unit"), recurrence.get("n"))
+                    text = f"⏰ Окей, буду напоминать «{title}» {phrase}"
+                elif rtype == "daily":
+                    text = f"⏰ Окей, буду напоминать «{title}» каждый день в {recurrence.get('time')}"
+                elif rtype == "weekly":
+                    text = f"⏰ Окей, буду напоминать «{title}» {ru_weekly_phrase(recurrence.get('weekday'))} в {recurrence.get('time')}"
+                elif rtype == "yearly":
+                    text = f"⏰ Окей, буду напоминать «{title}» каждый год {int(recurrence.get('day')):02d}.{int(recurrence.get('month')):02d} в {recurrence.get('time')}"
+                else:
+                    text = f"⏰ Окей, буду напоминать «{title}» каждое {recurrence.get('day')}-е число в {recurrence.get('time')}"
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+                set_clarify_state(context, None)
+                return await safe_reply(update, text, reply_markup=kb)
+
+            if not dt_iso_local:
+                return await safe_reply(update, "Не понял время. Напиши, например: «сегодня 18:30».")
+            when_local = dparser.isoparse(dt_iso_local)
+            if when_local.tzinfo is None:
+                when_local = when_local.replace(tzinfo=tzinfo_from_user(user_tz))
+            when_iso_utc = iso_utc(when_local)
+            rem_id = db_add_reminder_oneoff(user_id, title, body, when_iso_utc)
+            schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+            set_clarify_state(context, None)
+            return await safe_reply(update, f"⏰ Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+
+        # ничего не распознали
+        return await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+
     except Exception:
         log.exception("handle_text fatal")
         await safe_reply(update, "Упс, что-то пошло не так. Напиши ещё раз, пожалуйста.")
