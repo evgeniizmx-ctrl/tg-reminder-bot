@@ -135,10 +135,13 @@ def db():
              "set" if conn_url_ipv4 != DATABASE_URL else "same",
              ipv4, parts.get("host"))
 
-        # Попытка 1: прям URL с IPv4
-try:
-    return psycopg.connect(conn_url_ipv4, autocommit=True, row_factory=dict_row)
-except Exception as e1:
+            # Попытка 1: прям URL с IPv4
+    try:
+        return psycopg.connect(conn_url_ipv4, autocommit=True, row_factory=dict_row)
+    except Exception as e1:
+        log.warning("IPv4 URL connect failed, will try kwargs hostaddr. Err=%r", e1)
+        last_err = e1
+        
     log.warning("IPv4 URL connect failed, will try kwargs hostaddr. Err=%r", e1)
     last_err = e1
 
