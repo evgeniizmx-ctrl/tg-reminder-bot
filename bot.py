@@ -43,6 +43,10 @@ PROMPTS_PATH = os.environ.get("PROMPTS_PATH", "prompts.yaml")
 DB_PATH = os.environ.get("DB_PATH", "reminders.db")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
+# Новое: берём URL к Postgres и выбираем диалект ДО блока DB
+DATABASE_URL = os.environ.get("DATABASE_URL")  # postgresql+psycopg://...@.../postgres?sslmode=require
+DB_DIALECT = (os.environ.get("DB_DIALECT") or ("postgres" if DATABASE_URL else "sqlite")).lower()
+
 missing = []
 if not BOT_TOKEN: missing.append("BOT_TOKEN")
 if not OPENAI_API_KEY:
@@ -52,6 +56,9 @@ if not os.path.exists(PROMPTS_PATH): missing.append(f"{PROMPTS_PATH} (prompts.ya
 if missing and "BOT_TOKEN" in missing:
     log.error("Missing required environment/files: %s", ", ".join(missing))
     sys.exit(1)
+
+# Полезно видеть, что выбралось
+log.info("DB mode: %s (DATABASE_URL=%s)", DB_DIALECT, "set" if DATABASE_URL else "not set")
 
 # ---------- DB ----------
 def db():
