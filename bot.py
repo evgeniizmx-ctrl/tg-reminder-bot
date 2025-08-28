@@ -414,8 +414,9 @@ def _extract_title(text: str) -> str:
     return t.capitalize() if t else "Напоминание"
 
 def rule_parse(text: str, now_local: datetime):
-    s = text.strip().lower()
+    s = (text or "").strip().lower()
 
+    # --- интервалы ---
     m_int = re.search(r"\bкажды(е|й|е)\s+(\d+)\s*(сек|секунд|секунды|мин|минут|минуты|час|часа|часов)\b", s)
     if m_int:
         n = int(m_int.group(2))
@@ -426,31 +427,73 @@ def rule_parse(text: str, now_local: datetime):
     if re.search(r"\bкажд(ую|ый)\s+минут(у|ы)?\b", s):
         return {"intent": "create_interval", "title": _extract_title(text), "unit": "minute", "n": 1, "start_at": now_local}
 
+    # --- «через …» ---
     if re.search(r"\bчерез\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)\b", s):
         m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)", s)
         delta = timedelta()
         ch = m.group(1)
-        if "полчаса" in ch: delta = timedelta(minutes=30)
-        elif "минуту" in ch: delta = timedelta(minutes=1)
-        elif "мин" in ch: delta = timedelta(minutes=int(re.search(r"\d+", ch).group()))
-        else: delta = timedelta(hours=int(re.search(r"\d+", ch).group()))
+        if "полчаса" in ch:
+            delta = timedelta(minutes=30)
+        elif "минуту" in ch:
+            delta = timedelta(minutes=1)
+        elif "мин" in ch:
+            delta = timedelta(minutes=int(re.search(r"\d+", ch).group()))
+        else:
+            delta = timedelta(hours=int(re.search(r"\d+", ch).group()))
         when_local = now_local + delta
         return {"intent": "create", "title": _extract_title(text), "when_local": when_local}
 
-        md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s)
-    mt = re.search(r"\bв\s+(\d{1,2})(?::(\d{2}))?(?:\s*(?:час(?:а|ов)?|ч))?\b", s)
-    
-    if md and mt:
+    # --- якорь по дню ---
+    base = 0
+    md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s)
+    if md:
         base = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[md.group(1)]
-        day = (now_local + timedelta(days=base)).date()
+    day = (now_local + timedelta(days=base)).date()
 
-        # если минут нет — берём :00, НЕ спрашиваем уточнение
+    # --- обычное время «в 11[:40]» ---
+    mt = re.search(r"\bв\s+(\d{1,2})(?::(\d{2}))?\b", s)
+    if mt:
         hh = int(mt.group(1))
         mm = int(mt.group(2) or 0)
-
         title = _extract_title(text)
+        # без минут → уточнить (двусмысленно: 11:00 или 23:00)
+        if mt.group(2) is None and 1 <= hh <= 12:
+            return {
+                "intent": "ask",
+                "title": title,
+                "base_date": day.isoformat(),
+                "question": "Уточни, пожалуйста, время",
+                "variants": [f"{hh:02d}:00", f"{(hh % 12) + 12:02d}:00"],
+            }
+        when_local = datetime(day.year, day.month, day.day, hh, mm, tzinfo=now_local.tzinfo)
+        return {"intent": "create", "title": title, "when_local": when_local}
 
-        # строим локальное время (как написали — так и понимаем, без догадок про 12/24)
+    # --- спец-формы «в час / в полдень / в полночь» ---
+    title = _extract_title(text)
+    if re.search(r"\bв\s+час\b", s):
+        when_local = datetime(day.year, day.month, day.day, 1, 0, tzinfo=now_local.tzinfo)
+        return {"intent": "create", "title": title, "when_local": when_local}
+    if re.search(r"\bв\s+полдень\b", s):
+        when_local = datetime(day.year, day.month, day.day, 12, 0, tzinfo=now_local.tzinfo)
+        return {"intent": "create", "title": title, "when_local": when_local}
+    if re.search(r"\bв\s+полночь\b", s):
+        when_local = datetime(day.year, day.month, day.day, 0, 0, tzinfo=now_local.tzinfo)
+        return {"intent": "create", "title": title, "when_local": when_local}
+
+    # --- «в полшестого / полпятого …» ---
+    num_map = {
+        "первого": 1, "второго": 2, "третьего": 3, "четвертого": 4, "четвёртого": 4,
+        "пятого": 5, "шестого": 6, "седьмого": 7, "восьмого": 8,
+        "девятого": 9, "десятого": 10, "одиннадцатого": 11, "двенадцатого": 12,
+    }
+    mhalf = re.search(
+        r"\bв\s*пол\s*(первого|второго|третьего|четвертого|четвёртого|пятого|шестого|седьмого|восьмого|девятого|десятого|одиннадцатого|двенадцатого)\b",
+        s,
+    )
+    if mhalf:
+        target = num_map[mhalf.group(1)]
+        hh = (target - 1) % 24  # «полшестого» → 5 (т.е. 6 - 0.5)
+        mm = 30
         when_local = datetime(day.year, day.month, day.day, hh, mm, tzinfo=now_local.tzinfo)
         return {"intent": "create", "title": title, "when_local": when_local}
 
