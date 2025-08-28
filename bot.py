@@ -116,6 +116,7 @@ def _url_with_ipv4_host(url: str) -> tuple[str, str | None, dict]:
     return new_url, ipv4, parts
 
 # ---------- DB ----------
+# ---------- DB ----------
 def db():
     """
     Подключение к БД:
@@ -135,22 +136,19 @@ def db():
              "set" if conn_url_ipv4 != DATABASE_URL else "same",
              ipv4, parts.get("host"))
 
-            # Попытка 1: прям URL с IPv4
+    # Попытка 1: прям URL с IPv4
     try:
         return psycopg.connect(conn_url_ipv4, autocommit=True, row_factory=dict_row)
     except Exception as e1:
         log.warning("IPv4 URL connect failed, will try kwargs hostaddr. Err=%r", e1)
         last_err = e1
-        
-    log.warning("IPv4 URL connect failed, will try kwargs hostaddr. Err=%r", e1)
-    last_err = e1
 
-# Попытка 2: kwargs с hostaddr (если IPv4 есть)
-if not ipv4:
-    # вообще нет IPv4 — перекидываем исходную ошибку
-    raise last_err
+    # Попытка 2: kwargs с hostaddr (если IPv4 есть)
+    if not ipv4:
+        # вообще нет IPv4 — перекидываем исходную ошибку
+        raise last_err
 
-    # Разобраем query → dict
+    # Разбираем query → dict
     qs = dict(parse_qsl(parts.get("query") or "", keep_blank_values=True))
     sslmode = qs.get("sslmode", "require")
 
