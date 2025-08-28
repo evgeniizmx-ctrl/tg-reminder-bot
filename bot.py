@@ -437,18 +437,22 @@ def rule_parse(text: str, now_local: datetime):
         when_local = now_local + delta
         return {"intent": "create", "title": _extract_title(text), "when_local": when_local}
 
-    md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s)
+        md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s)
     mt = re.search(r"\bв\s+(\d{1,2})(?::?(\d{2}))?\s*(час(?:а|ов)?|ч)?\b", s)
     if md and mt:
         base = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[md.group(1)]
         day = (now_local + timedelta(days=base)).date()
-        hh = int(mt.group(1)); mm = int(mt.group(2) or 0)
+
+        # если минут нет — берём :00, НЕ спрашиваем уточнение
+        hh = int(mt.group(1))
+        mm = int(mt.group(2) or 0)
+
         title = _extract_title(text)
-        if mt.group(2) is None and 1 <= hh <= 12:
-            return {"intent":"ask","title":title,"base_date":day.isoformat(),"question":"Уточни, пожалуйста, время",
-                    "variants":[f"{hh:02d}:00", f"{(hh%12)+12:02d}:00"]}
+
+        # строим локальное время (как написали — так и понимаем, без догадок про 12/24)
         when_local = datetime(day.year, day.month, day.day, hh, mm, tzinfo=now_local.tzinfo)
         return {"intent": "create", "title": title, "when_local": when_local}
+
     return None
 
 # ---------- Scheduler ----------
