@@ -62,201 +62,108 @@ if missing and "BOT_TOKEN" in missing:
 log.info("DB mode: %s (DATABASE_URL=%s)", DB_DIALECT, "set" if DATABASE_URL else "not set")
 
 # ---------- Helpers ----------
-def _url_with_ipv4_host(url: str) -> str:
+def _url_with_ipv4_host(url: str) -> tuple[str, str | None, dict]:
     """
-    Резолвит hostname в IPv4 и подставляет его в netloc (user:pass@<ipv4>:port),
-    чтобы libpq/psycopg не пытались идти по IPv6.
+    Возвращает (new_url, ipv4, parts)
+    - new_url: URL с подставленным IPv4 в netloc (если вышло), иначе исходный
+    - ipv4: найденный IPv4 (или None)
+    - parts: разобранные части (scheme, username, password, host, port, path, query)
     """
+    from urllib.parse import urlsplit, urlunsplit
     if not url:
-        return url
-    try:
-        p = urlsplit(url)
-        host = p.hostname
-        port = p.port or 5432
-        if not host:
-            return url
-        # Берём первую A-запись (IPv4)
-        infos = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
-        ipv4 = infos[0][4][0]
+        return url, None, {}
 
-        # Соберём netloc: [user[:pass]@]ipv4[:port]
-        userinfo = ""
-        if p.username:
-            userinfo = p.username
-            if p.password:
-                userinfo += f":{p.password}"
-            userinfo += "@"
-        netloc = f"{userinfo}{ipv4}:{port}"
+    p = urlsplit(url)
+    host = p.hostname
+    port = p.port or 5432
+    scheme = p.scheme
+    user = p.username
+    password = p.password
+    query = p.query
+    parts = {
+        "scheme": scheme, "username": user, "password": password,
+        "host": host, "port": port, "path": p.path, "query": query
+    }
 
-        # Сохраним query как есть (sslmode=require и т.п.)
-        new_url = urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment))
-        return new_url
-    except Exception:
-        # На всякий — вернём исходный
-        return url
+    if not host:
+        return url, None, parts
+
+    # 1) ручной override
+    ipv4_env = (os.environ.get("DB_HOST_IPV4") or "").strip() or None
+    ipv4 = None
+    if ipv4_env:
+        ipv4 = ipv4_env
+    else:
+        # 2) простой фоллбек
+        try:
+            ipv4 = socket.gethostbyname(host)  # IPv4 только
+        except Exception:
+            ipv4 = None
+
+    if not ipv4:
+        # не получилось — вернём исходный URL
+        return url, None, parts
+
+    # Соберём netloc: [user[:pass]@]ipv4[:port]
+    userinfo = ""
+    if user:
+        userinfo = user
+        if password:
+            userinfo += f":{password}"
+        userinfo += "@"
+    netloc = f"{userinfo}{ipv4}:{port}"
+    new_url = urlunsplit((scheme, netloc, p.path, query, p.fragment))
+    return new_url, ipv4, parts
 
 # ---------- DB ----------
 def db():
     """
-    Возвращает подключение к БД.
-    - Postgres (Supabase): psycopg, строки как dict (row['field'])
-    - SQLite fallback: если нет DATABASE_URL
+    Подключение к БД:
+    - если postgres: форсим IPv4.
+      1) пробуем URL с IPv4 в netloc;
+      2) если всё ещё падает — собираем kwargs c hostaddr=<ipv4>, host=<dnsname>.
+    - иначе sqlite.
     """
-    if DB_DIALECT == "postgres":
-        conn_url = _url_with_ipv4_host(DATABASE_URL)
-        return psycopg.connect(conn_url, autocommit=True, row_factory=dict_row)
-    else:
+    if DB_DIALECT != "postgres":
         import sqlite3
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         return conn
 
-def db_init():
-    with db() as conn:
-        if DB_DIALECT == "postgres":
-            conn.execute("""
-                create table if not exists users (
-                  user_id bigint primary key,
-                  tz text
-                )
-            """)
-            conn.execute("""
-                create table if not exists reminders (
-                  id bigserial primary key,
-                  user_id bigint not null,
-                  title text not null,
-                  body text,
-                  when_iso text,
-                  status text default 'scheduled',
-                  kind text default 'oneoff',
-                  recurrence_json text
-                )
-            """)
-            conn.execute("create index if not exists reminders_user_idx on reminders(user_id)")
-            conn.execute("create index if not exists reminders_status_idx on reminders(status)")
-        else:
-            import sqlite3
-            conn.execute("""
-                create table if not exists users (
-                    user_id integer primary key,
-                    tz text
-                )
-            """)
-            conn.execute("""
-                create table if not exists reminders (
-                    id integer primary key autoincrement,
-                    user_id integer not null,
-                    title text not null,
-                    body text,
-                    when_iso text,
-                    status text default 'scheduled',
-                    kind text default 'oneoff',
-                    recurrence_json text
-                )
-            """)
-            try: conn.execute("alter table reminders add column kind text default 'oneoff'")
-            except Exception: pass
-            try: conn.execute("alter table reminders add column recurrence_json text")
-            except Exception: pass
-            conn.commit()
+    conn_url_ipv4, ipv4, parts = _url_with_ipv4_host(DATABASE_URL)
+    log.info("Postgres connect try: url_ipv4=%s, ipv4=%s, host=%s",
+             "set" if conn_url_ipv4 != DATABASE_URL else "same",
+             ipv4, parts.get("host"))
 
-def db_get_user_tz(user_id: int) -> str | None:
-    with db() as conn:
-        q = "select tz from users where user_id=%s" if DB_DIALECT=="postgres" else "select tz from users where user_id=?"
-        cur = conn.execute(q, (user_id,))
-        row = cur.fetchone()
-        return (row and row["tz"]) or None
+    # Попытка 1: прям URL с IPv4
+    try:
+        return psycopg.connect(conn_url_ipv4, autocommit=True, row_factory=dict_row)
+    except Exception as e1:
+        log.warning("IPv4 URL connect failed, will try kwargs hostaddr. Err=%r", e1)
 
-def db_set_user_tz(user_id: int, tz: str):
-    with db() as conn:
-        if DB_DIALECT == "postgres":
-            conn.execute("""
-                insert into users(user_id, tz) values(%s, %s)
-                on conflict (user_id) do update set tz=excluded.tz
-            """, (user_id, tz))
-        else:
-            conn.execute(
-                "insert into users(user_id, tz) values(?, ?) "
-                "on conflict(user_id) do update set tz=excluded.tz",
-                (user_id, tz)
-            )
-            conn.commit()
+    # Попытка 2: kwargs с hostaddr (если IPv4 есть)
+    if not ipv4:
+        # вообще нет IPv4 — падаем той же ошибкой
+        raise
 
-def db_add_reminder_oneoff(user_id: int, title: str, body: str | None, when_iso_utc: str) -> int:
-    with db() as conn:
-        if DB_DIALECT == "postgres":
-            cur = conn.execute(
-                "insert into reminders(user_id,title,body,when_iso,kind) values(%s,%s,%s,%s,%s) returning id",
-                (user_id, title, body, when_iso_utc, 'oneoff')
-            )
-            return cur.fetchone()["id"]
-        else:
-            cur = conn.execute(
-                "insert into reminders(user_id,title,body,when_iso,kind) values(?,?,?,?,?)",
-                (user_id, title, body, when_iso_utc, 'oneoff')
-            )
-            conn.commit()
-            return cur.lastrowid
+    # Разобраем query → dict
+    qs = dict(parse_qsl(parts.get("query") or "", keep_blank_values=True))
+    sslmode = qs.get("sslmode", "require")
 
-def db_add_reminder_recurring(user_id: int, title: str, body: str | None, recurrence: dict, tz: str) -> int:
-    rec = dict(recurrence or {})
-    rec["tz"] = tz
-    rec_json = json.dumps(rec, ensure_ascii=False)
-    with db() as conn:
-        if DB_DIALECT == "postgres":
-            cur = conn.execute(
-                "insert into reminders(user_id,title,body,when_iso,kind,recurrence_json) values(%s,%s,%s,%s,%s,%s) returning id",
-                (user_id, title, body, None, 'recurring', rec_json)
-            )
-            return cur.fetchone()["id"]
-        else:
-            cur = conn.execute(
-                "insert into reminders(user_id,title,body,when_iso,kind,recurrence_json) values(?,?,?,?,?,?)",
-                (user_id, title, body, None, 'recurring', rec_json)
-            )
-            conn.commit()
-            return cur.lastrowid
+    kwargs = {
+        "hostaddr": ipv4,
+        "host": parts["host"],            # для TLS SNI/cert
+        "port": parts["port"] or 5432,
+        "dbname": (parts["path"][1:] if parts["path"].startswith("/") else parts["path"] or "postgres"),
+        "user": parts["username"],
+        "password": parts["password"],
+        "sslmode": sslmode,
+        "autocommit": True,
+        "row_factory": dict_row,
+    }
+    log.info("Postgres connect kwargs: %s", {k: kwargs[k] for k in ("hostaddr","host","port","dbname","sslmode")})
 
-def db_mark_done(rem_id: int):
-    with db() as conn:
-        q = "update reminders set status='done' where id=%s" if DB_DIALECT=="postgres" else "update reminders set status='done' where id=?"
-        conn.execute(q, (rem_id,))
-
-def db_snooze(rem_id: int, minutes: int):
-    with db() as conn:
-        q = "select when_iso, kind from reminders where id=%s" if DB_DIALECT=="postgres" else "select when_iso, kind from reminders where id=?"
-        cur = conn.execute(q, (rem_id,))
-        row = cur.fetchone()
-        if not row:
-            return None, None
-        kind = (row.get("kind") if isinstance(row, dict) else row["kind"]) or "oneoff"
-        if kind == "recurring":
-            return "recurring", None
-        base = row.get("when_iso") if isinstance(row, dict) else row["when_iso"]
-        dt = dparser.isoparse(str(base)) + timedelta(minutes=minutes)
-        new_iso = iso_utc(dt)
-        q2 = "update reminders set when_iso=%s, status='scheduled' where id=%s" if DB_DIALECT=="postgres" else "update reminders set when_iso=?, status='scheduled' where id=?"
-        conn.execute(q2, (new_iso, rem_id))
-        return "oneoff", dt
-
-def db_delete(rem_id: int):
-    with db() as conn:
-        q = "delete from reminders where id=%s" if DB_DIALECT=="postgres" else "delete from reminders where id=?"
-        conn.execute(q, (rem_id,))
-
-def db_future(user_id: int):
-    with db() as conn:
-        q = ("select * from reminders where user_id=%s and status='scheduled' order by id desc"
-             if DB_DIALECT=="postgres"
-             else "select * from reminders where user_id=? and status='scheduled' order by id desc")
-        cur = conn.execute(q, (user_id,))
-        return cur.fetchall()
-
-def db_get_reminder(rem_id: int):
-    with db() as conn:
-        q = "select * from reminders where id=%s" if DB_DIALECT=="postgres" else "select * from reminders where id=?"
-        cur = conn.execute(q, (rem_id,))
-        return cur.fetchone()
+    return psycopg.connect(**kwargs)
 
 # ---------- TZ / ISO ----------
 def tzinfo_from_user(tz_str: str) -> timezone | ZoneInfo:
