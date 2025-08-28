@@ -751,11 +751,9 @@ async def on_startup(app: Application):
     log.info("APScheduler started in PTB event loop")
     reschedule_all()
 
-# ---------- main ----------
-def main():
-    log.info("Starting PlannerBot...")
-    def db_init():
-        with db() as conn:
+# ---------- DB INIT ----------
+def db_init():
+    with db() as conn:
         if DB_DIALECT == "postgres":
             conn.execute("""
                 create table if not exists users (
@@ -797,19 +795,30 @@ def main():
                     recurrence_json text
                 )
             """)
-            try: conn.execute("alter table reminders add column kind text default 'oneoff'")
-            except Exception: pass
-            try: conn.execute("alter table reminders add column recurrence_json text")
-            except Exception: pass
+            try:
+                conn.execute("alter table reminders add column kind text default 'oneoff'")
+            except Exception:
+                pass
+            try:
+                conn.execute("alter table reminders add column recurrence_json text")
+            except Exception:
+                pass
             conn.commit()
 
+
+# ---------- MAIN ----------
+def main():
+    log.info("Starting PlannerBot...")
+    db_init()
 
     app = (Application.builder()
            .token(BOT_TOKEN)
            .post_init(on_startup)
            .build())
 
+    # Глобальный error-handler
     app.add_error_handler(on_error)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("settings", lambda u,c: u.message.reply_text(
@@ -818,10 +827,15 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_inline, pattern=r"^(del:|done:|snooze:)"))
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
+
+    # Голосовые:
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    # Текст:
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
