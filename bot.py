@@ -2,7 +2,11 @@
 import os
 import re
 import json
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
+
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore  # NEW
+
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
@@ -51,103 +55,166 @@ if missing and "BOT_TOKEN" in missing:
 
 # ---------- DB ----------
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """
+    Возвращает подключение к БД.
+    - Postgres (Supabase): psycopg, строки как dict (row['field'])
+    - SQLite fallback: если нет DATABASE_URL (для локальной разработки)
+    """
+    if DB_DIALECT == "postgres":
+        # autocommit: True, row_factory: dict_row
+        return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+    else:
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 def db_init():
     with db() as conn:
-        conn.execute("""
-            create table if not exists users (
-                user_id integer primary key,
-                tz text
-            )
-        """)
-        conn.execute("""
-            create table if not exists reminders (
-                id integer primary key autoincrement,
-                user_id integer not null,
-                title text not null,
-                body text,
-                when_iso text,                   -- UTC ISO
-                status text default 'scheduled',
-                kind text default 'oneoff',      -- 'oneoff' | 'recurring'
-                recurrence_json text             -- JSON {type,weekday,day,month,time,unit,n,start_at,tz}
-            )
-        """)
-        try: conn.execute("alter table reminders add column kind text default 'oneoff'")
-        except Exception: pass
-        try: conn.execute("alter table reminders add column recurrence_json text")
-        except Exception: pass
-        conn.commit()
+        if DB_DIALECT == "postgres":
+            conn.execute("""
+                create table if not exists users (
+                  user_id bigint primary key,
+                  tz text
+                )
+            """)
+            conn.execute("""
+                create table if not exists reminders (
+                  id bigserial primary key,
+                  user_id bigint not null,
+                  title text not null,
+                  body text,
+                  when_iso text,
+                  status text default 'scheduled',
+                  kind text default 'oneoff',
+                  recurrence_json text
+                )
+            """)
+            conn.execute("create index if not exists reminders_user_idx on reminders(user_id)")
+            conn.execute("create index if not exists reminders_status_idx on reminders(status)")
+        else:
+            import sqlite3
+            conn.execute("""
+                create table if not exists users (
+                    user_id integer primary key,
+                    tz text
+                )
+            """)
+            conn.execute("""
+                create table if not exists reminders (
+                    id integer primary key autoincrement,
+                    user_id integer not null,
+                    title text not null,
+                    body text,
+                    when_iso text,
+                    status text default 'scheduled',
+                    kind text default 'oneoff',
+                    recurrence_json text
+                )
+            """)
+            try: conn.execute("alter table reminders add column kind text default 'oneoff'")
+            except Exception: pass
+            try: conn.execute("alter table reminders add column recurrence_json text")
+            except Exception: pass
+            conn.commit()
 
 def db_get_user_tz(user_id: int) -> str | None:
     with db() as conn:
-        row = conn.execute("select tz from users where user_id=?", (user_id,)).fetchone()
-        return row["tz"] if row and row["tz"] else None
+        q = "select tz from users where user_id=%s" if DB_DIALECT=="postgres" else "select tz from users where user_id=?"
+        cur = conn.execute(q, (user_id,))
+        row = cur.fetchone()
+        return (row and row["tz"]) or None
 
 def db_set_user_tz(user_id: int, tz: str):
     with db() as conn:
-        conn.execute(
-            "insert into users(user_id, tz) values(?, ?) "
-            "on conflict(user_id) do update set tz=excluded.tz",
-            (user_id, tz)
-        )
-        conn.commit()
+        if DB_DIALECT == "postgres":
+            conn.execute("""
+                insert into users(user_id, tz) values(%s, %s)
+                on conflict (user_id) do update set tz=excluded.tz
+            """, (user_id, tz))
+        else:
+            conn.execute(
+                "insert into users(user_id, tz) values(?, ?) "
+                "on conflict(user_id) do update set tz=excluded.tz",
+                (user_id, tz)
+            )
+            conn.commit()
 
 def db_add_reminder_oneoff(user_id: int, title: str, body: str | None, when_iso_utc: str) -> int:
     with db() as conn:
-        cur = conn.execute(
-            "insert into reminders(user_id,title,body,when_iso,kind) values(?,?,?,?,?)",
-            (user_id, title, body, when_iso_utc, 'oneoff')
-        )
-        conn.commit()
-        return cur.lastrowid
+        if DB_DIALECT == "postgres":
+            cur = conn.execute(
+                "insert into reminders(user_id,title,body,when_iso,kind) values(%s,%s,%s,%s,%s) returning id",
+                (user_id, title, body, when_iso_utc, 'oneoff')
+            )
+            return cur.fetchone()["id"]
+        else:
+            cur = conn.execute(
+                "insert into reminders(user_id,title,body,when_iso,kind) values(?,?,?,?,?)",
+                (user_id, title, body, when_iso_utc, 'oneoff')
+            )
+            conn.commit()
+            return cur.lastrowid
 
 def db_add_reminder_recurring(user_id: int, title: str, body: str | None, recurrence: dict, tz: str) -> int:
     rec = dict(recurrence or {})
     rec["tz"] = tz
+    rec_json = json.dumps(rec, ensure_ascii=False)
     with db() as conn:
-        cur = conn.execute(
-            "insert into reminders(user_id,title,body,when_iso,kind,recurrence_json) values(?,?,?,?,?,?)",
-            (user_id, title, body, None, 'recurring', json.dumps(rec, ensure_ascii=False))
-        )
-        conn.commit()
-        return cur.lastrowid
+        if DB_DIALECT == "postgres":
+            cur = conn.execute(
+                "insert into reminders(user_id,title,body,when_iso,kind,recurrence_json) values(%s,%s,%s,%s,%s,%s) returning id",
+                (user_id, title, body, None, 'recurring', rec_json)
+            )
+            return cur.fetchone()["id"]
+        else:
+            cur = conn.execute(
+                "insert into reminders(user_id,title,body,when_iso,kind,recurrence_json) values(?,?,?,?,?,?)",
+                (user_id, title, body, None, 'recurring', rec_json)
+            )
+            conn.commit()
+            return cur.lastrowid
 
 def db_mark_done(rem_id: int):
     with db() as conn:
-        conn.execute("update reminders set status='done' where id=?", (rem_id,))
-        conn.commit()
+        q = "update reminders set status='done' where id=%s" if DB_DIALECT=="postgres" else "update reminders set status='done' where id=?"
+        conn.execute(q, (rem_id,))
 
 def db_snooze(rem_id: int, minutes: int):
     with db() as conn:
-        row = conn.execute("select when_iso, kind from reminders where id=?", (rem_id,)).fetchone()
+        q = "select when_iso, kind from reminders where id=%s" if DB_DIALECT=="postgres" else "select when_iso, kind from reminders where id=?"
+        cur = conn.execute(q, (rem_id,))
+        row = cur.fetchone()
         if not row:
             return None, None
-        if (row["kind"] or "oneoff") == "recurring":
+        kind = (row.get("kind") if isinstance(row, dict) else row["kind"]) or "oneoff"
+        if kind == "recurring":
             return "recurring", None
-        dt = dparser.isoparse(row["when_iso"]) + timedelta(minutes=minutes)
+        base = row.get("when_iso") if isinstance(row, dict) else row["when_iso"]
+        dt = dparser.isoparse(str(base)) + timedelta(minutes=minutes)
         new_iso = iso_utc(dt)
-        conn.execute("update reminders set when_iso=?, status='scheduled' where id=?", (new_iso, rem_id))
-        conn.commit()
+        q2 = "update reminders set when_iso=%s, status='scheduled' where id=%s" if DB_DIALECT=="postgres" else "update reminders set when_iso=?, status='scheduled' where id=?"
+        conn.execute(q2, (new_iso, rem_id))
         return "oneoff", dt
 
 def db_delete(rem_id: int):
     with db() as conn:
-        conn.execute("delete from reminders where id=?", (rem_id,))
-        conn.commit()
+        q = "delete from reminders where id=%s" if DB_DIALECT=="postgres" else "delete from reminders where id=?"
+        conn.execute(q, (rem_id,))
 
 def db_future(user_id: int):
     with db() as conn:
-        return conn.execute(
-            "select * from reminders where user_id=? and status='scheduled' order by id desc",
-            (user_id,)
-        ).fetchall()
+        q = ("select * from reminders where user_id=%s and status='scheduled' order by id desc"
+             if DB_DIALECT=="postgres"
+             else "select * from reminders where user_id=? and status='scheduled' order by id desc")
+        cur = conn.execute(q, (user_id,))
+        return cur.fetchall()
 
 def db_get_reminder(rem_id: int):
     with db() as conn:
-        return conn.execute("select * from reminders where id=?", (rem_id,)).fetchone()
+        q = "select * from reminders where id=%s" if DB_DIALECT=="postgres" else "select * from reminders where id=?"
+        cur = conn.execute(q, (rem_id,))
+        return cur.fetchone()
 
 # ---------- TZ / ISO ----------
 def tzinfo_from_user(tz_str: str) -> timezone | ZoneInfo:
@@ -448,7 +515,8 @@ def _format_interval_phrase(unit: str, n: int) -> str:
     # hour
     return "каждый час" if n == 1 else f"каждые {n} часов"
 
-def format_reminder_line(row: sqlite3.Row, user_tz: str) -> str:
+def format_reminder_line(row, user_tz: str) -> str:
+    ...
     title = row["title"]
     kind = row["kind"] or "oneoff"
     if kind == "oneoff" and row["when_iso"]:
@@ -809,9 +877,16 @@ async def on_startup(app: Application):
     global scheduler, TG_BOT
     TG_BOT = app.bot
     loop = asyncio.get_running_loop()
+
+    # Подцепим jobstore к той же БД (если работаем через Postgres)
+    jobstores = None
+    if DB_DIALECT == "postgres" and DATABASE_URL:
+        jobstores = {"default": SQLAlchemyJobStore(url=DATABASE_URL)}
+
     scheduler = AsyncIOScheduler(
         timezone=timezone.utc,
         event_loop=loop,
+        jobstores=jobstores,
         job_defaults={"coalesce": True, "misfire_grace_time": 600}
     )
     scheduler.start()
