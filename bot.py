@@ -137,14 +137,17 @@ def db():
 
     # Попытка 1: прям URL с IPv4
     try:
-        return psycopg.connect(conn_url_ipv4, autocommit=True, row_factory=dict_row)
-    except Exception as e1:
-        log.warning("IPv4 URL connect failed, will try kwargs hostaddr. Err=%r", e1)
+        # Попытка 1: прям URL с IPv4
+try:
+    return psycopg.connect(conn_url_ipv4, autocommit=True, row_factory=dict_row)
+except Exception as e1:
+    log.warning("IPv4 URL connect failed, will try kwargs hostaddr. Err=%r", e1)
+    last_err = e1
 
-    # Попытка 2: kwargs с hostaddr (если IPv4 есть)
-    if not ipv4:
-        # вообще нет IPv4 — падаем той же ошибкой
-        raise
+# Попытка 2: kwargs с hostaddr (если IPv4 есть)
+if not ipv4:
+    # вообще нет IPv4 — перекидываем исходную ошибку
+    raise last_err
 
     # Разобраем query → dict
     qs = dict(parse_qsl(parts.get("query") or "", keep_blank_values=True))
@@ -604,7 +607,7 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
             schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            await safe_reply(update, f"⏰ Окей, напомню «{title}» {when_localstrftime('%d.%m в %H:%M')}", reply_markup=kb)
+            await safe_reply(update, f"⏰ Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
             return
 
     context.user_data["__auto_answer"] = choice
@@ -736,10 +739,10 @@ async def on_startup(app: Application):
 
     jobstores = None
     if DB_DIALECT == "postgres" and DATABASE_URL:
-        jobstore_url = _url_with_ipv4_host(
-            DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-        )
-        jobstores = {"default": SQLAlchemyJobStore(url=jobstore_url)}
+    jobstore_url, _, _ = _url_with_ipv4_host(
+        DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+    )
+    jobstores = {"default": SQLAlchemyJobStore(url=jobstore_url)}
 
     scheduler = AsyncIOScheduler(
         timezone=timezone.utc,
