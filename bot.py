@@ -754,7 +754,55 @@ async def on_startup(app: Application):
 # ---------- main ----------
 def main():
     log.info("Starting PlannerBot...")
-    db_init()
+    def db_init():
+    with db() as conn:
+        if DB_DIALECT == "postgres":
+            conn.execute("""
+                create table if not exists users (
+                  user_id bigint primary key,
+                  tz text
+                )
+            """)
+            conn.execute("""
+                create table if not exists reminders (
+                  id bigserial primary key,
+                  user_id bigint not null,
+                  title text not null,
+                  body text,
+                  when_iso text,
+                  status text default 'scheduled',
+                  kind text default 'oneoff',
+                  recurrence_json text
+                )
+            """)
+            conn.execute("create index if not exists reminders_user_idx on reminders(user_id)")
+            conn.execute("create index if not exists reminders_status_idx on reminders(status)")
+        else:
+            import sqlite3
+            conn.execute("""
+                create table if not exists users (
+                    user_id integer primary key,
+                    tz text
+                )
+            """)
+            conn.execute("""
+                create table if not exists reminders (
+                    id integer primary key autoincrement,
+                    user_id integer not null,
+                    title text not null,
+                    body text,
+                    when_iso text,
+                    status text default 'scheduled',
+                    kind text default 'oneoff',
+                    recurrence_json text
+                )
+            """)
+            try: conn.execute("alter table reminders add column kind text default 'oneoff'")
+            except Exception: pass
+            try: conn.execute("alter table reminders add column recurrence_json text")
+            except Exception: pass
+            conn.commit()
+
 
     app = (Application.builder()
            .token(BOT_TOKEN)
