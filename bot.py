@@ -755,7 +755,7 @@ async def on_startup(app: Application):
 def main():
     log.info("Starting PlannerBot...")
     def db_init():
-    with db() as conn:
+        with db() as conn:
         if DB_DIALECT == "postgres":
             conn.execute("""
                 create table if not exists users (
