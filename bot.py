@@ -737,7 +737,7 @@ async def on_startup(app: Application):
 
     jobstores = None
     if DB_DIALECT == "postgres" and DATABASE_URL:
-    jobstore_url, _, _ = _url_with_ipv4_host(
+        jobstore_url, _, _ = _url_with_ipv4_host(
         DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
     )
     jobstores = {"default": SQLAlchemyJobStore(url=jobstore_url)}
