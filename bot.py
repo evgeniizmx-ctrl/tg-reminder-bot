@@ -805,94 +805,112 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await safe_reply(update, "Ошибка обработки аудио")
 
 # ---------- main text ----------
+# ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    incoming_text = (context.user_data.pop("__auto_answer", None)
-                     or (update.message.text.strip() if update.message and update.message.text else ""))
-    log.debug("handle_text: user_id=%s text=%r", user_id, incoming_text)
-
-    # быстрые кнопки
-    if incoming_text == "📝 Список напоминаний" or incoming_text.lower() == "/list":
-        return await cmd_list(update, context)
-    if incoming_text == "⚙️ Настройки" or incoming_text.lower() == "/settings":
-        return await safe_reply(update, "Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
-
-    # TZ
-    if await try_handle_tz_input(update, context):
-        return
-    user_tz = db_get_user_tz(user_id)
-    if not user_tz:
-        await safe_reply(update, "Сначала укажи часовой пояс.", reply_markup=MAIN_MENU_KB)
-        await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
-        return
-
-    # 1) Rule-based разбор
-    now_local = now_in_user_tz(user_tz)
-    parsed = None
     try:
-        parsed = rule_parse(incoming_text, now_local)
-        log.debug("rule_parse result: %r", parsed)
-    except Exception:
-        log.exception("rule_parse crashed on text=%r", incoming_text)
+        # 0) быстрый путь: установка таймзоны по вводу
+        if await try_handle_tz_input(update, context):
+            return
 
-    if parsed:
-        try:
-            if parsed.get("intent") == "create_interval":
-                title = parsed["title"]
-                unit = parsed["unit"]; n = int(parsed["n"]); start_at_local = parsed["start_at"]
-                recurrence = {"type": "interval", "unit": unit, "n": n,
-                              "start_at": start_at_local.replace(microsecond=0).isoformat()}
-                rem_id = db_add_reminder_recurring(user_id, title, None, recurrence, user_tz)
-                schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
-                phrase = _format_interval_phrase(unit, n)
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-                return await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {phrase}", reply_markup=kb)
+        user_id = update.effective_user.id
+        incoming_text = (
+            context.user_data.pop("__auto_answer", None)
+            or (update.message.text.strip() if update.message and update.message.text else "")
+        )
+        log.debug("handle_text: user_id=%s text=%r", user_id, incoming_text)
 
-            if parsed["intent"] == "create":
-                title = parsed["title"]
-                when_iso_utc = iso_utc(parsed["when_local"])
-                rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
-                schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
-                dt_local = to_user_local(when_iso_utc, user_tz)
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-                return await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+        # 1) меню
+        if incoming_text == "📝 Список напоминаний" or incoming_text.lower() == "/list":
+            return await cmd_list(update, context)
+        if incoming_text == "⚙️ Настройки" or incoming_text.lower() == "/settings":
+            return await safe_reply(update, "Раздел «Настройки» в разработке.", reply_markup=MAIN_MENU_KB)
 
-            if parsed["intent"] == "ask":
-                return await safe_reply(update, "Уточни время, пожалуйста.")
-        except Exception:
-            log.exception("apply parsed result failed: %r", parsed)
-            return await safe_reply(update, "Упс, что-то пошло не так. Напиши ещё раз, пожалуйста.")
+        # 2) timezone должен быть задан
+        user_tz = db_get_user_tz(user_id)
+        if not user_tz:
+            await safe_reply(update, "Сначала укажи часовой пояс.", reply_markup=MAIN_MENU_KB)
+            await safe_reply(update, "Выбери из списка:", reply_markup=build_tz_inline_kb())
+            return
 
-    # 2) Fallback → LLM
-    try:
-        res = await call_llm(incoming_text, user_tz)
-        log.debug("LLM parsed: %r", res)
-        intent = (res.get("intent") or "").lower()
+        # 3) сначала пытаемся быстрыми правилами
+        now_local = now_in_user_tz(user_tz)
+        r = rule_parse(incoming_text, now_local)
+
+        # 4) если правила не справились — падаем в LLM
+        if not r:
+            try:
+                r = await call_llm(incoming_text, user_tz)
+                log.debug("LLM parsed: %r", r)
+            except Exception:
+                log.exception("LLM call failed")
+                r = None
+
+        # 5) если всё равно ничего — говорим не понял
+        if not r:
+            return await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+
+        # 6) единая обработка результата (поддерживает и rule_parse, и LLM)
+        intent = (r.get("intent") or "").lower()
+
+        if intent == "create_interval":
+            title = r.get("title", "Напоминание")
+            unit = (r.get("unit") or "minute").lower()
+            n = int(r.get("n", 1))
+            start_at = r.get("start_at")
+            # LLM даёт строку — распарсим; правила дают datetime
+            if isinstance(start_at, str):
+                start_dt_local = dparser.isoparse(start_at)
+            else:
+                start_dt_local = start_at or now_in_user_tz(user_tz)
+            recurrence = {
+                "type": "interval",
+                "unit": unit,
+                "n": n,
+                "start_at": start_dt_local.replace(microsecond=0).isoformat(),
+            }
+            rem_id = db_add_reminder_recurring(user_id, title, None, recurrence, user_tz)
+            schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
+            phrase = _format_interval_phrase(unit, n)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+            return await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {phrase}", reply_markup=kb)
 
         if intent == "create":
-            title = res.get("title") or "Напоминание"
-            when_local = dparser.isoparse(res["when_local"])
+            title = r.get("title", "Напоминание")
+            when_local = r.get("when_local")
+            # LLM даёт строку — распарсим; правила дают datetime
+            if isinstance(when_local, str):
+                when_local = dparser.isoparse(when_local)
             if when_local.tzinfo is None:
                 when_local = when_local.replace(tzinfo=tzinfo_from_user(user_tz))
             when_iso_utc = iso_utc(when_local)
-            rem_id = db_add_reminder_oneoff(user_id, title, res.get("body"), when_iso_utc)
+            rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
             schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
             dt_local = to_user_local(when_iso_utc, user_tz)
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%м в %H:%M')}", reply_markup=kb)
+            return await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
-        if intent == "create_recurring":
-            title = res.get("title") or "Напоминание"
-            recurrence = res.get("recurrence") or {}
-            rem_id = db_add_reminder_recurring(user_id, title, res.get("body"), recurrence, user_tz)
-            schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-            return await safe_reply(update, f"⏰ Окей, буду напоминать «{title}».", reply_markup=kb)
+        if intent == "ask":
+            # просим уточнить время; варианты может прислать и LLM
+            question = r.get("question") or "Уточни время, пожалуйста."
+            variants = r.get("variants") or []
+            if variants:
+                buttons = [[InlineKeyboardButton(v, callback_data=f"answer:{v}") for v in variants]]
+                await safe_reply(update, question, reply_markup=InlineKeyboardMarkup(buttons))
+            else:
+                await safe_reply(update, question)
+            # сохраним состояние для ответа
+            context.user_data["clarify_state"] = {
+                "base_date": r.get("base_date"),
+                "title": r.get("title") or "Напоминание",
+            }
+            return
 
+        # если пришёл какой-то другой intent
         return await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+
     except Exception:
-        log.exception("LLM fallback failed")
-        return await safe_reply(update, "Упс, что-то пошло не так. Напиши ещё раз, пожалуйста.")
+        log.exception("handle_text fatal")
+        await safe_reply(update, "Упс, что-то пошло не так. Напиши ещё раз, пожалуйста.")
 
 # ---------- Error handler ----------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
