@@ -2,6 +2,9 @@
 import os
 import re
 import json
+import socket
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
 import psycopg
 from psycopg.rows import dict_row
 
@@ -61,6 +64,29 @@ if missing and "BOT_TOKEN" in missing:
 # Полезно видеть, что выбралось
 log.info("DB mode: %s (DATABASE_URL=%s)", DB_DIALECT, "set" if DATABASE_URL else "not set")
 
+# ---------- Helpers ----------
+def _force_ipv4_in_url(url: str) -> str:
+    """
+    Добавляет в строку подключения параметр hostaddr=<IPv4>, чтобы принудительно
+    использовать IPv4 (актуально, когда среда не умеет в IPv6 и libpq выбирает AAAA).
+    """
+    try:
+        if not url:
+            return url
+        parts = urlsplit(url)
+        host = parts.hostname
+        port = parts.port or 5432
+        # Берём A-запись (IPv4)
+        infos = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        ipv4 = infos[0][4][0]
+        qs = dict(parse_qsl(parts.query, keep_blank_values=True))
+        # если уже есть hostaddr — не трогаем
+        qs.setdefault("hostaddr", ipv4)
+        new_parts = parts._replace(query=urlencode(qs))
+        return urlunsplit(new_parts)
+    except Exception:
+        return url
+
 # ---------- DB ----------
 def db():
     """
@@ -69,8 +95,10 @@ def db():
     - SQLite fallback: если нет DATABASE_URL (для локальной разработки)
     """
     if DB_DIALECT == "postgres":
+        # Принудительно используем IPv4, чтобы избежать "Network is unreachable" по IPv6
+        conn_url = _force_ipv4_in_url(DATABASE_URL)
         # autocommit: True, row_factory: dict_row
-        return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+        return psycopg.connect(conn_url, autocommit=True, row_factory=dict_row)
     else:
         import sqlite3
         conn = sqlite3.connect(DB_PATH)
@@ -379,8 +407,8 @@ def rule_parse(text: str, now_local: datetime):
     if re.search(r"\bкажд(ую|ый)\s+минут(у|ы)?\b", s):
         return {"intent": "create_interval", "title": _extract_title(text), "unit": "minute", "n": 1, "start_at": now_local}
 
-    if re.search(r"\bчерез\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)\b", s):
-        m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\d+\s*час(?:а|ов)?)", s)
+    if re.search(r"\bчерез\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\д+\s*час(?:а|ов)?)\b", s):
+        m = re.search(r"через\s+(полчаса|минуту|\d+\s*мин(?:ут)?|\д+\s*час(?:а|ов)?)", s)
         delta = timedelta()
         ch = m.group(1)
         if "полчаса" in ch: delta = timedelta(minutes=30)
@@ -524,7 +552,6 @@ def _format_interval_phrase(unit: str, n: int) -> str:
     return "каждый час" if n == 1 else f"каждые {n} часов"
 
 def format_reminder_line(row, user_tz: str) -> str:
-    ...
     title = row["title"]
     kind = row["kind"] or "oneoff"
     if kind == "oneoff" and row["when_iso"]:
@@ -651,7 +678,7 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
     dt_local = to_user_local(when_iso_utc, tz)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-    await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+    await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%м в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -889,7 +916,11 @@ async def on_startup(app: Application):
     # Подцепим jobstore к той же БД (если работаем через Postgres)
     jobstores = None
     if DB_DIALECT == "postgres" and DATABASE_URL:
-        jobstores = {"default": SQLAlchemyJobStore(url=DATABASE_URL)}
+        # APScheduler требует явный диалект + принудим IPv4
+        jobstore_url = _force_ipv4_in_url(
+            DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+        )
+        jobstores = {"default": SQLAlchemyJobStore(url=jobstore_url)}
 
     scheduler = AsyncIOScheduler(
         timezone=timezone.utc,
