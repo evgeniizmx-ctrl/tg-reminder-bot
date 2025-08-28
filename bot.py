@@ -461,16 +461,23 @@ def _format_interval_phrase(unit: str, n: int) -> str:
     return "каждый час" if n == 1 else f"каждые {n} часов"
 
 def format_reminder_line(row, user_tz: str) -> str:
-    title = row["title"]
-    kind = row["kind"] or "oneoff"
-    if kind == "oneoff" and row["when_iso"]:
+    # row может быть dict (psycopg rows=dict_row) или sqlite Row → приведём к dict
+    if not isinstance(row, dict):
+        row = dict(row)
+
+    title = row.get("title", "Напоминание")
+    kind = (row.get("kind") or "oneoff").lower()
+
+    if kind == "oneoff" and row.get("when_iso"):
         dt_local = to_user_local(row["when_iso"], user_tz)
         return f"{dt_local.strftime('%d.%m в %H:%M')} — «{title}»"
-    rec = json.loads(row["recurrence_json"]) if row["recurrence_json"] else {}
+
+    rec = json.loads(row.get("recurrence_json") or "{}")
     rtype = (rec.get("type") or "").lower()
     if rtype == "interval":
         phrase = _format_interval_phrase(rec.get("unit"), rec.get("n"))
         return f"{phrase} — «{title}»"
+
     time_str = rec.get("time") or "00:00"
     if rtype == "daily":
         return f"каждый день в {time_str} — «{title}»"
@@ -478,9 +485,10 @@ def format_reminder_line(row, user_tz: str) -> str:
         wd = ru_weekly_phrase(rec.get("weekday", ""))
         return f"{wd} в {time_str} — «{title}»"
     if rtype == "yearly":
-        day = rec.get("day"); month = rec.get("month")
-        return f"каждый год {int(day):02d}.{int(month):02d} в {time_str} — «{title}»"
-    day = rec.get("day")
+        day = int(rec.get("day", 1)); month = int(rec.get("month", 1))
+        return f"каждый год {day:02d}.{month:02d} в {time_str} — «{title}»"
+
+    day = int(rec.get("day", 1))
     return f"каждое {day}-е число в {time_str} — «{title}»"
 
 # ---------- Handlers ----------
@@ -506,6 +514,7 @@ async def try_handle_tz_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     await safe_reply(update, f"Часовой пояс установлен: {tz}\nТеперь напиши что и когда напомнить.",
                      reply_markup=MAIN_MENU_KB)
     return True
+    
 
 async def cb_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -517,11 +526,51 @@ async def cb_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_set_user_tz(chat_id, value)
     await q.edit_message_text(f"Часовой пояс установлен: {value}\nТеперь напиши что и когда напомнить.")
 
+def db_future(user_id: int):
+    with db() as conn:
+        q = (
+            "select * from reminders where user_id=%s and status='scheduled' order by id desc"
+            if DB_DIALECT == "postgres"
+            else "select * from reminders where user_id=? and status='scheduled' order by id desc"
+        )
+        try:
+            cur = conn.execute(q, (user_id,))
+            rows = cur.fetchall() or []
+            log.debug("db_future: got %d rows for user_id=%s", len(rows), user_id)
+            return rows
+        except Exception:
+            log.exception("db_future query failed")
+            return []
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    rows = db_future(user_id)
-    if not rows:
-        return await safe_reply(update, "Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
+    try:
+        user_id = update.effective_user.id
+        rows = db_future(user_id)
+        log.debug("cmd_list: user_id=%s rows=%d", user_id, len(rows or []))
+
+        if not rows:
+            return await safe_reply(update, "Будущих напоминаний нет.", reply_markup=MAIN_MENU_KB)
+
+        tz = db_get_user_tz(user_id) or "+03:00"
+        await safe_reply(update, "🗓 Ближайшие напоминания —")
+
+        PAD = "⠀" * 20
+        for r in rows:
+            try:
+                line = format_reminder_line(r, tz)
+            except Exception:
+                log.exception("format_reminder_line failed on row=%r", r)
+                # максимально безопасная подстановка
+                title = r.get("title") if isinstance(r, dict) else (r["title"] if r else "Напоминание")
+                line = f"«{title}» (некорректные данные)"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🗑 Удалить {PAD}", callback_data=f"del:{r['id']}")]
+            ])
+            await safe_reply(update, line, reply_markup=kb)
+            await asyncio.sleep(0.05)
+    except Exception:
+        log.exception("cmd_list fatal")
+        return await safe_reply(update, "Не удалось получить список. Попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
     tz = db_get_user_tz(user_id) or "+03:00"
     await safe_reply(update, "🗓 Ближайшие напоминания —")
@@ -582,7 +631,7 @@ async def cb_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
     dt_local = to_user_local(when_iso_utc, tz)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-    await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+    await safe_reply(update, f"⏰ Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
 
 async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -676,6 +725,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         incoming_text = (context.user_data.pop("__auto_answer", None)
                         or (update.message.text.strip() if update.message and update.message.text else ""))
+        log.debug("handle_text: user_id=%s text=%r", user_id, incoming_text)
 
         if incoming_text == "📝 Список напоминаний" or incoming_text.lower() == "/list":
             return await cmd_list(update, context)
