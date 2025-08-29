@@ -561,6 +561,11 @@ def schedule_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, 
     )
     sch.print_jobs()
 
+    # --- NEW: планируем пре-оповещения на ближайший фаер (если заданы) ---
+    pre_offsets = recurrence.get("pre_offsets") or []
+    if pre_offsets:
+        schedule_prealerts_for_recurring(rem_id, user_id, title, recurrence, tz_str)
+
 def reschedule_all():
     sch = ensure_scheduler()
     with db() as conn:
@@ -574,6 +579,9 @@ def reschedule_all():
             tz = rec.get("tz") or "+03:00"
             if rec:
                 schedule_recurring(row["id"], row["user_id"], row["title"], rec, tz)
+                # --- NEW: восстанавливаем пре-оповещения после рестарта ---
+                if rec.get("pre_offsets"):
+                    schedule_prealerts_for_recurring(row["id"], row["user_id"], row["title"], rec, tz)
     log.info("Rescheduled %d reminders from DB", len(rows))
 
 # ---------- RU wording ----------
@@ -709,6 +717,13 @@ async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_delete(rem_id)
         sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
         if job: job.remove()
+        # --- NEW: снять все пре-оповещения, связанные с этим recurring ---
+        try:
+            for job in sch.get_jobs():
+                if job.id and job.id.startswith(f"pre-{rem_id}-"):
+                    job.remove()
+        except Exception:
+            pass
         await q.edit_message_text("Удалено ✅"); return
     if data.startswith("snooze:"):
         _, mins, rem_id = data.split(":"); rem_id = int(rem_id); mins = int(mins)
@@ -976,6 +991,79 @@ async def cb_prebuild(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Обновлено", show_alert=False)
         return
 
+# ---------- NEW: PRE-ALERTS for RECURRING (скользящее окно) ----------
+def _build_cron_trigger_for_recurrence(recurrence: dict, tz_str: str):
+    """Строим CronTrigger/IntervalTrigger аналогично schedule_recurring, чтобы получить next_fire_time."""
+    rtype = (recurrence.get("type") or "").lower()
+    if rtype == "interval":
+        return None
+    tzinfo = tzinfo_from_user(tz_str)
+    time_str = recurrence.get("time") or "00:00"
+    hh, mm = map(int, time_str.split(":"))
+    if rtype == "daily":
+        return CronTrigger(hour=hh, minute=mm, timezone=tzinfo)
+    if rtype == "weekly":
+        return CronTrigger(day_of_week=recurrence.get("weekday"), hour=hh, minute=mm, timezone=tzinfo)
+    if rtype == "monthly":
+        return CronTrigger(day=int(recurrence.get("day")), hour=hh, minute=mm, timezone=tzinfo)
+    if rtype == "yearly":
+        month = int(recurrence.get("month")); day = int(recurrence.get("day"))
+        return CronTrigger(month=month, day=day, hour=hh, minute=mm, timezone=tzinfo)
+    return CronTrigger(hour=hh, minute=mm, timezone=tzinfo)
+
+def _next_fire_from_trigger(trigger, now_utc: datetime | None = None):
+    if not now_utc:
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    nft = trigger.get_next_fire_time(None, now_utc)
+    return nft
+
+def _pre_alert_job_id(rem_id: int, offset: int) -> str:
+    return f"pre-{rem_id}-{offset}"
+
+async def fire_prealert(*, chat_id: int, rem_id: int, title: str, offset: int):
+    try:
+        await TG_BOT.send_message(chat_id, f"⏳ Скоро «{title}» ({offset} мин до начала)")
+    except Exception as e:
+        log.exception("fire_prealert failed: %s", e)
+
+def schedule_prealerts_for_recurring(rem_id: int, user_id: int, title: str, recurrence: dict, tz_str: str):
+    """Ставит date-джобы для пре-оповещений на ближайшее следующее срабатывание recurring.
+       Старые пре-джобы с теми же offset снимает.
+    """
+    sch = ensure_scheduler()
+    pre_offsets = sorted({int(x) for x in (recurrence.get("pre_offsets") or []) if int(x) > 0})
+    # Сначала снимем прошлые пре-джобы, чтобы не плодить
+    try:
+        for job in sch.get_jobs():
+            if job.id and job.id.startswith(f"pre-{rem_id}-"):
+                job.remove()
+    except Exception:
+        pass
+
+    if not pre_offsets:
+        return
+
+    trig = _build_cron_trigger_for_recurrence(recurrence, tz_str)
+    if trig is None:
+        # интервалы — пропускаем
+        return
+
+    next_fire = _next_fire_from_trigger(trig)
+    if not next_fire:
+        return
+
+    for off in pre_offsets:
+        when_utc = next_fire - timedelta(minutes=off)
+        if when_utc <= datetime.now(timezone.utc):
+            continue
+        job_id = _pre_alert_job_id(rem_id, off)
+        sch.add_job(
+            fire_prealert, DateTrigger(run_date=when_utc),
+            id=job_id, replace_existing=True, misfire_grace_time=300, coalesce=True,
+            kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "offset": off},
+            name=f"prealert {rem_id} ({off}m)",
+        )
+
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 0) быстрые выходы
@@ -1082,6 +1170,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             recurrence["month"] = int(rec_obj.get("month") or 1)
             recurrence["day"] = int(rec_obj.get("day") or 1)
 
+        # --- NEW: поддержка pre_offsets, если парсер их дал ---
+        pre_offsets = rec_obj.get("pre_offsets") or []
+        if pre_offsets:
+            try:
+                pre_offsets = sorted({int(x) for x in pre_offsets if int(x) > 0})
+                if pre_offsets:
+                    recurrence["pre_offsets"] = pre_offsets
+            except Exception:
+                pass
+
         rem_id = db_add_reminder_recurring(user_id, title, None, recurrence, user_tz)
         schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data=f"del:{rem_id}")]])
@@ -1173,6 +1271,22 @@ async def on_startup(app: Application):
     scheduler.start()
     log.info("APScheduler started in PTB event loop")
     reschedule_all()
+
+    # --- NEW: hourly sweep для перестройки пре-оповещений (DST/рестарт/дрейф) ---
+    async def _sweep_prealerts():
+        try:
+            with db() as conn:
+                rows = conn.execute("select * from reminders where status='scheduled' and kind='recurring'").fetchall()
+            for r in rows:
+                row = dict(r) if not isinstance(r, dict) else r
+                rec = json.loads(row.get("recurrence_json") or "{}")
+                tz = rec.get("tz") or "+03:00"
+                if rec.get("pre_offsets"):
+                    schedule_prealerts_for_recurring(row["id"], row["user_id"], row["title"], rec, tz)
+        except Exception:
+            log.exception("sweep_prealerts failed")
+
+    scheduler.add_job(_sweep_prealerts, "interval", minutes=60, id="sweep-prealerts", replace_existing=True)
 
 # ---------- DB INIT ----------
 def db_init():
