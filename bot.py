@@ -839,12 +839,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         now_local = now_in_user_tz(user_tz)
 
 # 1) быстрый парсер
-r = rule_parse(incoming_text, now_local)
+try:
+    r = rule_parse(incoming_text, now_local)
+except Exception as e:
+    log.exception("rule_parse failed: %s", e)
+    r = None
 
 # 2) LLM-парсер (если быстрый не сработал и ключ задан)
 if not r and OPENAI_API_KEY:
-    r = await call_llm(incoming_text, user_tz)
-    log.debug("LLM parsed: %s", r)
+    try:
+        r = await call_llm(incoming_text, user_tz)
+        log.debug("LLM parsed: %s", r)
+    except Exception:
+        log.exception("call_llm failed")
+        r = None
 
 # 3) ничего не распознано
 if not r:
