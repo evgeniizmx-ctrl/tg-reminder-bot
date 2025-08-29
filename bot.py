@@ -1324,7 +1324,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
-with open('/mnt/data/bot.py', 'w', encoding='utf-8') as f:
-    f.write(bot_code)
-print("Saved to /mnt/data/bot.py")
