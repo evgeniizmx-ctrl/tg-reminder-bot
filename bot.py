@@ -838,7 +838,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         now_local = now_in_user_tz(user_tz)
 
-            # 1) быстрый парсер
+    # 1) быстрый парсер
     r = rule_parse(incoming_text, now_local)
 
     # 2) LLM-парсер (если быстрый не сработал и ключ задан)
