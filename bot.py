@@ -1086,13 +1086,9 @@ def schedule_prealerts_for_recurring(rem_id: int, user_id: int, title: str, recu
 
 # --- UI для выбора pre_offsets у recurring ---
 def _recurring_prebuild_options_for_next_occurrence(
-    recurrence: dict, tz_str: str
+    recurrence: dict,
+    tz_str: str,
 ) -> Tuple[List[Tuple[int, str]], Optional[datetime]]:
-    ...
-
-    recurrence: dict, tz_str: str
-) -> Tuple[List[Tuple[int, str]], Optional[datetime]]:
-
     """Вернёт доступные (offset, label) для ближайшего next_fire, и сам next_fire (UTC).
        Фильтруем те, что уже прошли относительно now().
     """
@@ -1104,7 +1100,13 @@ def _recurring_prebuild_options_for_next_occurrence(
         return [], None
 
     # кандидаты как у одноразовых
-    candidates = [(10, "За 10 мин"), (60, "За час"), (180, "За 3 часа"), (1440, "За день"), (10080, "За неделю")]
+    candidates = [
+        (10, "За 10 мин"),
+        (60, "За час"),
+        (180, "За 3 часа"),
+        (1440, "За день"),
+        (10080, "За неделю"),
+    ]
     now_utc = datetime.now(timezone.utc)
     avail = [(m, lbl) for m, lbl in candidates if next_fire - timedelta(minutes=m) > now_utc]
     return avail, next_fire
