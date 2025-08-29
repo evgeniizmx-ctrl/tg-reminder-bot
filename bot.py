@@ -1082,7 +1082,6 @@ def schedule_prealerts_for_recurring(rem_id: int, user_id: int, title: str, recu
             kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "offset": off},
             name=f"prealert {rem_id} ({off}m)",
             # --- UI для выбора pre_offsets у recurring ---
-from typing import List, Tuple, Optional
 
 def _recurring_prebuild_options_for_next_occurrence(
     recurrence: dict, tz_str: str
