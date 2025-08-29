@@ -845,22 +845,100 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r = await call_llm(incoming_text, user_tz)
 
         if r:
-            intent = (r.get("intent") or "").lower()
+    intent = (r.get("intent") or "").lower()
+    title = r.get("title") or _extract_title(incoming_text)
 
-            if intent == "create_interval":
-                title = r.get("title") or _extract_title(incoming_text)
-                unit = (r.get("unit") or "minute").lower()
-                n = int(r.get("n") or 1)
-                start_at_local = r.get("start_at") or now_local
-                if isinstance(start_at_local, str):
-                    start_at_local = dparser.isoparse(start_at_local)
-                recurrence = {"type":"interval","unit":unit,"n":int(n),"start_at":start_at_local.replace(microsecond=0).isoformat()}
-                rem_id = db_add_reminder_recurring(user_id, title, None, recurrence, user_tz)
-                schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
-                phrase = _format_interval_phrase(unit, n)
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
-                await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {phrase}", reply_markup=kb)
+    # ---- 1) интервалы (поддержка старой и новой схем одновременно)
+    # старая схема: intent == "create_interval", поля: unit, n, start_at
+    # новая схема:  intent == "create_reminder", recurrence = {type:"interval", ...}
+    if intent in {"create_interval", "create_reminder"}:
+        rec_obj = r.get("recurrence") or {}
+        is_interval = (rec_obj.get("type") or "").lower() == "interval"
+        if intent == "create_interval" or is_interval:
+            unit = (r.get("unit") or rec_obj.get("unit") or "minute").lower()
+            n = int(r.get("n") or rec_obj.get("n") or 1)
+            start_at = r.get("start_at") or rec_obj.get("start_at")
+            start_local = dparser.isoparse(start_at) if start_at else now_local
+            recurrence = {
+                "type": "interval",
+                "unit": unit,
+                "n": int(n),
+                "start_at": start_local.replace(microsecond=0).isoformat(),
+            }
+            rem_id = db_add_reminder_recurring(user_id, title, None, recurrence, user_tz)
+            schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
+            phrase = _format_interval_phrase(unit, n)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+            await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {phrase}", reply_markup=kb)
+            return
+
+    # ---- 2) одноразовое время (новая схема: fixed_datetime) + (старая: when_local)
+    fixed_dt = r.get("fixed_datetime")
+    when_local_old = r.get("when_local")
+    if intent in {"create", "create_reminder"} and (fixed_dt or when_local_old):
+        when_local = dparser.isoparse(fixed_dt) if fixed_dt else when_local_old
+        if when_local.tzinfo is None:
+            when_local = when_local.replace(tzinfo=tzinfo_from_user(user_tz))
+        when_iso_utc = iso_utc(when_local)
+        rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+        schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+        dt_local = to_user_local(when_iso_utc, user_tz)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+        await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+        return
+
+    # ---- 3) периодичка daily / weekly / monthly / yearly (новая схема промпта)
+    rec = r.get("recurrence") or {}
+    rtype = (rec.get("type") or "").lower()
+    if intent in {"create", "create_reminder"} and rtype in {"daily", "weekly", "monthly", "yearly"}:
+        rec_norm = {"type": rtype}
+
+        # время обязательно; если нет — спрашиваем
+        t = rec.get("time")
+        if not t:
+            await safe_reply(update, "Уточни, пожалуйста, время.")
+            return
+        rec_norm["time"] = t
+
+        if rtype == "weekly":
+            wd = rec.get("weekday")
+            if not wd:
+                await safe_reply(update, "В какой день недели напоминать? (пн-вс)")
                 return
+            rec_norm["weekday"] = wd
+
+        elif rtype == "monthly":
+            rec_norm["day"] = int(rec.get("day") or 1)
+
+        elif rtype == "yearly":
+            rec_norm["month"] = int(rec.get("month") or 1)
+            rec_norm["day"] = int(rec.get("day") or 1)
+
+        rem_id = db_add_reminder_recurring(user_id, title, None, rec_norm, user_tz)
+        schedule_recurring(rem_id, user_id, title, rec_norm, user_tz)
+
+        # ответ пользователю
+        if rtype == "daily":
+            txt = f"⏰ Окей, буду напоминать «{title}» каждый день в {rec_norm['time']}"
+        elif rtype == "weekly":
+            ru = {"mon":"понедельник","tue":"вторник","wed":"среду","thu":"четверг","fri":"пятницу","sat":"субботу","sun":"воскресенье"}[rec_norm["weekday"]]
+            txt = f"⏰ Окей, буду напоминать «{title}» каждую {ru} в {rec_norm['time']}"
+        elif rtype == "monthly":
+            txt = f"⏰ Окей, буду напоминать «{title}» каждое {int(rec_norm['day']):02d}-е число в {rec_norm['time']}"
+        else:
+            txt = f"⏰ Окей, буду напоминать «{title}» каждый год {int(rec_norm['day']):02d}.{int(rec_norm['month']):02d} в {rec_norm['time']}"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+        await safe_reply(update, txt, reply_markup=kb)
+        return
+
+    # ---- 4) уточнение из LLM
+    if intent == "ask_clarification":
+        q = r.get("question") or "Уточни, пожалуйста."
+        variants = r.get("variants") or []
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in variants]) if variants else None
+        set_clarify_state(context, {"title": title})
+        await safe_reply(update, q, reply_markup=kb)
+        return
 
             if intent == "create":
                 title = r.get("title") or _extract_title(incoming_text)
