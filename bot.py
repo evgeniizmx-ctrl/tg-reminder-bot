@@ -854,6 +854,7 @@ if not r and OPENAI_API_KEY:
         log.exception("call_llm failed")
         r = None
 
+
 # 3) ничего не распознано
 if not r:
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
