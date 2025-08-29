@@ -473,9 +473,11 @@ def db_snooze(rem_id: int, minutes: int) -> tuple[str, str | None]:
 def db_future(user_id: int):
     with db() as conn:
         q = (
-            "select * from reminders where user_id=%s and status='scheduled' order by id desc"
+            # >>> PATCH: скрываем «детей» (parent_id is null)
+            "select * from reminders where user_id=%s and status='scheduled' and parent_id is null order by id desc"
             if DB_DIALECT == "postgres"
-            else "select * from reminders where user_id=? and status='scheduled' order by id desc"
+            else "select * from reminders where user_id=? and status='scheduled' and parent_id is null order by id desc"
+            # <<< PATCH
         )
         try:
             cur = conn.execute(q, (user_id,))
@@ -685,7 +687,31 @@ async def cb_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data or ""
     if data.startswith("del:"):
-        rem_id = int(data.split(":")[1]); db_delete(rem_id)
+        rem_id = int(data.split(":")[1]); 
+        # >>> PATCH: удаляем детей каскадно
+        try:
+            # снимем джобы детей заранее
+            with db() as conn:
+                if DB_DIALECT == "postgres":
+                    kids = conn.execute("select id from reminders where parent_id=%s", (rem_id,)).fetchall()
+                else:
+                    kids = conn.execute("select id from reminders where parent_id=?", (rem_id,)).fetchall()
+            sch = ensure_scheduler()
+            for k in (kids or []):
+                kid_id = k["id"] if isinstance(k, dict) else k[0]
+                job = sch.get_job(f"rem-{kid_id}")
+                if job: job.remove()
+            # удалим детей из БД
+            with db() as conn:
+                if DB_DIALECT == "postgres":
+                    conn.execute("delete from reminders where parent_id=%s", (rem_id,))
+                else:
+                    conn.execute("delete from reminders where parent_id=?", (rem_id,)); conn.commit()
+        except Exception:
+            log.exception("cascade delete children failed")
+        # <<< PATCH
+
+        db_delete(rem_id)
         sch = ensure_scheduler(); job = sch.get_job(f"rem-{rem_id}")
         if job: job.remove()
         await q.edit_message_text("Удалено ✅"); return
@@ -842,10 +868,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1) быстрый парсер
     r = rule_parse(incoming_text, now_local)
+    log.debug("rule_parse -> %r", r)
 
     # 2) LLM (только если первого нет и ключ есть)
     if not r and OPENAI_API_KEY:
         r = await call_llm(incoming_text, user_tz)
+        log.debug("llm_parse -> %r", r)
 
     # 3) ничего не распознано
     if not r:
@@ -872,18 +900,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {phrase}", reply_markup=kb)
         return
 
-        # ====== ОДНОРАЗОВОЕ ======
+    # ====== ОДНОРАЗОВОЕ ======
+    # >>> PATCH: поддержка both fixed_datetime (LLM) и when_local (rule_parse)
     when_local = None
     fixed = r.get("fixed_datetime")
 
     if fixed:
-        # из LLM
         try:
             when_local = dparser.isoparse(fixed)
         except Exception:
             when_local = None
 
-    # поддержка быстрого парсера: rule_parse -> when_local (datetime | iso)
     if when_local is None:
         wl = r.get("when_local")
         if wl is not None:
@@ -894,6 +921,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     when_local = dparser.isoparse(str(wl))
                 except Exception:
                     when_local = None
+    # <<< PATCH
 
     if intent in {"create", "create_reminder"} and when_local is not None:
         if when_local.tzinfo is None:
@@ -904,6 +932,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
         dt_local = to_user_local(when_iso_utc, user_tz)
         await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+
+        # >>> PATCH: показать опрос пред-напоминаний
+        try:
+            now_loc = now_in_user_tz(user_tz)
+            delta_min = int((dt_local - now_loc).total_seconds() // 60)
+            options = [
+                (10, "за 10 мин"),
+                (60, "за час"),
+                (180, "за 3 часа"),
+                (1440, "за день"),
+                (10080, "за неделю"),
+            ]
+            avail = [(m, lbl) for m, lbl in options if m <= delta_min]
+            if avail:
+                rows = []
+                row = []
+                for i, (m, lbl) in enumerate(avail, 1):
+                    row.append(InlineKeyboardButton(lbl, callback_data=f"pre:{m}:{rem_id}"))
+                    if i % 2 == 0:
+                        rows.append(row); row = []
+                if row: rows.append(row)
+                rows.append([
+                    InlineKeyboardButton("Готово", callback_data=f"pre:save:{rem_id}"),
+                    InlineKeyboardButton("Отмена", callback_data=f"pre:cancel:{rem_id}")
+                ])
+                await safe_reply(update, "Когда напомнить заранее? (можно несколько)", reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            log.exception("pre-alert keyboard build failed")
+        # <<< PATCH
         return
 
     # ====== ПЕРИОДИЧЕСКИЕ (daily/weekly/monthly/yearly) ======
@@ -934,7 +991,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {txt}", reply_markup=kb)
         return
 
-        # ====== УТОЧНЕНИЯ ======
+    # ====== УТОЧНЕНИЯ ======
     if intent in {"ask", "ask_clarification"} or r.get("expects"):
         set_clarify_state(context, {
             "title": title,
@@ -952,29 +1009,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if expects == "time":
-            # Показываем кнопки ТОЛЬКО для двусмысленного "в 1..12" (две опции: HH:00 и (HH+12):00)
-            def _is_time(s: str) -> bool:
+            # >>> PATCH: кнопки показываем ТОЛЬКО когда двусмысленно (ровно 2 вида HH:00)
+            def _is_hhmm(s: str) -> bool:
                 return bool(re.fullmatch(r"\d{2}:\d{2}", s))
 
-            if len(variants) == 2 and all(_is_time(v) for v in variants):
-                # красивые подписи: "в 5 утра" / "в 17 часов", а в callback — чистое время
+            if len(variants) == 2 and all(_is_hhmm(v) for v in variants):
                 def label_for(t: str) -> str:
                     hh = int(t[:2])
                     if hh == 0: return "в 00:00"
                     if 1 <= hh <= 11: return f"в {hh} утра"
                     return f"в {hh} часов"
-
                 kb = InlineKeyboardMarkup([[
                     InlineKeyboardButton(label_for(variants[0]), callback_data=f"answer:{variants[0]}"),
                     InlineKeyboardButton(label_for(variants[1]), callback_data=f"answer:{variants[1]}")
                 ]])
                 await safe_reply(update, r.get("question") or "Уточни время", reply_markup=kb)
             else:
-                # все прочие случаи — времени нет кнопок, ввод руками
                 await safe_reply(update, r.get("question") or "Во сколько?", reply_markup=None)
+            # <<< PATCH
             return
 
-        # прочие уточнения
+        # все прочие уточнения
         if variants:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in variants])
             await safe_reply(update, r.get("question") or "Уточни, пожалуйста.", reply_markup=kb)
@@ -1037,15 +1092,18 @@ def db_init():
                   when_iso text,
                   status text default 'scheduled',
                   kind text default 'oneoff',
-                  recurrence_json text
+                  recurrence_json text,
+                  parent_id bigint,
+                  offset_minutes integer
                 )
             """)
-            conn.execute("create index if not exists reminders_user_idx on reminders(user_id)")
-            conn.execute("create index if not exists reminders_status_idx on reminders(status)")
+            # >>> PATCH: индексы/alter на всякий случай
             conn.execute("alter table reminders add column if not exists parent_id bigint")
             conn.execute("alter table reminders add column if not exists offset_minutes integer")
+            conn.execute("create index if not exists reminders_user_idx on reminders(user_id)")
+            conn.execute("create index if not exists reminders_status_idx on reminders(status)")
             conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)")
-
+            # <<< PATCH
         else:
             import sqlite3
             conn.execute("""
@@ -1063,7 +1121,9 @@ def db_init():
                     when_iso text,
                     status text default 'scheduled',
                     kind text default 'oneoff',
-                    recurrence_json text
+                    recurrence_json text,
+                    parent_id integer,
+                    offset_minutes integer
                 )
             """)
             # защита от повторных миграций
@@ -1071,7 +1131,75 @@ def db_init():
             except Exception: pass
             try: conn.execute("alter table reminders add column recurrence_json text")
             except Exception: pass
+            # >>> PATCH: новые поля и индекс
+            try: conn.execute("alter table reminders add column parent_id integer")
+            except Exception: pass
+            try: conn.execute("alter table reminders add column offset_minutes integer")
+            except Exception: pass
+            try: conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)")
+            except Exception: pass
+            # <<< PATCH
             conn.commit()
+
+# ---------- PRE-ALERTS CALLBACKS ----------
+# >>> PATCH: обработчик inline-кнопок пред-напоминаний
+async def cb_prealerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data or ""
+    try:
+        if data.startswith("pre:save:"):
+            await q.edit_message_text("Готово ✅")
+            return
+        if data.startswith("pre:cancel:"):
+            await q.edit_message_text("Окей, без предупреждений.")
+            return
+
+        m = re.fullmatch(r"pre:(\d+):(\d+)", data)
+        if not m:
+            return
+        offset = int(m.group(1))
+        parent_id = int(m.group(2))
+
+        parent = db_get_reminder(parent_id)
+        if not parent:
+            return await q.edit_message_text("Событие не найдено.")
+
+        when_iso = parent.get("when_iso") if isinstance(parent, dict) else parent["when_iso"]
+        if not when_iso:
+            return await q.edit_message_text("Нельзя добавить предупреждение к этому событию.")
+
+        child_when_utc = dparser.isoparse(when_iso).astimezone(timezone.utc) - timedelta(minutes=offset)
+        if child_when_utc <= datetime.now(timezone.utc):
+            await q.answer("Эта опция уже недоступна", show_alert=False)
+            return
+
+        with db() as conn:
+            if DB_DIALECT == "postgres":
+                r = conn.execute(
+                    "insert into reminders(user_id, title, body, when_iso, status, kind, parent_id, offset_minutes) "
+                    "values(%s,%s,%s,%s,'scheduled','oneoff',%s,%s) returning id",
+                    (parent["user_id"], parent["title"], parent.get("body"), iso_utc(child_when_utc), parent_id, offset)
+                ).fetchone()
+                child_id = r["id"]
+            else:
+                cur = conn.execute(
+                    "insert into reminders(user_id, title, body, when_iso, status, kind, parent_id, offset_minutes) "
+                    "values(?,?,?,?, 'scheduled','oneoff',?,?)",
+                    (parent["user_id"], parent["title"], parent.get("body"), iso_utc(child_when_utc), parent_id, offset)
+                )
+                conn.commit()
+                child_id = cur.lastrowid
+
+        schedule_oneoff(child_id, parent["user_id"], iso_utc(child_when_utc), parent["title"], kind="oneoff")
+        await q.answer("Добавлено ✅", show_alert=False)
+        # не перерисовываем — можно нажать ещё и потом «Готово»
+    except Exception:
+        log.exception("cb_prealerts failed")
+        try:
+            await q.answer("Ошибка", show_alert=False)
+        except Exception:
+            pass
+# <<< PATCH
 
 # ---------- MAIN ----------
 def main():
@@ -1093,6 +1221,9 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_inline, pattern=r"^(del:|done:|snooze:)"))
     app.add_handler(CallbackQueryHandler(cb_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
+    # >>> PATCH: регистрируем обработчик пред-напоминаний
+    app.add_handler(CallbackQueryHandler(cb_prealerts, pattern=r"^pre:"))
+    # <<< PATCH
 
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
