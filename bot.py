@@ -1081,6 +1081,127 @@ def schedule_prealerts_for_recurring(rem_id: int, user_id: int, title: str, recu
             id=job_id, replace_existing=True, misfire_grace_time=300, coalesce=True,
             kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "offset": off},
             name=f"prealert {rem_id} ({off}m)",
+            # --- UI для выбора pre_offsets у recurring ---
+def _recurring_prebuild_options_for_next_occurrence(recurrence: dict, tz_str: str) -> tuple[list[tuple[int,str]], datetime | None]:
+    """Вернёт доступные (offset, label) для ближайшего next_fire, и сам next_fire (UTC).
+       Фильтруем те, что уже прошли относительно now().
+    """
+    trig = _build_cron_trigger_for_recurrence(recurrence, tz_str)
+    if trig is None:
+        return [], None
+    next_fire = _next_fire_from_trigger(trig)
+    if not next_fire:
+        return [], None
+
+    # кандидаты как у одноразовых
+    candidates = [(10, "За 10 мин"), (60, "За час"), (180, "За 3 часа"), (1440, "За день"), (10080, "За неделю")]
+    now_utc = datetime.now(timezone.utc)
+    avail = [(m, lbl) for m, lbl in candidates if next_fire - timedelta(minutes=m) > now_utc]
+    return avail, next_fire
+
+def _recurring_prebuild_keyboard(selected: set[int], recurrence: dict, tz_str: str):
+    opts, next_fire = _recurring_prebuild_options_for_next_occurrence(recurrence, tz_str)
+    if not opts:
+        return None, next_fire
+    rows = []
+    row = []
+    for i, (m, lbl) in enumerate(opts, 1):
+        mark = "✅ " if m in selected else "⬜ "
+        row.append(InlineKeyboardButton(mark + lbl, callback_data=f"preR:toggle:{m}"))
+        if i % 2 == 0:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([
+        InlineKeyboardButton("✅ Готово", callback_data="preR:save"),
+        InlineKeyboardButton("❌ Отмена", callback_data="preR:cancel"),
+    ])
+    return InlineKeyboardMarkup(rows), next_fire
+
+async def send_recurring_prebuild(update: Update, context: ContextTypes.DEFAULT_TYPE, *, rem_id: int, recurrence: dict, tz_str: str):
+    """Запускает опрос pre_offsets для recurring и кладёт состояние в user_data['rec_prebuild']"""
+    state = {
+        "rem_id": rem_id,
+        "recurrence": dict(recurrence or {}),
+        "tz": tz_str,
+        "selected": set(),
+    }
+    context.user_data["rec_prebuild"] = state
+    kb, next_fire = _recurring_prebuild_keyboard(state["selected"], state["recurrence"], tz_str)
+    if kb is None:
+        # нечего предлагать (слишком близко ко времени) — просто выходим
+        return
+    await safe_reply(update, "Когда напоминать заранее для этого повтора? (можно несколько)", reply_markup=kb)
+
+async def cb_recurring_prebuild(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data or ""
+    st = context.user_data.get("rec_prebuild")
+    if not st:
+        try: await q.edit_message_text("Сессия выбора завершена.")
+        except Exception: pass
+        return
+
+    if data == "preR:cancel":
+        context.user_data.pop("rec_prebuild", None)
+        try: await q.edit_message_text("Окей, без предупреждений для повтора.")
+        except Exception: pass
+        return
+
+    if data == "preR:save":
+        # сохраняем в recurrence_json и планируем пре-оповещения
+        rem_id = st["rem_id"]; tz = st["tz"]; sel = sorted(list(st.get("selected", set())))
+        # читаем текущий recurrence_json
+        row = db_get_reminder(rem_id)
+        if not row:
+            context.user_data.pop("rec_prebuild", None)
+            try: await q.edit_message_text("Событие не найдено.")
+            except Exception: pass
+            return
+        rec = json.loads((row.get("recurrence_json") if isinstance(row, dict) else row["recurrence_json"]) or "{}")
+        if sel:
+            rec["pre_offsets"] = sel
+        else:
+            rec.pop("pre_offsets", None)
+
+        # апдейт в БД
+        rec_json = json.dumps(rec, ensure_ascii=False)
+        with db() as conn:
+            if DB_DIALECT == "postgres":
+                conn.execute("update reminders set recurrence_json=%s where id=%s", (rec_json, rem_id))
+            else:
+                conn.execute("update reminders set recurrence_json=? where id=?", (rec_json, rem_id)); conn.commit()
+
+        # перестроить пре-оповещения на ближайший цикл
+        schedule_prealerts_for_recurring(rem_id, row["user_id"], row["title"], rec, rec.get("tz") or tz)
+        context.user_data.pop("rec_prebuild", None)
+        # финальный текст
+        suffix = ""
+        if sel:
+            mapping = {10:"за 10 мин",60:"за час",180:"за 3 часа",1440:"за день",10080:"за неделю"}
+            labels = [mapping[o] for o in sel if o in mapping]
+            suffix = " " + ", ".join(labels)
+        try:
+            await q.edit_message_text(f"Готово ✅ Предупреждения для повтора:{suffix if suffix else ' нет'}")
+        except Exception:
+            pass
+        return
+
+    # toggle
+    m = re.fullmatch(r"preR:toggle:(\d+)", data)
+    if m:
+        offset = int(m.group(1))
+        sel = st.get("selected", set())
+        if offset in sel: sel.remove(offset)
+        else: sel.add(offset)
+        st["selected"] = sel
+        context.user_data["rec_prebuild"] = st
+        kb, _ = _recurring_prebuild_keyboard(st["selected"], st["recurrence"], st["tz"])
+        try:
+            await q.edit_message_reply_markup(reply_markup=kb)
+        except Exception:
+            await q.answer("Обновлено", show_alert=False)
+        return
+
         )
 
 # ---------- main text ----------
@@ -1201,6 +1322,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rem_id = db_add_reminder_recurring(user_id, title, None, recurrence, user_tz)
         schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
+        # Сразу предложим выбрать «за сколько заранее»
+        await send_recurring_prebuild(update, context, rem_id=rem_id, recurrence=recurrence, tz_str=user_tz)
+
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data=f"del:{rem_id}")]])
         if rtype == "daily":
             txt = f"каждый день в {rtime}"
@@ -1440,6 +1564,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_answer, pattern=r"^answer:"))
     app.add_handler(CallbackQueryHandler(cb_prealerts, pattern=r"^pre:"))     # старый обработчик оставлен
     app.add_handler(CallbackQueryHandler(cb_prebuild, pattern=r"^pre2:"))      # новый сценарий (создание при Готово)
+    app.add_handler(CallbackQueryHandler(cb_recurring_prebuild, pattern=r"^preR:"))
 
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
