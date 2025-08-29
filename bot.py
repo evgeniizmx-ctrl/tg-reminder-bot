@@ -22,6 +22,7 @@ import asyncio
 import tempfile
 
 from dateutil import parser as dparser
+from typing import List, Tuple, Optional
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -1077,13 +1078,18 @@ def schedule_prealerts_for_recurring(rem_id: int, user_id: int, title: str, recu
             continue
         job_id = _pre_alert_job_id(rem_id, off)
         sch.add_job(
-            fire_prealert, DateTrigger(run_date=when_utc),
-            id=job_id, replace_existing=True, misfire_grace_time=300, coalesce=True,
-            kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "offset": off},
-            name=f"prealert {rem_id} ({off}m)",
-            # --- UI для выбора pre_offsets у recurring ---
+    fire_prealert, DateTrigger(run_date=when_utc),
+    id=job_id, replace_existing=True, misfire_grace_time=300, coalesce=True,
+    kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "offset": off},
+    name=f"prealert {rem_id} ({off}m)",
+)
 
+# --- UI для выбора pre_offsets у recurring ---
 def _recurring_prebuild_options_for_next_occurrence(
+    recurrence: dict, tz_str: str
+) -> Tuple[List[Tuple[int, str]], Optional[datetime]]:
+    ...
+
     recurrence: dict, tz_str: str
 ) -> Tuple[List[Tuple[int, str]], Optional[datetime]]:
 
