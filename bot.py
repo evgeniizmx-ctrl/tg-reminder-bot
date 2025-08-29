@@ -872,10 +872,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {phrase}", reply_markup=kb)
         return
 
-    # ====== ОДНОРАЗОВОЕ ======
+        # ====== ОДНОРАЗОВОЕ ======
+    when_local = None
     fixed = r.get("fixed_datetime")
-    if intent in {"create", "create_reminder"} and fixed:
-        when_local = dparser.isoparse(fixed)
+
+    if fixed:
+        # из LLM
+        try:
+            when_local = dparser.isoparse(fixed)
+        except Exception:
+            when_local = None
+
+    # поддержка быстрого парсера: rule_parse -> when_local (datetime | iso)
+    if when_local is None:
+        wl = r.get("when_local")
+        if wl is not None:
+            if isinstance(wl, datetime):
+                when_local = wl
+            else:
+                try:
+                    when_local = dparser.isoparse(str(wl))
+                except Exception:
+                    when_local = None
+
+    if intent in {"create", "create_reminder"} and when_local is not None:
         if when_local.tzinfo is None:
             when_local = when_local.replace(tzinfo=tzinfo_from_user(user_tz))
         when_iso_utc = iso_utc(when_local)
