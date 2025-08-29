@@ -934,19 +934,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {txt}", reply_markup=kb)
         return
 
-    # ====== УТОЧНЕНИЯ ======
+        # ====== УТОЧНЕНИЯ ======
     if intent in {"ask", "ask_clarification"} or r.get("expects"):
         set_clarify_state(context, {
             "title": title,
             "base_date": r.get("base_date"),
             "recurrence": rec_obj if rec_obj else None
         })
+
+        expects = r.get("expects")
         variants = r.get("variants") or []
-        if r.get("expects") == "weekday":
-            labels = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(x, callback_data=f"answer:{x}") for x in labels]])
+
+        if expects == "weekday":
+            labels = ["пн","вт","ср","чт","пт","сб","вс"]
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(x, callback_data=f"answer:{x}")] for x in labels])
             await safe_reply(update, r.get("question") or "В какой день недели?", reply_markup=kb)
-        elif variants:
+            return
+
+        if expects == "time":
+            # Показываем кнопки ТОЛЬКО для двусмысленного "в 1..12" (две опции: HH:00 и (HH+12):00)
+            def _is_time(s: str) -> bool:
+                return bool(re.fullmatch(r"\d{2}:\d{2}", s))
+
+            if len(variants) == 2 and all(_is_time(v) for v in variants):
+                # красивые подписи: "в 5 утра" / "в 17 часов", а в callback — чистое время
+                def label_for(t: str) -> str:
+                    hh = int(t[:2])
+                    if hh == 0: return "в 00:00"
+                    if 1 <= hh <= 11: return f"в {hh} утра"
+                    return f"в {hh} часов"
+
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(label_for(variants[0]), callback_data=f"answer:{variants[0]}"),
+                    InlineKeyboardButton(label_for(variants[1]), callback_data=f"answer:{variants[1]}")
+                ]])
+                await safe_reply(update, r.get("question") or "Уточни время", reply_markup=kb)
+            else:
+                # все прочие случаи — времени нет кнопок, ввод руками
+                await safe_reply(update, r.get("question") or "Во сколько?", reply_markup=None)
+            return
+
+        # прочие уточнения
+        if variants:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in variants])
             await safe_reply(update, r.get("question") or "Уточни, пожалуйста.", reply_markup=kb)
         else:
