@@ -838,22 +838,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         now_local = now_in_user_tz(user_tz)
 
-    # 1) быстрый парсер
-    r = rule_parse(incoming_text, now_local)
+# 1) быстрый парсер
+r = rule_parse(incoming_text, now_local)
 
-    # 2) LLM-парсер (если быстрый не сработал и ключ задан)
-    if not r and OPENAI_API_KEY:
-        r = await call_llm(incoming_text, user_tz)
-        log.debug("LLM parsed: %s", r)
+# 2) LLM-парсер (если быстрый не сработал и ключ задан)
+if not r and OPENAI_API_KEY:
+    r = await call_llm(incoming_text, user_tz)
+    log.debug("LLM parsed: %s", r)
 
-    # 3) ничего не распознано
-    if not r:
-        await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
-        return
+# 3) ничего не распознано
+if not r:
+    await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+    return
 
-    # ---- разбор результата парсера ----
-    intent = (r.get("intent") or "").lower()
-    title = r.get("title") or _extract_title(incoming_text)
+# ---- разбор результата парсера ----
+intent = (r.get("intent") or "").lower()
+title = r.get("title") or _extract_title(incoming_text)
+
 
     # ====== INTERVAL (поддержка старой и новой схемы) ======
     # старая: intent == "create_interval", поля: unit, n, start_at
