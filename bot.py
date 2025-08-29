@@ -1042,6 +1042,10 @@ def db_init():
             """)
             conn.execute("create index if not exists reminders_user_idx on reminders(user_id)")
             conn.execute("create index if not exists reminders_status_idx on reminders(status)")
+            conn.execute("alter table reminders add column if not exists parent_id bigint")
+            conn.execute("alter table reminders add column if not exists offset_minutes integer")
+            conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)")
+
         else:
             import sqlite3
             conn.execute("""
