@@ -583,6 +583,25 @@ def reschedule_all():
                 if rec.get("pre_offsets"):
                     schedule_prealerts_for_recurring(row["id"], row["user_id"], row["title"], rec, tz)
     log.info("Rescheduled %d reminders from DB", len(rows))
+    # --- module-level sweep for recurring pre-alerts ---
+
+async def sweep_prealerts():
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "select * from reminders where status='scheduled' and kind='recurring'"
+            ).fetchall()
+        for r in rows:
+            row = dict(r) if not isinstance(r, dict) else r
+            rec = json.loads(row.get("recurrence_json") or "{}")
+            tz = rec.get("tz") or "+03:00"
+            if rec.get("pre_offsets"):
+                schedule_prealerts_for_recurring(
+                    row["id"], row["user_id"], row["title"], rec, tz
+                )
+    except Exception:
+        log.exception("sweep_prealerts failed")
+
 
 # ---------- RU wording ----------
 def ru_weekly_phrase(weekday_code: str) -> str:
@@ -1273,20 +1292,11 @@ async def on_startup(app: Application):
     reschedule_all()
 
     # --- NEW: hourly sweep для перестройки пре-оповещений (DST/рестарт/дрейф) ---
-    async def _sweep_prealerts():
-        try:
-            with db() as conn:
-                rows = conn.execute("select * from reminders where status='scheduled' and kind='recurring'").fetchall()
-            for r in rows:
-                row = dict(r) if not isinstance(r, dict) else r
-                rec = json.loads(row.get("recurrence_json") or "{}")
-                tz = rec.get("tz") or "+03:00"
-                if rec.get("pre_offsets"):
-                    schedule_prealerts_for_recurring(row["id"], row["user_id"], row["title"], rec, tz)
-        except Exception:
-            log.exception("sweep_prealerts failed")
 
-    scheduler.add_job(_sweep_prealerts, "interval", minutes=60, id="sweep-prealerts", replace_existing=True)
+    scheduler.add_job(
+        sweep_prealerts, "interval",
+        minutes=60, id="sweep-prealerts", replace_existing=True
+    )
 
 # ---------- DB INIT ----------
 def db_init():
