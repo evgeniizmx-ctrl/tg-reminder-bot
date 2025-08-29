@@ -1082,7 +1082,12 @@ def schedule_prealerts_for_recurring(rem_id: int, user_id: int, title: str, recu
             kwargs={"chat_id": user_id, "rem_id": rem_id, "title": title, "offset": off},
             name=f"prealert {rem_id} ({off}m)",
             # --- UI для выбора pre_offsets у recurring ---
-def _recurring_prebuild_options_for_next_occurrence(recurrence: dict, tz_str: str) -> tuple[list[tuple[int,str]], datetime | None]:
+from typing import List, Tuple, Optional
+
+def _recurring_prebuild_options_for_next_occurrence(
+    recurrence: dict, tz_str: str
+) -> Tuple[List[Tuple[int, str]], Optional[datetime]]:
+
     """Вернёт доступные (offset, label) для ближайшего next_fire, и сам next_fire (UTC).
        Фильтруем те, что уже прошли относительно now().
     """
