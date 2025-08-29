@@ -1214,8 +1214,6 @@ async def cb_recurring_prebuild(update: Update, context: ContextTypes.DEFAULT_TY
             await q.answer("Обновлено", show_alert=False)
         return
 
-        )
-
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 0) быстрые выходы
