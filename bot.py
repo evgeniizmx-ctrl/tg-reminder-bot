@@ -914,8 +914,74 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await safe_reply(update, r.get("question") or "Уточни, пожалуйста.")
                 return
+            # ---- LLM Fallback ----
+        try:
+            parsed = await call_llm(incoming_text, user_tz)
+            intent = (parsed.get("intent") or "").lower()
+            title = parsed.get("title") or _extract_title(incoming_text)
 
-        await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+            if intent == "create":
+                when_local_iso = parsed.get("when_local")
+                if not when_local_iso:
+                    return await safe_reply(update, "Не смог распарсить время.", reply_markup=MAIN_MENU_KB)
+                when_local = dparser.isoparse(when_local_iso)
+                if when_local.tzinfo is None:
+                    when_local = when_local.replace(tzinfo=tzinfo_from_user(user_tz))
+                when_iso_utc = iso_utc(when_local)
+                rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+                schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+                dt_local = to_user_local(when_iso_utc, user_tz)
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+                return await safe_reply(update, f"⏰ Окей, напомню «{title}» {dt_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+
+            if intent == "create_interval":
+                unit = (parsed.get("unit") or "minute").lower()
+                n = int(parsed.get("n") or 1)
+                start_at_local = dparser.isoparse(parsed.get("start_at")) if parsed.get("start_at") else now_local
+                recurrence = {"type":"interval","unit":unit,"n":n,"start_at":start_at_local.replace(microsecond=0).isoformat()}
+                rem_id = db_add_reminder_recurring(user_id, title, None, recurrence, user_tz)
+                schedule_recurring(rem_id, user_id, title, recurrence, user_tz)
+                phrase = _format_interval_phrase(unit, n)
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+                return await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {phrase}", reply_markup=kb)
+
+            if intent == "create_recurring":
+                rec = parsed.get("recurrence") or {}
+                # ожидаем type ∈ {daily, weekly, monthly, yearly} и поля time / weekday / day / month
+                rem_id = db_add_reminder_recurring(user_id, title, None, rec, user_tz)
+                schedule_recurring(rem_id, user_id, title, rec, user_tz)
+                # короткая фраза подтверждения:
+                rtype = (rec.get("type") or "").lower()
+                if rtype == "daily":
+                    msg = f"каждый день в {rec.get('time','00:00')}"
+                elif rtype == "weekly":
+                    msg = f"{ru_weekly_phrase(rec.get('weekday',''))} в {rec.get('time','00:00')}"
+                elif rtype == "monthly":
+                    msg = f"каждое {rec.get('day')} число в {rec.get('time','00:00')}"
+                elif rtype == "yearly":
+                    msg = f"каждый год {int(rec.get('day',1)):02d}.{int(rec.get('month',1)):02d} в {rec.get('time','00:00')}"
+                else:
+                    msg = "по расписанию"
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить", callback_data=f"del:{rem_id}")]])
+                return await safe_reply(update, f"⏰ Окей, буду напоминать «{title}» {msg}", reply_markup=kb)
+
+            if intent == "ask":
+                # бот просит уточнения (например, 11 → 11:00 или 23:00)
+                set_clarify_state(context, {
+                    "base_date": parsed.get("base_date"),
+                    "title": title
+                })
+                variants = parsed.get("variants") or []
+                if variants:
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in variants])
+                    return await safe_reply(update, parsed.get("question") or "Уточни, пожалуйста, время", reply_markup=kb)
+                return await safe_reply(update, parsed.get("question") or "Уточни, пожалуйста, время")
+
+        except Exception:
+            log.exception("LLM fallback failed")
+
+        return await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+
     except Exception:
         log.exception("handle_text fatal")
         await safe_reply(update, "Упс, что-то пошло не так. Напиши ещё раз, пожалуйста.")
