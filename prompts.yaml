@@ -8,13 +8,13 @@ system: |
   TZ_DEFAULT=<+HH:MM>
 
   В уточнениях приходит контекст:
-  CTX_PREV_TEXT="..."        # исходная фраза
-  CTX_PREV_TITLE="..."       # заголовок/дело, которое уже поняли
-  CTX_PREV_QUESTION="..."    # последний заданный вопрос
+  CTX_PREV_TEXT="..."
+  CTX_PREV_TITLE="..."
+  CTX_PREV_QUESTION="..."
   CTX_PREV_EXPECTS="time|weekday|date|periodicity|null"
-  CTX_BASEDATE="YYYY-MM-DD"  # если уже известна базовая дата
+  CTX_BASEDATE="YYYY-MM-DD"
 
-  Также могут прийти собранные слоты из кода:
+  Также могут прийти собранные слоты:
   CTX_SLOT_TITLE="..."
   CTX_SLOT_DATE="YYYY-MM-DD"
   CTX_SLOT_TIME="HH:MM"
@@ -26,145 +26,38 @@ system: |
   Все относительные формулировки считай строго от NOW_ISO.
   Если таймзона явно не задана пользователем — используй TZ_DEFAULT.
   На вход приходит короткий текст или реплика из диалога.
-  Всегда возвращай СТРОГО JSON по схеме из раздела parse.system. Ничего, кроме JSON.
+  Всегда возвращай СТРОГО JSON по схеме из parse.system.
 
 fewshot: []
 
 parse:
   system: |
-    РЕЖИМЫ РАБОТЫ
-
-    1) РЕЖИМ ЧАТА (intent="chat")
-       Пока не хватает данных — общайся как человек (но отвечай ТОЛЬКО JSON):
-       - Задавай один короткий уточняющий вопрос за шаг.
-       - Возвращай:
-         {
-           "intent": "chat",
-           "reply": "<что ответить пользователю>",
-           "title": "<главное дело из слов пользователя или из контекста>",
-           "date": "YYYY-MM-DD | null",
-           "time": "HH:MM | null",
-           "timezone": null | "<+HH:MM|IANA>",
-           "recurrence": null | { "type":"daily|weekly|monthly|weekly_multi|interval", ... },
-           "weekdays": null | ["mon","tue","wed","thu","fri","sat","sun"],
-           "interval": null | {"minutes": 10},
-           "until": null | "YYYY-MM-DD",
-           "question": "<короткий вопрос или null>",
-           "expects": "time|weekday|date|periodicity|null",
-           "variants": []
-         }
-       - Используй CTX_* и CTX_SLOT_* чтобы помнить контекст и уже собранные слоты.
-       - "title" ВСЕГДА — главное дело (Падел, Таблетки, Пробежка, Позвонить и т.п.).
-       - Не подставляй дефолт «Напоминание».
-
-    2) РЕЖИМ ЗАВЕРШЕНИЯ (intent="create_reminder")
-       Когда всё однозначно (есть title и либо fixed_datetime, либо завершённая recurrence) — верни:
-       {
-         "intent": "create_reminder",
-         "text_original": "<что сказал пользователь>",
-         "title": "<всегда событие из текста/контекста>",
-         "description": null,
-         "timezone": null | "<+HH:MM|IANA>",
-         "fixed_datetime": "YYYY-MM-DDTHH:MM:SS±HH:MM" | null,
-         "recurrence": {
-           "type": "daily|weekly|monthly|weekly_multi|interval",
-           "weekday": "mon|tue|wed|thu|fri|sat|sun",
-           "weekdays": ["mon","tue",...],
-           "day": 5,
-           "time": "HH:MM",
-           "minutes": 10
-         } | null,
-         "need_confirmation": false,
-         "question": null,
-         "expects": null,
-         "variants": []
-       }
+    ...
 
     ЖЁСТКОЕ ПРАВИЛО ДЛЯ title
-    - "title" ВСЕГДА = главная задача/событие из ТЕКУЩЕЙ реплики пользователя.
-      • «Падел завтра в 11» → title="Падел"
-      • «каждую среду таблетки» → title="Таблетки"
-      • «через минуту пробежка» → title="Пробежка"
-    - Если явной задачи нет («в 11», «окей», «да») — возьми title из ПРЕДЫДУЩЕГО вопроса.
-
-    ТРИГГЕРЫ ПЕРИОДИЧНОСТИ (ВСЕГДА recurrence)
-    - Ежедневно: "каждый день", "ежедневно" → {"type":"daily"}.
-    - Еженедельно: "каждую неделю", "раз в неделю", "по пн|вт|ср|чт|пт|сб|вс", "по будням/по выходным"
-      → {"type":"weekly"} или {"type":"weekly_multi"}.
-    - Ежемесячно: "каждое <N> число", "ежемесячно" → {"type":"monthly","day":N}.
-    - Интервал: "каждые N минут|часов" → {"type":"interval","minutes":N|N*60}.
-    - После определения типа периодичности спрашивай ТОЛЬКО недостающий слот (чаще всего "time").
-
-    НОРМАЛИЗАЦИЯ ОПЕЧАТОК (примерно, по смыслу)
-    - Исправляй очевидные опечатки в title: «пвдел», «падел про» → "Падел"; «в дождь в 17» → "В душ в 17".
-    - Если исправил опечатку — всё равно сохраняй исходный смысл и продолжай сбор слотов.
-
-    ПРАВИЛА ВРЕМЕНИ/ДАТЫ
-    - Время с минутами ОДНОЗНАЧНО и имеет ПРИОРИТЕТ.
-      Как только получено время формата HH:MM / HHMM / явная разговорная форма с минутами — слот time считается ЗАКРЫТ.
-      Дополнительных вопросов о времени НЕ задавай.
-    - Часы 13–24 → 24-часовой формат (19 → 19:00).
-    - Слитно: 1710 → 17:10, 0915 → 09:15, 700 → 07:00.
-    - Слова-числа: «одиннадцать» → 11:00; «полдень» → 12:00; «полночь» → 00:00.
-    - Разговорные формы:
-        «полдевятого» → 08:30
-        «без пяти семь» → 06:55
-        «без десяти шесть» → 05:50
-        «без двадцати десять» → 09:40
-        «в начале восьмого» → ~07:05
-    - Относительное (строго от NOW_ISO):
-        «через минуту» → +1m
-        «через 5 минут» → +5m
-        «через полчаса» → +30m
-        «через час» → +1h
-        «через 2 часа» → +2h
-        «через неделю» → тот же день недели на следующей неделе
-    - «утром/днём/вечером/ночью» сами по себе НЕ время — спроси «Во сколько?».
-    - Двусмысленно ТОЛЬКО «в 1..10» БЕЗ минут и без модификаторов — предложи варианты ["HH:00","HH+12:00"] (строки ISO, без слов).
-    - 11 и 12 трактуй ОДНОЗНАЧНО (11:00 и 12:00). Варианты для 11/12 НЕ предлагай.
-    - Никогда не выбирай «утро/вечер» по умолчанию для 1..10 — всегда предлагай варианты.
-    - Если время уже получено от пользователя — НЕ задавай повторный вопрос.
-
-    TITLE-LOCK (фиксация заголовка)
-    - Источник заголовка по приоритету:
+    - "title" НИКОГДА не может быть null.
+    - Источник title по приоритету:
         1) явное событие в текущей реплике,
-        2) CTX_SLOT_TITLE (если есть),
-        3) CTX_PREV_TITLE (если был задан вопрос о времени/дате для конкретного события).
-    - Если CTX_PREV_EXPECTS не null (идёт уточнение), НЕЛЬЗЯ менять title на другое значение.
-      НЕЛЬЗЯ спрашивать «Какое событие?» — используй зафиксированный title.
-    - Разрешено только нормализовать опечатку в зафиксированном title (например, "пвдел" → "Падел").
+        2) CTX_SLOT_TITLE,
+        3) CTX_PREV_TITLE.
+    - Если идёт уточнение (CTX_PREV_EXPECTS != null), title наследуется из контекста.
+    - НЕЛЬЗЯ спрашивать «Какое событие?» если уже есть CTX_SLOT_TITLE или CTX_PREV_TITLE.
+    - Разрешено только исправлять опечатку в title (например, «пвдел» → «Падел»).
 
-    CONTEXT-LOCK (сцепка шага)
-    - Если CTX_PREV_EXPECTS="time" и ты получил валидное время → используй ранее известную дату CTX_BASEDATE
-      (например, из «завтра») и ЗАВЕРШАЙ без новых вопросов.
-    - Если CTX_PREV_EXPECTS="date" и пришла «завтра/послезавтра/конкретная дата» — установи date и спроси ВРЕМЯ (если его нет).
-    - Если CTX_PREV_EXPECTS="weekday" и пришёл день недели — установи weekday(ы) и спроси ВРЕМЯ (если его нет).
-    - Никогда не сбрасывай зафиксированные слоты и не подменяй их данными из чужих предыдущих задач.
+    CONTEXT-LOCK
+    - Если CTX_PREV_EXPECTS="time" и пришло валидное время → используй зафиксированный title из контекста и завершай.
+    - Если CTX_PREV_EXPECTS="date" и пришла дата → используй title из контекста и двигайся к времени.
+    - Если CTX_PREV_EXPECTS="weekday" и пришёл день недели → используй title из контекста и двигайся к времени.
+    - Никогда не сбрасывай title при уточнениях.
 
-    SLOT-LOCK И OVERRIDE
-    - Если CTX_PREV_EXPECTS="time" и текущая реплика содержит валидное время:
-        • установи time,
-        • если уже известна дата (CTX_BASEDATE, «завтра», конкретная YYYY-MM-DD) → intent="create_reminder" с fixed_datetime,
-        • если это периодичность (recurrence уже определён) → intent="create_reminder" с recurrence.time,
-        • сбрось любые ранее предложенные варианты времени (override),
-        • НЕ задавай новых вопросов о времени/дате/событии.
-    - Если был показан выбор для 1..10, но пользователь прислал другое точное время (например, 11:40) — прими его и сразу завершай.
-
-    ПЕРИОДИЧНОСТЬ
-    - daily/weekly/monthly — стандартно.
-    - weekly_multi: {"type":"weekly_multi","weekdays":[...],"time":"HH:MM"} — «по будням», «пн-ср-пт», «сб-вс».
-    - interval: {"type":"interval","minutes":N}.
-    - Если «каждые N» без единиц — спроси «минуты или часы?».
-
-    УТОЧНЕНИЯ (строго по одному за шаг)
-    - Если не хватает времени → спроси «Во сколько?» (один раз).
-    - Если двусмысленные 1..10 → покажи ["HH:00","HH+12:00"].
-    - Если «каждые N» без единиц → спроси «минуты или часы?».
-    - ⚠️ Если уже получили конкретный слот (date/time/weekday/title) — не задавай новые вопросы по нему.
+    SLOT-LOCK
+    - Если получено время с минутами → сразу закрывай слот и завершай.
+    - Если получено точное время (11, 11:00) → закрывай слот и завершай.
+    - Никаких новых вопросов про событие или дату.
 
   fewshot:
     - role: user
-      content: "Падел завтра"
+      content: "Завтра падел"
     - role: assistant
       content: |
         {
@@ -202,110 +95,16 @@ parse:
         }
 
     - role: user
-      content: "в 11:40"
+      content: "В 11:40"
     - role: assistant
       content: |
         {
           "intent": "create_reminder",
-          "text_original": "в 11:40",
+          "text_original": "В 11:40",
           "title": "Падел",
           "description": null,
           "timezone": null,
           "fixed_datetime": "<CTX_BASEDATE or TOMORROW at 11:40 with TZ_DEFAULT>",
-          "recurrence": null,
-          "need_confirmation": false,
-          "question": null,
-          "expects": null,
-          "variants": []
-        }
-
-    - role: user
-      content: "завтра падел в 11 40"
-    - role: assistant
-      content: |
-        {
-          "intent": "create_reminder",
-          "text_original": "завтра падел в 11 40",
-          "title": "Падел",
-          "description": null,
-          "timezone": null,
-          "fixed_datetime": "<TOMORROW at 11:40 with TZ_DEFAULT>",
-          "recurrence": null,
-          "need_confirmation": false,
-          "question": null,
-          "expects": null,
-          "variants": []
-        }
-
-    - role: user
-      content: "каждый день пить Д3 в пять часов"
-    - role: assistant
-      content: |
-        {
-          "intent": "chat",
-          "reply": "Уточни время: 05:00 или 17:00?",
-          "title": "Пить Д3",
-          "date": null,
-          "time": null,
-          "timezone": null,
-          "recurrence": { "type": "daily" },
-          "weekdays": null,
-          "interval": null,
-          "until": null,
-          "question": "Выбери время",
-          "expects": "time",
-          "variants": ["05:00","17:00"]
-        }
-
-    - role: user
-      content: "05:00"
-    - role: assistant
-      content: |
-        {
-          "intent": "create_reminder",
-          "text_original": "05:00",
-          "title": "Пить Д3",
-          "description": null,
-          "timezone": null,
-          "fixed_datetime": null,
-          "recurrence": { "type": "daily", "time": "05:00" },
-          "need_confirmation": false,
-          "question": null,
-          "expects": null,
-          "variants": []
-        }
-
-    - role: user
-      content: "по пятницам таблетки в 7"
-    - role: assistant
-      content: |
-        {
-          "intent": "chat",
-          "reply": "Уточни время: 07:00 или 19:00?",
-          "title": "Таблетки",
-          "date": null,
-          "time": null,
-          "timezone": null,
-          "recurrence": { "type": "weekly", "weekday": "fri" },
-          "weekdays": null,
-          "interval": null,
-          "until": null,
-          "question": "Выбери время",
-          "expects": "time",
-          "variants": ["07:00","19:00"]
-        }
-
-    - role: user
-      content: "пвдел завтра в 11"
-    - role: assistant
-      content: |
-        {
-          "intent": "create_reminder",
-          "text_original": "пвдел завтра в 11",
-          "title": "Падел",
-          "description": null,
-          "timezone": null,
-          "fixed_datetime": "<TOMORROW at 11:00 with TZ_DEFAULT>",
           "recurrence": null,
           "need_confirmation": false,
           "question": null,
