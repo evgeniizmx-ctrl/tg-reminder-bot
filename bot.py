@@ -1100,7 +1100,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_prebuild_poll(update, context)
         set_clarify_state(context, None)
         # [3б] если модель подставила 00:00, но пользователь время не называл — попросим время
-def _text_has_time(s: str) -> bool:
+    def _text_has_time(s: str) -> bool:
     s = s.lower()
     # «в 9», «в 09», «в 9:30», «09:30» и пр.
     return bool(re.search(r"\bв\s+\d{1,2}(:\d{2})?\b", s) or re.search(r"\b\d{1,2}:\d{2}\b", s))
