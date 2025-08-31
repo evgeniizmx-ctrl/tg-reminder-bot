@@ -982,7 +982,7 @@ async def cb_prebuild(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global _CTX_INJECTION   # <- ДОЛЖНО быть самой первой инструкцией в функции
+    global _CTX_INJECTION  # ...
 
     # 0) быстрые выходы
     if await try_handle_tz_input(update, context):
