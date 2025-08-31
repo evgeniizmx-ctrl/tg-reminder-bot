@@ -378,6 +378,21 @@ def rule_parse(text: str, now_local: datetime):
                     "variants":[f"{hh:02d}:00", f"{(hh%12)+12:02d}:00"], "base_date": day.isoformat()}
         when_local = datetime(day.year, day.month, day.day, hh, mm, tzinfo=now_local.tzinfo)
         return {"intent": "create_reminder", "title": title, "fixed_datetime": when_local.replace(microsecond=0).isoformat()}
+        # есть слово-дата, но ВРЕМЕНИ нет -> спросим время и положим base_date
+    if md and not mt:
+        base = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[md.group(1)]
+        day = (now_local + timedelta(days=base)).date()
+        title = _extract_title(text)
+        return {
+            "intent": "ask_clarification",
+            "title": title,
+            "question": "Во сколько?",
+            "expects": "time",
+            "base_date": day.isoformat(),
+            # variants можно не давать; при желании можно подсунуть две кнопки
+            # "variants": [f"{now_local.hour:02d}:00", f"{(now_local.hour % 12) + 12:02d}:00"]
+        }
+
     return None
 
 # ---------- DB helpers ----------
@@ -791,6 +806,13 @@ async def cb_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             await send_prebuild_poll(update, context)
             return
+            
+        set_clarify_state(context, None)  # сбрасываем уточнения
+        rem_id = db_add_reminder_oneoff(user_id, title, None, when_iso_utc)
+        schedule_oneoff(rem_id, user_id, when_iso_utc, title, kind="oneoff")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data=f"del:{rem_id}")]])
+        await safe_reply(update, f"⏰ Окей, напомню «{title}» {when_local.strftime('%d.%m в %H:%M')}", reply_markup=kb)
+        return        
 
     context.user_data["__auto_answer"] = choice
     await handle_text(update, context)
@@ -1114,13 +1136,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 set_clarify_state(context, None)
                 return
 
+
+    # ------- дальше внутри async def handle_text(...):
+
     r = None
     if OPENAI_API_KEY:
         try:
             r = await call_llm(incoming_text, user_tz)
             log.debug("llm_parse -> %r", r)
+
+            # --- постфикс на случай, когда LLM ошибочно просит "дату"
+            # при явном «сегодня/завтра», чтобы не показывать кнопки дат ---
+            if r:
+                asks_date = (str(r.get("expects") or "").
+                             lower() in ("date", "day")) or \
+                            ("на какую дату" in (r.get("question") or "").lower())
+
+                s_low = incoming_text.lower()
+                md = re.search(r"\b(сегодня|завтра|послезавтра)\b", s_low)
+                mt = re.search(r"\b\d{1,2}(:\d{2})?\b", s_low)
+
+                if asks_date and md and not mt:
+                    base = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[md.group(1)]
+                    base_day = (now_local + timedelta(days=base)).date().isoformat()
+                    r = {
+                        "intent": "ask_clarification",
+                        "title": _extract_title(incoming_text),
+                        "question": "Во сколько?",
+                        "expects": "time",
+                        "base_date": base_day,
+                    }
+                    log.debug("llm_postfix: override to ask time with base_date=%s", base_day)
+
         except Exception:
-            log.exception("LLM parse failed")
+            log.exception("llm_postfix failed")
 
     # Если LLM ничего не вернул — пробуем rule_fallback
     if not r:
@@ -1128,6 +1177,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not r:
             await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
             return
+
 
     intent = (r.get("intent") or "").lower()
     title = r.get("title") or _extract_title(incoming_text)
