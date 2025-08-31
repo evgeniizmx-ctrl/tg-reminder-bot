@@ -984,6 +984,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     incoming_text = (context.user_data.pop("__auto_answer", None)
                      or (update.message.text.strip() if update.message and update.message.text else ""))
+    # [4] если пользователь начал новую «явную» команду — сбросим старый clarify_state
+if get_clarify_state(context) and re.search(
+    r"\b(сегодня|завтра|послезавтра|через|кажд(ый|ую|ое)|по\s+(пн|вт|ср|чт|пт|сб|вс)|в\s+\d{1,2}(:\d{2})?)\b",
+    incoming_text.lower()
+):
+    set_clarify_state(context, None)
+
 
     # запомним последнюю пользовательскую фразу для цепочки
     context.user_data["__last_user_text"] = incoming_text
@@ -1011,15 +1018,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if base_date:
         prev_expects = "time"
 
+        # --- подготовим CTX_* только если реально в режиме уточнения ---
+    cs = get_clarify_state(context) or {}
+    is_clarify_active = bool(cs.get("expects") or cs.get("base_date"))
+
     global _CTX_INJECTION
-    _CTX_INJECTION = {
-        "CTX_PREV_TEXT": context.user_data.get("__last_user_text_prev", "") or "",
-        "CTX_PREV_TITLE": prev_title or "",
-        "CTX_PREV_QUESTION": prev_q or "",
-        "CTX_PREV_EXPECTS": prev_expects or "null",
-        "CTX_BASEDATE": base_date or None,
-        "CTX_SLOT_TITLE": prev_title or None,
-    }
+    if is_clarify_active:
+        base_date = cs.get("base_date")
+        prev_title = cs.get("title") or ""
+        prev_q = cs.get("question") or ""
+        prev_expects = cs.get("expects") or ("time" if base_date else None)
+
+        _CTX_INJECTION = {
+            "CTX_PREV_TEXT": context.user_data.get("__last_user_text_prev", "") or "",
+            "CTX_PREV_TITLE": prev_title or "",
+            "CTX_PREV_QUESTION": prev_q or "",
+            "CTX_PREV_EXPECTS": prev_expects or "null",
+            "CTX_BASEDATE": base_date or None,
+            "CTX_SLOT_TITLE": prev_title or None,
+        }
+    else:
+        # новый независимый запрос — контекст не прокидываем
+        _CTX_INJECTION = {}
+
+    # перетасуем «предыдущую» фразу для следующего шага
     context.user_data["__last_user_text_prev"] = incoming_text
 
     # LLM — основной парсер
@@ -1086,8 +1108,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await send_prebuild_poll(update, context)
         set_clarify_state(context, None)
-        return
+        # [3б] если модель подставила 00:00, но пользователь время не называл — попросим время
+def _text_has_time(s: str) -> bool:
+    s = s.lower()
+    # «в 9», «в 09», «в 9:30», «09:30» и пр.
+    return bool(re.search(r"\bв\s+\d{1,2}(:\d{2})?\b", s) or re.search(r"\b\d{1,2}:\d{2}\b", s))
 
+if rec_obj:
+    _rtype = (rec_obj.get("type") or "").lower()
+    _rtime = (rec_obj.get("time") or "").strip()
+    if _rtype in {"daily", "weekly", "monthly", "yearly"} and (_rtime in {"0:00","00:00","00:00:00"}) and not _text_has_time(incoming_text):
+        set_clarify_state(context, {
+            "title": title,
+            "base_date": None,
+            "question": "Во сколько?",
+            "expects": "time",
+        })
+        await safe_reply(update, "Во сколько?")
+        return
+        
     # ====== ПЕРИОДИЧЕСКИЕ ======
     rtype = (rec_obj.get("type") or "").lower()
     rtime = rec_obj.get("time")
@@ -1123,6 +1162,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
         variants = r.get("variants") or []
+        # [2] нормализация вариантов времени: HH:MM:SS -> HH:MM, уникализация с сохранением порядка
+def _norm_time(s: str) -> str:
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", s.strip())
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return s.strip()
+
+variants = list(dict.fromkeys(_norm_time(v) for v in variants))
+
         if expects == "weekday":
             labels = ["пн","вт","ср","чт","пт","сб","вс"]
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(x, callback_data=f"answer:{x}")] for x in labels])
