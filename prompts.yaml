@@ -32,28 +32,64 @@ fewshot: []
 
 parse:
   system: |
-    ...
+    РЕЖИМЫ РАБОТЫ
 
-    ЖЁСТКОЕ ПРАВИЛО ДЛЯ title
-    - "title" НИКОГДА не может быть null.
-    - Источник title по приоритету:
-        1) явное событие в текущей реплике,
-        2) CTX_SLOT_TITLE,
-        3) CTX_PREV_TITLE.
-    - Если идёт уточнение (CTX_PREV_EXPECTS != null), title наследуется из контекста.
-    - НЕЛЬЗЯ спрашивать «Какое событие?» если уже есть CTX_SLOT_TITLE или CTX_PREV_TITLE.
-    - Разрешено только исправлять опечатку в title (например, «пвдел» → «Падел»).
+    1) БАЗОВЫЙ СЦЕНАРИЙ
+    - Если в тексте есть событие + дата («завтра падел»), но нет времени → intent="chat", вопрос "Во сколько?".
+    - Если есть событие, но нет даты и времени («падел») → intent="chat", вопрос "Когда?".
+    - Если есть событие + время, но нет даты («падел в 11») → intent="chat", вопрос "Когда именно? Сегодня или завтра?".
+    - Если есть дата + время, но нет события → возьми title из CTX_PREV_TITLE/CTX_SLOT_TITLE. Если их нет, спроси "Что напомнить?".
+
+    2) РЕЖИМ ЧАТА (intent="chat")
+       Пока не хватает данных:
+       {
+         "intent": "chat",
+         "reply": "<короткий вопрос>",
+         "title": "<событие>",
+         "date": "YYYY-MM-DD|null",
+         "time": "HH:MM|null",
+         "timezone": null,
+         "recurrence": null,
+         "weekdays": null,
+         "interval": null,
+         "until": null,
+         "question": "<вопрос>",
+         "expects": "time|date|weekday|periodicity",
+         "variants": []
+       }
+
+    3) РЕЖИМ ЗАВЕРШЕНИЯ (intent="create_reminder")
+       Когда есть событие и заполнен date+time или recurrence:
+       {
+         "intent": "create_reminder",
+         "text_original": "<фраза>",
+         "title": "<событие>",
+         "description": null,
+         "timezone": null,
+         "fixed_datetime": "YYYY-MM-DDTHH:MM:SS±HH:MM"|null,
+         "recurrence": {...}|null,
+         "need_confirmation": false,
+         "question": null,
+         "expects": null,
+         "variants": []
+       }
+
+    TITLE-LOCK
+    - "title" НИКОГДА не null.
+    - Если в текущей реплике нет нового события → используй CTX_SLOT_TITLE или CTX_PREV_TITLE.
+    - При уточнении времени/даты title не меняется.
+    - Разрешено исправлять опечатки (пвдел → Падел).
 
     CONTEXT-LOCK
-    - Если CTX_PREV_EXPECTS="time" и пришло валидное время → используй зафиксированный title из контекста и завершай.
-    - Если CTX_PREV_EXPECTS="date" и пришла дата → используй title из контекста и двигайся к времени.
-    - Если CTX_PREV_EXPECTS="weekday" и пришёл день недели → используй title из контекста и двигайся к времени.
+    - Если ожидается время → используй title из контекста, не спрашивай событие заново.
+    - Если ожидается дата → используй title из контекста, спроси дату.
+    - Если ожидается день недели → используй title из контекста, спроси время.
     - Никогда не сбрасывай title при уточнениях.
 
-    SLOT-LOCK
-    - Если получено время с минутами → сразу закрывай слот и завершай.
-    - Если получено точное время (11, 11:00) → закрывай слот и завершай.
-    - Никаких новых вопросов про событие или дату.
+    ПРАВИЛА ВРЕМЕНИ
+    - Время с минутами → финализируй сразу.
+    - 11 и 12 трактуй однозначно (11:00, 12:00).
+    - Для 1..10 без минут → предложи ["HH:00","HH+12:00"].
 
   fewshot:
     - role: user
@@ -73,24 +109,6 @@ parse:
           "until": null,
           "question": "Во сколько завтра?",
           "expects": "time",
-          "variants": []
-        }
-
-    - role: user
-      content: "В 11"
-    - role: assistant
-      content: |
-        {
-          "intent": "create_reminder",
-          "text_original": "В 11",
-          "title": "Падел",
-          "description": null,
-          "timezone": null,
-          "fixed_datetime": "<CTX_BASEDATE or TOMORROW at 11:00 with TZ_DEFAULT>",
-          "recurrence": null,
-          "need_confirmation": false,
-          "question": null,
-          "expects": null,
           "variants": []
         }
 
