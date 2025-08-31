@@ -65,6 +65,10 @@ parse:
        • «по пн/вт/…», «каждую неделю», «по будням/выходным» → weekly / weekly_multi + time (или chat(expects="time")).
        • «каждое 5 число» → monthly + day + time (или chat(expects="time")).
        • «через N мин/час» → interval {type:"interval","unit":"minute|hour","n":N,"start_at":NOW_ISO}.
+       • «каждое 15 декабря», «каждый 12 марта» → yearly + day + month (+ time). 
+       • Если время не сказано — intent="chat", expects="time" (не подставляй 00:00).
+       • НЕЛЬЗЯ автоматически ставить 00:00, если пользователь не назвал время. В таких случаях всегда возвращай intent="chat", expects="time".
+
 
     3) ФОРМАТ ОТВЕТА:
        • intent="chat":
