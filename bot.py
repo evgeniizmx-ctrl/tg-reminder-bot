@@ -982,7 +982,7 @@ async def cb_prebuild(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global _CTX_INJECTION  # ← эта строка должна идти сразу после def
+    global _CTX_INJECTION  # ← первая инструкция внутри функции
 
     # 0) быстрые выходы
     if await try_handle_tz_input(update, context):
@@ -992,7 +992,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     incoming_text = (context.user_data.pop("__auto_answer", None)
                      or (update.message.text.strip() if update.message and update.message.text else ""))
 
-    # [4] новая явная команда — обнулим старое уточнение
+    # (по желанию) сброс висящего уточнения на новую явную команду
     if get_clarify_state(context) and re.search(
         r"\b(сегодня|завтра|послезавтра|через|кажд(ый|ую|ое)|по\s+(пн|вт|ср|чт|пт|сб|вс)|в\s+\d{1,2}(:\d{2})?)\b",
         incoming_text.lower()
@@ -1012,16 +1012,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     now_local = now_in_user_tz(user_tz)
 
-    # --- подготовим CTX_* только если реально в режиме уточнения ---
+    # --- готовим CTX_* ТОЛЬКО если реально идёт уточнение ---
     cs = get_clarify_state(context) or {}
     is_clarify_active = bool(cs.get("expects") or cs.get("base_date"))
-
     if is_clarify_active:
         base_date = cs.get("base_date")
         prev_title = cs.get("title") or ""
         prev_q = cs.get("question") or ""
         prev_expects = cs.get("expects") or ("time" if base_date else None)
-
         _CTX_INJECTION = {
             "CTX_PREV_TEXT": context.user_data.get("__last_user_text_prev", "") or "",
             "CTX_PREV_TITLE": prev_title or "",
@@ -1031,7 +1029,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "CTX_SLOT_TITLE": prev_title or None,
         }
     else:
-        # новый независимый запрос — контекст не прокидываем
         _CTX_INJECTION = {}
 
     # запомним текущую фразу как «предыдущую» для следующего шага
