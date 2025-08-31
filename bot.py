@@ -979,10 +979,10 @@ async def cb_prebuild(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Обновлено", show_alert=False)
         return
 
+
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global _CTX_INJECTION
-
+    global _CTX_INJECTION  # ← эта строка должна идти сразу после def
 
     # 0) быстрые выходы
     if await try_handle_tz_input(update, context):
@@ -991,18 +991,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     incoming_text = (context.user_data.pop("__auto_answer", None)
                      or (update.message.text.strip() if update.message and update.message.text else ""))
-    # [4] если пользователь начал новую «явную» команду — сбросим старый clarify_state
-if get_clarify_state(context) and re.search(
-    r"\b(сегодня|завтра|послезавтра|через|кажд(ый|ую|ое)|по\s+(пн|вт|ср|чт|пт|сб|вс)|в\s+\d{1,2}(:\d{2})?)\b",
-    incoming_text.lower()
-):
-    set_clarify_state(context, None)
 
+    # [4] новая явная команда — обнулим старое уточнение
+    if get_clarify_state(context) and re.search(
+        r"\b(сегодня|завтра|послезавтра|через|кажд(ый|ую|ое)|по\s+(пн|вт|ср|чт|пт|сб|вс)|в\s+\d{1,2}(:\d{2})?)\b",
+        incoming_text.lower()
+    ):
+        set_clarify_state(context, None)
 
-    # запомним последнюю пользовательскую фразу для цепочки
-    context.user_data["__last_user_text"] = incoming_text
-
-    # кнопки/команды
     if incoming_text == "📝 Список напоминаний" or incoming_text.lower() == "/list":
         return await cmd_list(update, context)
     if incoming_text == "⚙️ Настройки" or incoming_text.lower() == "/settings":
@@ -1016,11 +1012,10 @@ if get_clarify_state(context) and re.search(
 
     now_local = now_in_user_tz(user_tz)
 
-        # --- подготовим CTX_* только если реально в режиме уточнения ---
+    # --- подготовим CTX_* только если реально в режиме уточнения ---
     cs = get_clarify_state(context) or {}
     is_clarify_active = bool(cs.get("expects") or cs.get("base_date"))
 
-    global _CTX_INJECTION
     if is_clarify_active:
         base_date = cs.get("base_date")
         prev_title = cs.get("title") or ""
@@ -1039,8 +1034,9 @@ if get_clarify_state(context) and re.search(
         # новый независимый запрос — контекст не прокидываем
         _CTX_INJECTION = {}
 
-    # перетасуем «предыдущую» фразу для следующего шага
+    # запомним текущую фразу как «предыдущую» для следующего шага
     context.user_data["__last_user_text_prev"] = incoming_text
+
 
     # LLM — основной парсер
     r = None
