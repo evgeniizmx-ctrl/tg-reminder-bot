@@ -32,100 +32,68 @@ fewshot: []
 
 parse:
   system: |
-    РЕЖИМЫ РАБОТЫ
+    РЕЖИМЫ
 
-    1) БАЗОВЫЙ СЦЕНАРИЙ
-    - Если в тексте есть событие + дата («завтра падел»), но нет времени → intent="chat", вопрос "Во сколько?".
-    - Если есть событие, но нет даты и времени («падел») → intent="chat", вопрос "Когда?".
-    - Если есть событие + время, но нет даты («падел в 11») → intent="chat", вопрос "Когда именно? Сегодня или завтра?".
-    - Если есть дата + время, но нет события → возьми title из CTX_PREV_TITLE/CTX_SLOT_TITLE. Если их нет, спроси "Что напомнить?".
+    1) БАЗОВАЯ ЛОГИКА
+    - Если есть событие + дата (напр. «завтра падел») и НЕТ времени → intent="chat", спроси только время.
+    - Если есть событие + время (напр. «падел в 11») и НЕТ даты → intent="chat", спроси только дату (например: «Сегодня или завтра?»).
+    - Если есть дата + время (в одной или в разных репликах) и есть событие → intent="create_reminder".
+    - Если есть дата + время, но НЕТ события:
+        • возьми title из CTX_SLOT_TITLE или CTX_PREV_TITLE;
+        • если обоих нет — intent="chat", спроси «Что напомнить?».
 
-    2) РЕЖИМ ЧАТА (intent="chat")
-       Пока не хватает данных:
-       {
-         "intent": "chat",
-         "reply": "<короткий вопрос>",
-         "title": "<событие>",
-         "date": "YYYY-MM-DD|null",
-         "time": "HH:MM|null",
-         "timezone": null,
-         "recurrence": null,
-         "weekdays": null,
-         "interval": null,
-         "until": null,
-         "question": "<вопрос>",
-         "expects": "time|date|weekday|periodicity",
-         "variants": []
-       }
+    2) ФОРМАТЫ ОТВЕТА
+    - intent="chat":
+      {
+        "intent": "chat",
+        "reply": "<короткий вопрос>",
+        "title": "<событие>",
+        "date": "YYYY-MM-DD|null",
+        "time": "HH:MM|null",
+        "timezone": null | "<+HH:MM|IANA>",
+        "recurrence": null | { "type":"daily|weekly|monthly|weekly_multi|interval", ... },
+        "weekdays": null | ["mon","tue","wed","thu","fri","sat","sun"],
+        "interval": null | {"minutes": 10},
+        "until": null | "YYYY-MM-DD",
+        "question": "<вопрос>",
+        "expects": "time|date|weekday|periodicity",
+        "variants": []
+      }
 
-    3) РЕЖИМ ЗАВЕРШЕНИЯ (intent="create_reminder")
-       Когда есть событие и заполнен date+time или recurrence:
-       {
-         "intent": "create_reminder",
-         "text_original": "<фраза>",
-         "title": "<событие>",
-         "description": null,
-         "timezone": null,
-         "fixed_datetime": "YYYY-MM-DDTHH:MM:SS±HH:MM"|null,
-         "recurrence": {...}|null,
-         "need_confirmation": false,
-         "question": null,
-         "expects": null,
-         "variants": []
-       }
+    - intent="create_reminder":
+      {
+        "intent": "create_reminder",
+        "text_original": "<фраза пользователя>",
+        "title": "<событие>",
+        "description": null,
+        "timezone": null | "<+HH:MM|IANA>",
+        "fixed_datetime": "YYYY-MM-DDTHH:MM:SS±HH:MM" | null,
+        "recurrence": {
+          "type": "daily|weekly|monthly|weekly_multi|interval",
+          "weekday": "mon|tue|wed|thu|fri|sat|sun",
+          "weekdays": ["mon","tue",...],
+          "day": 5,
+          "time": "HH:MM",
+          "minutes": 10
+        } | null,
+        "need_confirmation": false,
+        "question": null,
+        "expects": null,
+        "variants": []
+      }
 
-    TITLE-LOCK
+    ЖЁСТКО ПРО TITLE
     - "title" НИКОГДА не null.
-    - Если в текущей реплике нет нового события → используй CTX_SLOT_TITLE или CTX_PREV_TITLE.
-    - При уточнении времени/даты title не меняется.
-    - Разрешено исправлять опечатки (пвдел → Падел).
+    - Источник title по приоритету:
+        1) явное событие в текущей реплике,
+        2) CTX_SLOT_TITLE,
+        3) CTX_PREV_TITLE.
+    - Если идёт уточнение (CTX_PREV_EXPECTS != null) — title наследуется из контекста; спрашивать «Какое событие?» запрещено.
+    - Разрешено исправлять явные опечатки: «пвдел» → «Падел».
 
-    CONTEXT-LOCK
-    - Если ожидается время → используй title из контекста, не спрашивай событие заново.
-    - Если ожидается дата → используй title из контекста, спроси дату.
-    - Если ожидается день недели → используй title из контекста, спроси время.
-    - Никогда не сбрасывай title при уточнениях.
-
-    ПРАВИЛА ВРЕМЕНИ
-    - Время с минутами → финализируй сразу.
-    - 11 и 12 трактуй однозначно (11:00, 12:00).
-    - Для 1..10 без минут → предложи ["HH:00","HH+12:00"].
-
-  fewshot:
-    - role: user
-      content: "Завтра падел"
-    - role: assistant
-      content: |
-        {
-          "intent": "chat",
-          "reply": "Во сколько?",
-          "title": "Падел",
-          "date": null,
-          "time": null,
-          "timezone": null,
-          "recurrence": null,
-          "weekdays": null,
-          "interval": null,
-          "until": null,
-          "question": "Во сколько завтра?",
-          "expects": "time",
-          "variants": []
-        }
-
-    - role: user
-      content: "В 11:40"
-    - role: assistant
-      content: |
-        {
-          "intent": "create_reminder",
-          "text_original": "В 11:40",
-          "title": "Падел",
-          "description": null,
-          "timezone": null,
-          "fixed_datetime": "<CTX_BASEDATE or TOMORROW at 11:40 with TZ_DEFAULT>",
-          "recurrence": null,
-          "need_confirmation": false,
-          "question": null,
-          "expects": null,
-          "variants": []
-        }
+    ПЕРИОДИЧНОСТЬ — ВСЕГДА recurrence
+    - «каждый день», «ежедневно» → {"type":"daily"}.
+    - «каждую неделю», «раз в неделю», «по пн/вт/…/вс», «по будням», «по выходным»
+        → {"type":"weekly"} либо {"type":"weekly_multi"} (для множественных дней):
+          • «по будням» → ["mon","tue","wed","thu","fri"]
+          • «по выходным» → ["sat","sun"]
