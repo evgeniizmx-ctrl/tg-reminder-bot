@@ -1222,7 +1222,7 @@ def db_init():
             conn.execute("create index if not exists reminders_user_idx on reminders(user_id)")
             conn.execute("create index if not exists reminders_status_idx on reminders(status)")
             conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)")
-        else:
+    else:
     import sqlite3
     conn.execute("""
         create table if not exists users (
@@ -1245,7 +1245,6 @@ def db_init():
         )
     """)
 
-    # аккуратные миграции — каждая с try/except на отдельных строках
     try:
         conn.execute("alter table reminders add column kind text default 'oneoff'")
     except Exception:
