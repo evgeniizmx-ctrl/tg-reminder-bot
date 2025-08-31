@@ -431,3 +431,78 @@ fewshot:
         "expects": "title",
         "variants": []
       }
+      # --- Одноразовое: задан только день, время отсутствует — спрашиваем время
+- role: user
+  content: "Завтра падел"
+- role: assistant
+  content: |
+    {
+      "intent": "ask_clarification",
+      "text_original": "Завтра падел",
+      "title": "Падел",
+      "description": null,
+      "timezone": null,
+      "fixed_datetime": null,
+      "recurrence": null,
+      "need_confirmation": false,
+      "question": "Во сколько завтра?",
+      "expects": "time",
+      "variants": []
+    }
+
+- role: user
+  content: "в 16:40"
+- role: assistant
+  content: |
+    {
+      "intent": "create_reminder",
+      "text_original": "в 16:40",
+      "title": "Падел",
+      "description": null,
+      "timezone": null,
+      "fixed_datetime": null,
+      "recurrence": null,
+      "need_confirmation": false,
+      "question": null,
+      "expects": null,
+      "variants": []
+    }
+
+# То же для «сегодня …» (если времени нет — спрашиваем)
+- role: user
+  content: "Сегодня таблетки"
+- role: assistant
+  content: |
+    {
+      "intent": "ask_clarification",
+      "text_original": "Сегодня таблетки",
+      "title": "Таблетки",
+      "description": null,
+      "timezone": null,
+      "fixed_datetime": null,
+      "recurrence": null,
+      "need_confirmation": false,
+      "question": "Во сколько сегодня?",
+      "expects": "time",
+      "variants": []
+    }
+
+# И для явной даты без времени
+- role: user
+  content: "18 числа падел"
+- role: assistant
+  content: |
+    {
+      "intent": "ask_clarification",
+      "text_original": "18 числа падел",
+      "title": "Падел",
+      "description": null,
+      "timezone": null,
+      "fixed_datetime": null,
+      "recurrence": { "type": "monthly", "day": 18, "time": null, "weekday": null, "month": null, "unit": null, "n": null, "start_at": null },
+      "need_confirmation": false,
+      "question": "Во сколько 18-го?",
+      "expects": "time",
+      "variants": []
+    }
+
