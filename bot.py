@@ -998,19 +998,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     now_local = now_in_user_tz(user_tz)
 
-    # LLM — всегда сначала и единственный
-r = None
-if OPENAI_API_KEY:
-    try:
-        r = await call_llm(incoming_text, user_tz)
-        log.debug("llm_parse -> %r", r)
-    except Exception:
-        log.exception("LLM parse failed")
+     # LLM — всегда сначала и единственный
+    r = None
+    if OPENAI_API_KEY:
+        try:
+            r = await call_llm(incoming_text, user_tz)
+            log.debug("llm_parse -> %r", r)
+        except Exception:
+            log.exception("LLM parse failed")
 
-# Если LLM ничего не вернул — отвечаем «не понял»
-if not r:
-    await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
-    return
+    # Если LLM ничего не вернул — отвечаем «не понял»
+    if not r:
+        await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
+        return
 
     # ---- разбор результата парсера ----
     intent = (r.get("intent") or "").lower()
