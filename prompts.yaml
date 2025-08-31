@@ -121,7 +121,7 @@ parse:
     }
 
 fewshot:
-  # Chat
+  # --- CHAT ---
   - role: user
     content: "привет"
   - role: assistant
@@ -140,7 +140,25 @@ fewshot:
         "variants": []
       }
 
-  # Одноразовое с датой без времени
+  - role: user
+    content: "ничего, просто проверяю"
+  - role: assistant
+    content: |
+      {
+        "intent": "chat",
+        "text_original": "ничего, просто проверяю",
+        "title": "",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": null,
+        "recurrence": null,
+        "need_confirmation": false,
+        "question": "Окей! Когда понадобится — напиши, что и на когда поставить напоминание.",
+        "expects": null,
+        "variants": []
+      }
+
+  # --- Одноразовые: дата есть, времени НЕТ → только спроси время (НЕ подставляй) ---
   - role: user
     content: "Завтра падел"
   - role: assistant
@@ -159,18 +177,18 @@ fewshot:
         "variants": []
       }
 
-  # Одноразовое с временем и датой
+  # Ответ на уточнение времени (title и дата уже известны → создаём одноразовое)
   - role: user
-    content: "завтра падел в 17:30"
+    content: "в 16:40"
   - role: assistant
     content: |
       {
         "intent": "create_reminder",
-        "text_original": "завтра падел в 17:30",
+        "text_original": "в 16:40",
         "title": "Падел",
         "description": null,
         "timezone": null,
-        "fixed_datetime": "2025-09-01T17:30:00+03:00",
+        "fixed_datetime": "2025-09-01T16:40:00+03:00",
         "recurrence": null,
         "need_confirmation": false,
         "question": null,
@@ -178,14 +196,14 @@ fewshot:
         "variants": []
       }
 
-  # Время двусмысленное (5 часов)
+  # --- Одноразовые: двусмысленное время (1..12 без минут и без «утра/вечера») → уточни ---
   - role: user
-    content: "завтра падел в 5"
+    content: "Завтра падел в 11"
   - role: assistant
     content: |
       {
         "intent": "ask_clarification",
-        "text_original": "завтра падел в 5",
+        "text_original": "Завтра падел в 11",
         "title": "Падел",
         "description": null,
         "timezone": null,
@@ -194,29 +212,85 @@ fewshot:
         "need_confirmation": false,
         "question": "Уточни время",
         "expects": "time",
-        "variants": ["05:00","17:00"]
+        "variants": ["11:00","23:00"]
       }
 
-  # Ежедневное с явным временем
+  # Ответ на двусмысленность
   - role: user
-    content: "каждый день пить д3 в 08:00"
+    content: "11:00"
   - role: assistant
     content: |
       {
         "intent": "create_reminder",
-        "text_original": "каждый день пить д3 в 08:00",
-        "title": "Пить Д3",
+        "text_original": "11:00",
+        "title": "Падел",
         "description": null,
         "timezone": null,
-        "fixed_datetime": null,
-        "recurrence": { "type": "daily", "time": "08:00", "weekday": null, "day": null, "month": null, "unit": null, "n": null, "start_at": null },
+        "fixed_datetime": "2025-09-01T11:00:00+03:00",
+        "recurrence": null,
         "need_confirmation": false,
         "question": null,
         "expects": null,
         "variants": []
       }
 
-  # Интервал
+  # --- Только время (нет title и даты) → комбинированный вопрос ---
+  - role: user
+    content: "В 16:40"
+  - role: assistant
+    content: |
+      {
+        "intent": "ask_clarification",
+        "text_original": "В 16:40",
+        "title": "",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": null,
+        "recurrence": null,
+        "need_confirmation": false,
+        "question": "Что напомнить и на какую дату?",
+        "expects": "title",
+        "variants": []
+      }
+
+  # --- Weekly: без времени → спроси только время (не сбрасывать weekday/title) ---
+  - role: user
+    content: "каждый понедельник падел"
+  - role: assistant
+    content: |
+      {
+        "intent": "ask_clarification",
+        "text_original": "каждый понедельник падел",
+        "title": "Падел",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": null,
+        "recurrence": { "type": "weekly", "weekday": "mon", "time": null, "day": null, "month": null, "unit": null, "n": null, "start_at": null },
+        "need_confirmation": false,
+        "question": "Во сколько по понедельникам?",
+        "expects": "time",
+        "variants": []
+      }
+
+  - role: user
+    content: "в 13:40"
+  - role: assistant
+    content: |
+      {
+        "intent": "create_reminder",
+        "text_original": "в 13:40",
+        "title": "Падел",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": null,
+        "recurrence": { "type": "weekly", "weekday": "mon", "time": "13:40", "day": null, "month": null, "unit": null, "n": null, "start_at": null },
+        "need_confirmation": false,
+        "question": null,
+        "expects": null,
+        "variants": []
+      }
+
+  # --- Interval: корректные и слишком частые ---
   - role: user
     content: "каждые 2 дня зарядка"
   - role: assistant
@@ -235,7 +309,6 @@ fewshot:
         "variants": []
       }
 
-  # Слишком частый интервал
   - role: user
     content: "каждые 10 секунд разминка"
   - role: assistant
@@ -254,40 +327,58 @@ fewshot:
         "variants": ["каждую минуту"]
       }
 
-  # Относительное время
+  # --- Относительное время + подтверждение, если прошло ---
   - role: user
-    content: "Через 2 дня позвонить маме"
-  - role: assistant
-    content: |
-      {
-        "intent": "create_reminder",
-        "text_original": "Через 2 дня позвонить маме",
-        "title": "Позвонить маме",
-        "description": null,
-        "timezone": null,
-        "fixed_datetime": "2025-09-02T12:00:00+03:00",
-        "recurrence": null,
-        "need_confirmation": false,
-        "question": null,
-        "expects": null,
-        "variants": []
-      }
-
-  # Только время
-  - role: user
-    content: "В 16:40"
+    content: "сегодня в 09:00 таблетка"
   - role: assistant
     content: |
       {
         "intent": "ask_clarification",
-        "text_original": "В 16:40",
-        "title": "",
+        "text_original": "сегодня в 09:00 таблетка",
+        "title": "Таблетка",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": null,
+        "recurrence": null,
+        "need_confirmation": true,
+        "question": "Сегодня 09:00 уже прошло. Поставить на завтра в 09:00?",
+        "expects": "date",
+        "variants": ["завтра 09:00"]
+      }
+
+  # --- Неопределённые диапазоны → уточнение дня ---
+  - role: user
+    content: "на следующей неделе падел"
+  - role: assistant
+    content: |
+      {
+        "intent": "ask_clarification",
+        "text_original": "на следующей неделе падел",
+        "title": "Падел",
         "description": null,
         "timezone": null,
         "fixed_datetime": null,
         "recurrence": null,
         "need_confirmation": false,
-        "question": "Что напомнить и на какую дату?",
-        "expects": "title",
-        "variants": []
+        "question": "В какой день следующей недели?",
+        "expects": "weekday",
+        "variants": ["mon","tue","wed","thu","fri","sat","sun"]
+      }
+
+  - role: user
+    content: "в выходные созвон"
+  - role: assistant
+    content: |
+      {
+        "intent": "ask_clarification",
+        "text_original": "в выходные созвон",
+        "title": "Созвон",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": null,
+        "recurrence": null,
+        "need_confirmation": false,
+        "question": "В какой день выходных напомнить?",
+        "expects": "weekday",
+        "variants": ["sat","sun"]
       }
