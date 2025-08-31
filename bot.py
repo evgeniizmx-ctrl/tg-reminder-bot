@@ -1143,53 +1143,57 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_clarify_state(context, None)
         return
 
-   # ====== УТОЧНЕНИЯ ======
-if intent == "chat" or r.get("expects"):
-    expects = (r.get("expects") or "").lower()
-    question = r.get("question") or r.get("reply") or "Уточни, пожалуйста."
+       # ====== УТОЧНЕНИЯ ======
+    if (intent in {"ask", "ask_clarification"}) or r.get("expects"):
+        # соберём состояние уточнения
+        title = title or (r.get("title") or "Напоминание")
+        question = r.get("question") or "Уточни, пожалуйста."
+        expects = r.get("expects") or (get_clarify_state(context) or {}).get("expects")
 
-    # запоминаем состояние уточнения
-    set_clarify_state(context, {
-        "title": title,
-        "base_date": r.get("base_date") or (get_clarify_state(context) or {}).get("base_date"),
-        "question": question,
-        "expects": expects,
-    })
+        set_clarify_state(context, {
+            "title": title,
+            "base_date": r.get("base_date") or (get_clarify_state(context) or {}).get("base_date"),
+            "question": question,
+            "expects": expects,
+        })
 
-    variants = r.get("variants") or []
+        variants = r.get("variants") or []
 
-    # [2] нормализация вариантов времени: HH:MM:SS -> HH:MM и уникализация (сохранение порядка)
-    def _norm_time(s: str) -> str:
-        m = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", s.strip())
-        if m:
-            return f"{int(m.group(1)):02d}:{m.group(2)}"
-        return s.strip()
-    variants = list(dict.fromkeys(_norm_time(v) for v in variants))
+        # [2] нормализация времени HH:MM:SS -> HH:MM + уникализация с сохранением порядка
+        def _norm_time(s: str) -> str:
+            m = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", (s or "").strip())
+            if m:
+                return f"{int(m.group(1)):02d}:{m.group(2)}"
+            return (s or "").strip()
 
-    if expects == "weekday":
-        labels = ["пн","вт","ср","чт","пт","сб","вс"]
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(x, callback_data=f"answer:{x}")] for x in labels])
-        await safe_reply(update, question, reply_markup=kb)
+        variants = list(dict.fromkeys(_norm_time(v) for v in variants))
+
+        if expects == "weekday":
+            labels = ["пн","вт","ср","чт","пт","сб","вс"]
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(x, callback_data=f"answer:{x}")] for x in labels])
+            await safe_reply(update, question, reply_markup=kb)
+            return
+
+        if expects == "time" and len(variants) == 2 and all(re.fullmatch(r"\d{2}:\d{2}", v) for v in variants):
+            def _label(t: str) -> str:
+                hh = int(t[:2]); 
+                if hh == 0: return "в 00:00"
+                if 1 <= hh <= 11: return f"в {hh} утра"
+                return f"в {hh} часов"
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(_label(variants[0]), callback_data=f"answer:{variants[0]}"),
+                InlineKeyboardButton(_label(variants[1]), callback_data=f"answer:{variants[1]}")
+            ]])
+            await safe_reply(update, question, reply_markup=kb)
+            return
+
+        if variants:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in variants])
+            await safe_reply(update, question, reply_markup=kb)
+            return
+
+        await safe_reply(update, question)
         return
-
-    if expects == "time" and len(variants) == 2 and all(re.fullmatch(r"\d{2}:\d{2}", v) for v in variants):
-        def _label(t: str) -> str:
-            hh = int(t[:2])
-            return f"в {hh:02d}:00"
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(_label(variants[0]), callback_data=f"answer:{variants[0]}"),
-            InlineKeyboardButton(_label(variants[1]), callback_data=f"answer:{variants[1]}")
-        ]])
-        await safe_reply(update, question, reply_markup=kb)
-        return
-
-    if variants:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(v, callback_data=f"answer:{v}")] for v in variants])
-        await safe_reply(update, question, reply_markup=kb)
-        return
-
-    await safe_reply(update, question)
-    return
 
 # ---------- Error handler ----------
 import traceback
