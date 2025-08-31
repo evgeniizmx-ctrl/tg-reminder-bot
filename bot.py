@@ -1243,7 +1243,6 @@ def db_init():
                     parent_id integer,
                     offset_minutes integer
                 )
-            """)
             try: conn.execute("alter table reminders add column kind text default 'oneoff'"); except Exception: pass
             try: conn.execute("alter table reminders add column recurrence_json text"); except Exception: pass
             try: conn.execute("alter table reminders add column parent_id integer"); except Exception: pass
