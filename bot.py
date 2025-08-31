@@ -1,5 +1,3 @@
-# bot.py — PlannerBot (fixed)
-
 import os
 import re
 import json
@@ -1099,7 +1097,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await send_prebuild_poll(update, context)
         set_clarify_state(context, None)
-        # [36] если модель подставила 00:00, но пользователь время не называл — попросим время
+        return  # <-- ВАЖНО: не обрабатывать ниже (guard)
+
+    # [36] если модель подставила 00:00, но пользователь время не называл — спросим время
     def _text_has_time(s: str) -> bool:
         s = s.lower()
         # «в 9», «в 09», «в 9:30», «09:30» и пр.
@@ -1180,10 +1180,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if hh == 0: return "в 00:00"
                 if 1 <= hh <= 11: return f"в {hh} утра"
                 return f"в {hh} часов"
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(_label(variants[0]), callback_data=f"answer:{variants[0]}"),
-                InlineKeyboardButton(_label(variants[1]), callback_data=f"answer:{variants[1]}")
-            ]])
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(_label(variants[0]), callback_data=f"answer:{variants[0]}"),
+                 InlineKeyboardButton(_label(variants[1]), callback_data=f"answer:{variants[1]}")]
+            ])
             await safe_reply(update, question, reply_markup=kb)
             return
 
