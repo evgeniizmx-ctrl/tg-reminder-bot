@@ -8,13 +8,13 @@ system: |
   TZ_DEFAULT=<+HH:MM>
 
   В уточнениях приходит контекст:
-  CTX_PREV_TEXT="..."
-  CTX_PREV_TITLE="..."
-  CTX_PREV_QUESTION="..."
+  CTX_PREV_TEXT="..."        # исходная фраза
+  CTX_PREV_TITLE="..."       # заголовок/дело, которое уже поняли
+  CTX_PREV_QUESTION="..."    # последний заданный вопрос
   CTX_PREV_EXPECTS="time|weekday|date|periodicity|null"
-  CTX_BASEDATE="YYYY-MM-DD"
+  CTX_BASEDATE="YYYY-MM-DD"  # если уже известна базовая дата
 
-  Также могут прийти собранные слоты:
+  Также могут прийти собранные слоты из кода:
   CTX_SLOT_TITLE="..."
   CTX_SLOT_DATE="YYYY-MM-DD"
   CTX_SLOT_TIME="HH:MM"
@@ -26,30 +26,48 @@ system: |
   Все относительные формулировки считай строго от NOW_ISO.
   Если таймзона явно не задана пользователем — используй TZ_DEFAULT.
   На вход приходит короткий текст или реплика из диалога.
-  Всегда возвращай СТРОГО JSON по схеме из parse.system.
+  Всегда возвращай СТРОГО JSON по схеме из parse.system. Ничего, кроме JSON.
 
 fewshot: []
 
 parse:
   system: |
+    -----------------------------
+    ДЕТЕРМИНИРОВАННЫЙ MERGE СЛОТОВ
+    -----------------------------
+    0) Title НИКОГДА не null.
+       Источник title по приоритету:
+         1) явное событие в ТЕКУЩЕЙ реплике;
+         2) CTX_SLOT_TITLE;
+         3) CTX_PREV_TITLE;
+         4) авто-экстракция из CTX_PREV_TEXT (главное слово: «падел», «таблетки», «пробежка», «звонок», «встреча», «баня», и т.п.).
+       Разрешено исправлять опечатки: «пвдел»/«падел про» → «Падел».
+
+    1) Date (базовая дата) — первый ненулевой из:
+         • CTX_SLOT_DATE,
+         • явная/относительная дата в ТЕКУЩЕЙ реплике,
+         • CTX_BASEDATE,
+         • явная/относительная дата в CTX_PREV_TEXT.
+       Относительные слова конвертируй от NOW_ISO: «сегодня», «завтра», «послезавтра».
+
+    2) Time — первый ненулевой из:
+         • CTX_SLOT_TIME,
+         • явное время в ТЕКУЩЕЙ реплике,
+         • время в CTX_PREV_TEXT (если есть).
+
+    3) Recurrence — если встречены триггеры периодичности (см. ниже), создавай recurrence и дальше собирай только недостающие поля (обычно time/weekday/day).
+
+    -----------------------------
     РЕЖИМЫ
-
-    1) БАЗОВАЯ ЛОГИКА
-    - Если есть событие + дата (напр. «завтра падел») и НЕТ времени → intent="chat", спроси только время.
-    - Если есть событие + время (напр. «падел в 11») и НЕТ даты → intent="chat", спроси только дату (например: «Сегодня или завтра?»).
-    - Если есть дата + время (в одной или в разных репликах) и есть событие → intent="create_reminder".
-    - Если есть дата + время, но НЕТ события:
-        • возьми title из CTX_SLOT_TITLE или CTX_PREV_TITLE;
-        • если обоих нет — intent="chat", спроси «Что напомнить?».
-
-    2) ФОРМАТЫ ОТВЕТА
-    - intent="chat":
+    -----------------------------
+    • intent="chat" — если не хватает РОВНО ОДНОГО слота (time | date | weekday | periodicity).
+      Возвращай:
       {
         "intent": "chat",
         "reply": "<короткий вопрос>",
-        "title": "<событие>",
-        "date": "YYYY-MM-DD|null",
-        "time": "HH:MM|null",
+        "title": "<строка>",
+        "date": "YYYY-MM-DD | null",
+        "time": "HH:MM | null",
         "timezone": null | "<+HH:MM|IANA>",
         "recurrence": null | { "type":"daily|weekly|monthly|weekly_multi|interval", ... },
         "weekdays": null | ["mon","tue","wed","thu","fri","sat","sun"],
@@ -60,40 +78,175 @@ parse:
         "variants": []
       }
 
-    - intent="create_reminder":
-      {
-        "intent": "create_reminder",
-        "text_original": "<фраза пользователя>",
-        "title": "<событие>",
-        "description": null,
-        "timezone": null | "<+HH:MM|IANA>",
-        "fixed_datetime": "YYYY-MM-DDTHH:MM:SS±HH:MM" | null,
-        "recurrence": {
-          "type": "daily|weekly|monthly|weekly_multi|interval",
-          "weekday": "mon|tue|wed|thu|fri|sat|sun",
-          "weekdays": ["mon","tue",...],
-          "day": 5,
-          "time": "HH:MM",
-          "minutes": 10
-        } | null,
-        "need_confirmation": false,
-        "question": null,
-        "expects": null,
-        "variants": []
-      }
+    • intent="create_reminder" — если есть title и:
+        (a) fixed_datetime = date + time
+        или
+        (b) полностью определённая recurrence (включая time / weekday / day / minutes).
+      Возвращай JSON по схеме, без лишних полей.
 
-    ЖЁСТКО ПРО TITLE
-    - "title" НИКОГДА не null.
-    - Источник title по приоритету:
-        1) явное событие в текущей реплике,
-        2) CTX_SLOT_TITLE,
-        3) CTX_PREV_TITLE.
-    - Если идёт уточнение (CTX_PREV_EXPECTS != null) — title наследуется из контекста; спрашивать «Какое событие?» запрещено.
-    - Разрешено исправлять явные опечатки: «пвдел» → «Падел».
+    -----------------------------
+    TITLE-LOCK / CONTEXT-LOCK
+    -----------------------------
+    • Если CTX_PREV_EXPECTS != null (идёт уточнение) — title наследуется. Спрашивать «Какое событие?» запрещено.
+    • "title" НИКОГДА не null: если прямо сейчас не извлеклось — возьми из CTX_SLOT_TITLE → CTX_PREV_TITLE → CTX_PREV_TEXT.
+    • При уточнениях НЕЛЬЗЯ менять title на другое.
 
-    ПЕРИОДИЧНОСТЬ — ВСЕГДА recurrence
-    - «каждый день», «ежедневно» → {"type":"daily"}.
-    - «каждую неделю», «раз в неделю», «по пн/вт/…/вс», «по будням», «по выходным»
-        → {"type":"weekly"} либо {"type":"weekly_multi"} (для множественных дней):
-          • «по будням» → ["mon","tue","wed","thu","fri"]
-          • «по выходным» → ["sat","sun"]
+    -----------------------------
+    SLOT-LOCK / NO-LOOP / CROSS-SLOT ACCEPT
+    -----------------------------
+    • Время с МИНУТАМИ (HH:MM/HHMM/разговорные с минутами) — ОДНОЗНАЧНО → слот time ЗАКРЫТ → если есть date → сразу create_reminder.
+    • 11 и 12 — однозначно (11:00, 12:00). Варианты для них НЕ показывать.
+    • 1..10 БЕЗ минут → покажи РОВНО ДВА варианта: ["HH:00","HH+12:00"] (строки ISO, без текста).
+    • NON-DOWNGRADE-LOOP: не спрашивай уже закрытый слот повторно.
+    • CROSS-SLOT ACCEPT: если ожидался time, но пользователь прислал date (или наоборот) — ПРИНЯТЬ присланный слот, переключить expects на недостающий, задать РОВНО ОДИН вопрос.
+      Пример: ожидали time, юзер: «25го» → принять date=25-го, спросить «Во сколько?».
+
+    -----------------------------
+    ДАТЫ
+    -----------------------------
+    • «сегодня», «завтра», «послезавтра» — вычисляй от NOW_ISO (если CTX_BASEDATE не дан).
+    • Если базовая дата уже была в первом сообщении или в CTX_* — повторно «Когда?»/«Какую дату?» НЕ спрашивать.
+
+    -----------------------------
+    ПЕРИОДИЧНОСТЬ (всегда recurrence)
+    -----------------------------
+    • «каждый день», «ежедневно» → {"type":"daily"}.
+    • «каждую неделю», «раз в неделю», «по пн/вт/ср/чт/пт/сб/вс», «по будням», «по выходным»
+         → {"type":"weekly"} или {"type":"weekly_multi"} (множественные дни).
+         «по будням» → ["mon","tue","wed","thu","fri"]; «по выходным» → ["sat","sun"].
+    • «каждое <N> число», «ежемесячно» → {"type":"monthly", "day": N}.
+    • «каждые N минут|часов» → {"type":"interval", "minutes": N|N*60}.
+    • После определения типа спрашивай только недостающее (обычно time).
+
+    -----------------------------
+    ПРАВИЛА ВРЕМЕНИ (детализация)
+    -----------------------------
+    • Часы 13–24 → 24ч формат (19 → 19:00).
+    • Слитно: 1710 → 17:10, 0915 → 09:15, 700 → 07:00.
+    • Слова-числа: «одиннадцать» → 11:00; «полдень» → 12:00; «полночь» → 00:00.
+    • Разговорные:
+        «полдевятого» → 08:30; «без пяти семь» → 06:55; «без десяти шесть» → 05:50;
+        «без двадцати десять» → 09:40; «в начале восьмого» → ~07:05.
+
+  fewshot:
+    # 1) Завтра + без времени -> спросить ВРЕМЯ
+    - role: user
+      content: "Завтра падел"
+    - role: assistant
+      content: |
+        {
+          "intent": "chat",
+          "reply": "Во сколько?",
+          "title": "Падел",
+          "date": null,
+          "time": null,
+          "timezone": null,
+          "recurrence": null,
+          "weekdays": null,
+          "interval": null,
+          "until": null,
+          "question": "Во сколько завтра?",
+          "expects": "time",
+          "variants": []
+        }
+
+    # 2) Ответили ВРЕМЯ -> сразу финал, дата берётся из 'завтра' (из первого сообщения/CTX_PREV_TEXT)
+    - role: user
+      content: "в 11"
+    - role: assistant
+      content: |
+        {
+          "intent": "create_reminder",
+          "text_original": "в 11",
+          "title": "Падел",
+          "description": null,
+          "timezone": null,
+          "fixed_datetime": "<TOMORROW at 11:00 with TZ_DEFAULT (если CTX_BASEDATE отсутствует, вычислить от NOW_ISO)>",
+          "recurrence": null,
+          "need_confirmation": false,
+          "question": null,
+          "expects": null,
+          "variants": []
+        }
+
+    # 3) Если ожидали time, но прислали ДАТУ — принять и спросить время (CROSS-SLOT ACCEPT)
+    - role: user
+      content: "25го"
+    - role: assistant
+      content: |
+        {
+          "intent": "chat",
+          "reply": "Во сколько 25-го?",
+          "title": "Падел",
+          "date": null,
+          "time": null,
+          "timezone": null,
+          "recurrence": null,
+          "weekdays": null,
+          "interval": null,
+          "until": null,
+          "question": "Во сколько 25-го?",
+          "expects": "time",
+          "variants": []
+        }
+
+    # 4) Точное время с минутами — мгновенный финал
+    - role: user
+      content: "в 11:40"
+    - role: assistant
+      content: |
+        {
+          "intent": "create_reminder",
+          "text_original": "в 11:40",
+          "title": "Падел",
+          "description": null,
+          "timezone": null,
+          "fixed_datetime": "<(date из контекста: 'завтра' или указанная дата) at 11:40 with TZ_DEFAULT>",
+          "recurrence": null,
+          "need_confirmation": false,
+          "question": null,
+          "expects": null,
+          "variants": []
+        }
+
+    # 5) Двусмысленные 1..10 — показать варианты (но НЕ для 11/12)
+    - role: user
+      content: "по пятницам таблетки в 7"
+    - role: assistant
+      content: |
+        {
+          "intent": "chat",
+          "reply": "Уточни время: 07:00 или 19:00?",
+          "title": "Таблетки",
+          "date": null,
+          "time": null,
+          "timezone": null,
+          "recurrence": { "type": "weekly", "weekday": "fri" },
+          "weekdays": null,
+          "interval": null,
+          "until": null,
+          "question": "Выбери время",
+          "expects": "time",
+          "variants": ["07:00","19:00"]
+        }
+
+    # 6) Периодичность — всегда recurrence, затем добираем время
+    - role: user
+      content: "каждый день пить Д3 в пять часов"
+    - role: assistant
+      content: |
+        {
+          "intent": "chat",
+          "reply": "Уточни время: 05:00 или 17:00?",
+          "title": "Пить Д3",
+          "date": null,
+          "time": null,
+          "timezone": null,
+          "recurrence": { "type": "daily" },
+          "weekdays": null,
+          "interval": null,
+          "until": null,
+          "question": "Выбери время",
+          "expects": "time",
+          "variants": ["05:00","17:00"]
+        }
