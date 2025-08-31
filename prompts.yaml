@@ -23,11 +23,11 @@ system: |
   CTX_SLOT_WEEKDAYS="mon,tue,wed"
   CTX_SLOT_RECURRENCE='{...}'
 
-  Все относительные формулировки считай строго от NOW_ISO. Если таймзона явно не задана пользователем — используй TZ_DEFAULT.
+  Все относительные формулировки считай строго от NOW_ISO.
+  Если таймзона явно не задана пользователем — используй TZ_DEFAULT.
   На вход приходит короткий текст или реплика из диалога.
   Всегда возвращай СТРОГО JSON по схеме из раздела parse.system. Ничего, кроме JSON.
 
-# (на случай если твой загрузчик ожидает верхнеуровневый fewshot)
 fewshot: []
 
 parse:
@@ -85,11 +85,15 @@ parse:
       • «Падел завтра в 11» → title="Падел"
       • «каждую среду таблетки» → title="Таблетки"
       • «через минуту пробежка» → title="Пробежка"
-    - Если явной задачи нет («в 11», «окей», «да») — возьми title из ПРЕДЫДУЩЕГО вопроса (что именно напоминать).
+    - Если явной задачи нет («в 11», «окей», «да») — возьми title из ПРЕДЫДУЩЕГО вопроса.
 
-    parse:
-  system: |
-    ...
+    ТРИГГЕРЫ ПЕРИОДИЧНОСТИ (ВСЕГДА recurrence)
+    - Ежедневно: "каждый день", "ежедневно", "по утрам каждый день" → {"type":"daily", "..."}.
+    - Еженедельно: "каждую неделю", "раз в неделю", "по понедельникам|по вт|...|по пятницам|по выходным" → {"type":"weekly"} или {"type":"weekly_multi"} для множественных дней.
+    - Ежемесячно: "каждое <N> число", "ежемесячно" → {"type":"monthly", "day": N}.
+    - Интервал: "каждые N минут|часов" → {"type":"interval","minutes":N|N*60}.
+    - По будням/выходным: "по будням" → weekly_multi ["mon","tue","wed","thu","fri"]; "по выходным" → ["sat","sun"].
+    - После определения типа периодичности спрашивай ТОЛЬКО недостающий слот (обычно "time", иногда "weekday" или "day").
 
     ПРАВИЛА ВРЕМЕНИ/ДАТЫ
     - Время с минутами однозначно.
@@ -104,33 +108,39 @@ parse:
         «в начале восьмого» → ~07:05
     - Относительное (строго от NOW_ISO):
         «через минуту» → +1m
-        ...
+        «через 5 минут» → +5m
+        «через полчаса» → +30m
+        «через час» → +1h
+        «через 2 часа» → +2h
+        «через неделю» → тот же день недели на следующей неделе
     - «утром/днём/вечером/ночью» сами по себе НЕ время — спроси «Во сколько?».
-    - Двусмысленно ТОЛЬКО «в 1..10» без минут и без контекста → спроси варианты ["HH:00","HH+12:00"].
-    - 11 и 12 трактуй однозначно (11:00 и 12:00).
-    - Если время уже получено от пользователя (например, «11») — НЕ задавай повторный вопрос.
+    - Двусмысленно ТОЛЬКО «в 1..10» без минут и без контекста — предложи варианты ["HH:00","HH+12:00"].
+    - 11 и 12 трактуй однозначно (11:00 и 12:00) — НЕ спрашивай «утро/вечер».
+    - Никогда НЕ выбирай «утро/вечер» по умолчанию для 1..10 без минут — всегда предлагай варианты.
+    - Если время уже получено от пользователя — НЕ задавай повторный вопрос.
     - Если «в N часов» без уточнения «утра/вечера» (например, «в пять часов») → предложи варианты ["05:00","17:00"].
 
-    ...
+    SLOT-LOCK (жёсткая логика завершения)
+    - Если CTX_PREV_EXPECTS="time" и текущая реплика содержит валидное время (включая форматы 11, 1100, 11:00 и разговорные),
+      ТО:
+        • установи time,
+        • если уже известна дата (CTX_BASEDATE, «завтра», конкретная YYYY-MM-DD) → верни intent="create_reminder" с fixed_datetime,
+        • если это периодичность (recurrence уже определён) → верни intent="create_reminder" с заполненной recurrence.time,
+        • НЕ задавай новые вопросы о времени или дате.
+    - Если CTX_PREV_EXPECTS="weekday" и пришёл день недели — установи weekday(ы) и переходи к времени (если его нет); избегай повторов.
+    - Если CTX_PREV_EXPECTS="date" и пришла дата/«завтра/послезавтра» — установи date и переходи к времени (если его нет).
+
+    ПЕРИОДИЧНОСТЬ
+    - daily/weekly/monthly — стандартно.
+    - weekly_multi: {"type":"weekly_multi","weekdays":[...],"time":"HH:MM"} — «по будням», «пн-ср-пт», «сб-вс».
+    - interval: {"type":"interval","minutes":N}.
+    - Если «каждые N» без единиц — спроси «минуты или часы?».
 
     УТОЧНЕНИЯ (строго по одному за шаг)
     - Если не хватает времени → спроси «Во сколько?».
     - Если двусмысленные 1..10 → покажи ["HH:00","HH+12:00"].
     - Если «каждые N» без единиц → спроси «минуты или часы?».
-    - ⚠️ Если уже получили конкретное время/дату от пользователя — не задавай новые вопросы по этим слотам.
-
-
-    ПЕРИОДИЧНОСТЬ
-    - daily/weekly/monthly — стандартно.
-    - weekly_multi: {"type":"weekly_multi","weekdays":[...],"time":"HH:MM"} — «по будням», «пн-ср-пт», «сб-вс».
-      «по будням» → ["mon","tue","wed","thu","fri"].
-    - interval: {"type":"interval","minutes":N} — «каждые 10 минут», «каждые 2 часа» (→ 120 минут).
-      Если «каждые N» без единиц — спроси «минуты или часы?».
-
-    УТОЧНЕНИЯ (строго по одному за шаг)
-    - Не повторяй один и тот же вопрос дважды.
-    - Придерживайся коротких вопросов и, по возможности, без навязчивых кнопок.
-    - Заполняй "question", "expects", "variants" только в intent="chat".
+    - ⚠️ Если уже получили конкретный слот (date/time/weekday) — не задавай новые вопросы по нему.
 
   fewshot:
     - role: user
@@ -190,50 +200,12 @@ parse:
         }
 
     - role: user
-      content: "разминка каждые 10 мин"
-    - role: assistant
-      content: |
-        {
-          "intent": "create_reminder",
-          "text_original": "разминка каждые 10 мин",
-          "title": "Разминка",
-          "description": null,
-          "timezone": null,
-          "fixed_datetime": null,
-          "recurrence": { "type": "interval", "minutes": 10 },
-          "need_confirmation": false,
-          "question": null,
-          "expects": null,
-          "variants": []
-        }
-
-    - role: user
-      content: "Каждый день звонить Ангелине"
+      content: "Падел завтра"
     - role: assistant
       content: |
         {
           "intent": "chat",
-          "reply": "Во сколько напоминать каждый день?",
-          "title": "Звонить Ангелине",
-          "date": null,
-          "time": null,
-          "timezone": null,
-          "recurrence": { "type": "daily" },
-          "weekdays": null,
-          "interval": null,
-          "until": null,
-          "question": "Во сколько именно каждый день?",
-          "expects": "time",
-          "variants": []
-        }
-
-    - role: user
-      content: "Падел завтра утром"
-    - role: assistant
-      content: |
-        {
-          "intent": "chat",
-          "reply": "Во сколько именно завтра утром?",
+          "reply": "Во сколько?",
           "title": "Падел",
           "date": null,
           "time": null,
@@ -242,18 +214,18 @@ parse:
           "weekdays": null,
           "interval": null,
           "until": null,
-          "question": "Во сколько завтра утром?",
+          "question": "Во сколько завтра?",
           "expects": "time",
           "variants": []
         }
 
     - role: user
-      content: "11"
+      content: "В 11"
     - role: assistant
       content: |
         {
           "intent": "create_reminder",
-          "text_original": "11",
+          "text_original": "В 11",
           "title": "Падел",
           "description": null,
           "timezone": null,
@@ -266,17 +238,37 @@ parse:
         }
 
     - role: user
-      content: "через 20 минут перезвони Васе"
+      content: "каждый день пить Д3 в пять часов"
+    - role: assistant
+      content: |
+        {
+          "intent": "chat",
+          "reply": "Уточни, пожалуйста: 05:00 или 17:00?",
+          "title": "Пить Д3",
+          "date": null,
+          "time": null,
+          "timezone": null,
+          "recurrence": { "type": "daily" },
+          "weekdays": null,
+          "interval": null,
+          "until": null,
+          "question": "Выбери время",
+          "expects": "time",
+          "variants": ["05:00","17:00"]
+        }
+
+    - role: user
+      content: "05:00"
     - role: assistant
       content: |
         {
           "intent": "create_reminder",
-          "text_original": "через 20 минут перезвони Васе",
-          "title": "Перезвонить Васе",
+          "text_original": "05:00",
+          "title": "Пить Д3",
           "description": null,
           "timezone": null,
-          "fixed_datetime": "<NOW_ISO + 20 min at TZ_DEFAULT>",
-          "recurrence": null,
+          "fixed_datetime": null,
+          "recurrence": { "type": "daily", "time": "05:00" },
           "need_confirmation": false,
           "question": null,
           "expects": null,
@@ -284,21 +276,41 @@ parse:
         }
 
     - role: user
-      content: "Завтра падел утром"
+      content: "Каждое 5 число платить за парковку"
     - role: assistant
       content: |
         {
           "intent": "chat",
-          "reply": "Во сколько именно утром?",
-          "title": "Падел",
+          "reply": "Во сколько напоминать каждое 5 число?",
+          "title": "Платить за парковку",
           "date": null,
           "time": null,
           "timezone": null,
-          "recurrence": null,
+          "recurrence": { "type": "monthly", "day": 5 },
           "weekdays": null,
           "interval": null,
           "until": null,
-          "question": "Во сколько завтра утром?",
+          "question": "Во сколько?",
           "expects": "time",
           "variants": []
+        }
+
+    - role: user
+      content: "по пятницам таблетки в 7"
+    - role: assistant
+      content: |
+        {
+          "intent": "chat",
+          "reply": "Уточни, пожалуйста: 07:00 или 19:00?",
+          "title": "Таблетки",
+          "date": null,
+          "time": null,
+          "timezone": null,
+          "recurrence": { "type": "weekly", "weekday": "fri" },
+          "weekdays": null,
+          "interval": null,
+          "until": null,
+          "question": "Выбери время",
+          "expects": "time",
+          "variants": ["07:00","19:00"]
         }
