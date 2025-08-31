@@ -33,6 +33,7 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
+
 # ---------- Logging ----------
 logging.basicConfig(
     level=logging.DEBUG,
@@ -46,6 +47,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
 PROMPTS_PATH = os.environ.get("PROMPTS_PATH", "prompts.yaml")
 DB_PATH = os.environ.get("DB_PATH", "reminders.db")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+# --- LLM context injection state ---
+_CTX_INJECTION = {}
 
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 DB_DIALECT = ((os.environ.get("DB_DIALECT") or ("postgres" if DATABASE_URL else "sqlite")).strip().lower())
@@ -977,6 +981,9 @@ async def cb_prebuild(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- main text ----------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _CTX_INJECTION   # <- ДОЛЖНО быть самой первой инструкцией в функции
+
     # 0) быстрые выходы
     if await try_handle_tz_input(update, context):
         return
@@ -1008,15 +1015,6 @@ if get_clarify_state(context) and re.search(
         return
 
     now_local = now_in_user_tz(user_tz)
-
-    # --- подготовим CTX_* для LLM (если это уточнение)
-    cs = get_clarify_state(context) or {}
-    base_date = cs.get("base_date")
-    prev_title = cs.get("title") or ""
-    prev_q = cs.get("question") or ""
-    prev_expects = None
-    if base_date:
-        prev_expects = "time"
 
         # --- подготовим CTX_* только если реально в режиме уточнения ---
     cs = get_clarify_state(context) or {}
