@@ -1245,7 +1245,7 @@ def db_init():
         )
     """)
 
-    # миграции — каждая с отдельным try/except на СЛЕДУЮЩЕЙ строке
+    # аккуратные миграции — каждая с try/except на отдельных строках
     try:
         conn.execute("alter table reminders add column kind text default 'oneoff'")
     except Exception:
@@ -1262,14 +1262,17 @@ def db_init():
         pass
 
     try:
-        conn.execute("alter table reminders add column offset_mi_
+        conn.execute("alter table reminders add column offset_minutes integer")
+    except Exception:
+        pass
 
-            try: conn.execute("alter table reminders add column kind text default 'oneoff'"); except Exception: pass
-            try: conn.execute("alter table reminders add column recurrence_json text"); except Exception: pass
-            try: conn.execute("alter table reminders add column parent_id integer"); except Exception: pass
-            try: conn.execute("alter table reminders add column offset_minutes integer"); except Exception: pass
-            try: conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)"); except Exception: pass
-            conn.commit()
+    try:
+        conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)")
+    except Exception:
+        pass
+
+    conn.commit()
+
 
 # ---------- PRE-ALERTS (старый обработчик для совместимости) ----------
 async def cb_prealerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
