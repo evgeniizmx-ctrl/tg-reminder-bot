@@ -1099,24 +1099,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await send_prebuild_poll(update, context)
         set_clarify_state(context, None)
-        # [3б] если модель подставила 00:00, но пользователь время не называл — попросим время
+        # [36] если модель подставила 00:00, но пользователь время не называл — попросим время
     def _text_has_time(s: str) -> bool:
-    s = s.lower()
-    # «в 9», «в 09», «в 9:30», «09:30» и пр.
-    return bool(re.search(r"\bв\s+\d{1,2}(:\d{2})?\b", s) or re.search(r"\b\d{1,2}:\d{2}\b", s))
+        s = s.lower()
+        # «в 9», «в 09», «в 9:30», «09:30» и пр.
+        return bool(
+            re.search(r"\bв\s+\d{1,2}(:\d{2})?\b", s) or
+            re.search(r"\b\d{1,2}:\d{2}\b", s)
+        )
 
-if rec_obj:
-    _rtype = (rec_obj.get("type") or "").lower()
-    _rtime = (rec_obj.get("time") or "").strip()
-    if _rtype in {"daily", "weekly", "monthly", "yearly"} and (_rtime in {"0:00","00:00","00:00:00"}) and not _text_has_time(incoming_text):
-        set_clarify_state(context, {
-            "title": title,
-            "base_date": None,
-            "question": "Во сколько?",
-            "expects": "time",
-        })
-        await safe_reply(update, "Во сколько?")
-        return
+    if rec_obj:
+        _rtype = (rec_obj.get("type") or "").lower()
+        _rtime = (rec_obj.get("time") or "").strip()
+        if _rtype in {"daily", "weekly", "monthly", "yearly"} and (_rtime in {"0:00","00:00","00:00:00"}) and not _text_has_time(incoming_text):
+            set_clarify_state(context, {
+                "title": title,
+                "base_date": None,
+                "question": "Во сколько?",
+                "expects": "time",
+            })
+            await safe_reply(update, "Во сколько?")
+            return
         
     # ====== ПЕРИОДИЧЕСКИЕ ======
     rtype = (rec_obj.get("type") or "").lower()
