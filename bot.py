@@ -1223,27 +1223,47 @@ def db_init():
             conn.execute("create index if not exists reminders_status_idx on reminders(status)")
             conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)")
         else:
-            import sqlite3
-            conn.execute("""
-                create table if not exists users (
-                    user_id integer primary key,
-                    tz text
-                )
-            """)
-            conn.execute("""
-                create table if not exists reminders (
-                    id integer primary key autoincrement,
-                    user_id integer not null,
-                    title text not null,
-                    body text,
-                    when_iso text,
-                    status text default 'scheduled',
-                    kind text default 'oneoff',
-                    recurrence_json text,
-                    parent_id integer,
-                    offset_minutes integer
-             """)
-                )
+    import sqlite3
+    conn.execute("""
+        create table if not exists users (
+            user_id integer primary key,
+            tz text
+        )
+    """)
+    conn.execute("""
+        create table if not exists reminders (
+            id integer primary key autoincrement,
+            user_id integer not null,
+            title text not null,
+            body text,
+            when_iso text,
+            status text default 'scheduled',
+            kind text default 'oneoff',
+            recurrence_json text,
+            parent_id integer,
+            offset_minutes integer
+        )
+    """)
+
+    # миграции — каждая с отдельным try/except на СЛЕДУЮЩЕЙ строке
+    try:
+        conn.execute("alter table reminders add column kind text default 'oneoff'")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("alter table reminders add column recurrence_json text")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("alter table reminders add column parent_id integer")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("alter table reminders add column offset_mi_
+
             try: conn.execute("alter table reminders add column kind text default 'oneoff'"); except Exception: pass
             try: conn.execute("alter table reminders add column recurrence_json text"); except Exception: pass
             try: conn.execute("alter table reminders add column parent_id integer"); except Exception: pass
