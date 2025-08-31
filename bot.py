@@ -1,3 +1,5 @@
+# bot.py — PlannerBot (fixed)
+
 import os
 import re
 import json
@@ -1034,6 +1036,84 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     # LLM — основной парсер
+    # --- Быстрая связка уточнений "дата/время", когда модель спросила оба поля ---
+    if is_clarify_active:
+        cs2 = get_clarify_state(context) or {}
+        expects2 = (cs2.get("expects") or "").lower()
+        question2 = (cs2.get("question") or "").lower()
+        # эвристика: если в вопросе одновременно есть "дат" и "врем" — значит модель ждёт оба поля
+        expects_both = expects2 in {"both", "date_time", "date+time"} or ("дат" in question2 and "врем" in question2)
+
+        # распознаем отдельные ответы
+        txt = incoming_text.strip()
+        m_time = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?$", txt)
+        m_ddmm = re.fullmatch(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?", txt)
+        m_rel = re.search(r"\b(сегодня|завтра|послезавтра)\b", txt.lower())
+
+        def _compute_basedate_from_text() -> str | None:
+            if m_rel:
+                plus = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[m_rel.group(1)]
+                return (now_local + timedelta(days=plus)).date().isoformat()
+            if m_ddmm:
+                dd = int(m_ddmm.group(1)); mm = int(m_ddmm.group(2))
+                yy = int(m_ddmm.group(3) or now_local.year)
+                try:
+                    return datetime(yy, mm, dd, tzinfo=now_local.tzinfo).date().isoformat()
+                except Exception:
+                    return None
+            return None
+
+        if expects_both:
+            # 1) время пришло первым
+            if m_time and not cs2.get("base_date"):
+                hh = int(m_time.group(1)); mm = int(m_time.group(2) or 0)
+                cs2["slot_time"] = f"{hh:02d}:{mm:02d}"
+                cs2["expects"] = "date"
+                cs2["question"] = "На какую дату?"
+                set_clarify_state(context, cs2)
+                await safe_reply(update, cs2["question"])
+                return
+
+            # 2) дата пришла первой
+            bd = _compute_basedate_from_text()
+            if (bd is not None) and not cs2.get("slot_time"):
+                cs2["base_date"] = bd
+                cs2["expects"] = "time"
+                cs2["question"] = "Во сколько?"
+                set_clarify_state(context, cs2)
+                await safe_reply(update, cs2["question"])
+                return
+
+            # 3) есть дата и новое время — завершаем
+            if m_time and cs2.get("base_date"):
+                hh = int(m_time.group(1)); mm = int(m_time.group(2) or 0)
+                when_local2 = datetime.fromisoformat(cs2["base_date"]).replace(hour=hh, minute=mm, tzinfo=now_local.tzinfo)
+                when_iso_utc2 = iso_utc(when_local2)
+                context.user_data["prebuild"] = {
+                    "title": cs2.get("title") or "Напоминание",
+                    "when_iso_utc": when_iso_utc2,
+                    "user_tz": user_tz,
+                    "selected": set(),
+                }
+                await send_prebuild_poll(update, context)
+                set_clarify_state(context, None)
+                return
+
+            # 4) есть время в state и новая дата — тоже завершаем
+            if cs2.get("slot_time") and (bd is not None):
+                hh, mm = map(int, cs2["slot_time"].split(":"))
+                when_local2 = datetime.fromisoformat(bd).replace(hour=hh, minute=mm, tzinfo=now_local.tzinfo)
+                when_iso_utc2 = iso_utc(when_local2)
+                context.user_data["prebuild"] = {
+                    "title": cs2.get("title") or "Напоминание",
+                    "when_iso_utc": when_iso_utc2,
+                    "user_tz": user_tz,
+                    "selected": set(),
+                }
+                await send_prebuild_poll(update, context)
+                set_clarify_state(context, None)
+                return
+
     r = None
     if OPENAI_API_KEY:
         try:
