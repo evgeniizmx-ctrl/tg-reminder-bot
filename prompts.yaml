@@ -47,12 +47,12 @@ parse:
     - Единственная двусмысленность — «в 1..12» БЕЗ минут и без «утра/вечера»:
       intent="ask_clarification", expects="time", variants=["HH:00","(HH+12):00"].
 
-    ДАТЫ И ДНИ НЕДЕЛИ
+        ДАТЫ И ДНИ НЕДЕЛЕЛИ
     - «сегодня», «завтра», «послезавтра», «в эту/следующую пятницу» — вычисляй от NOW_ISO
       (следующая пятница — пятница СЛЕДУЮЩЕЙ календарной недели).
     - День недели + время → ближайший такой день в будущем.
-    - ЕСЛИ дан день/дата/«завтра/сегодня», НО НЕТ ВРЕМЕНИ → СНАЧАЛА спроси время:
-        intent="ask_clarification", expects="time", question="Во сколько [дата/день]?"
+    - ⚠️ ЕСЛИ указаны только день/дата/«завтра/сегодня» БЕЗ времени — НЕ подставляй дефолт,
+      а верни intent="ask_clarification", expects="time", question="Во сколько [дата/день]?"
 
     ПЕРИОДИЧНОСТЬ
     - daily: «каждый день», «ежедневно».
@@ -416,3 +416,21 @@ fewshot:
         "expects": "title",
         "variants": []
       }
+        - role: user
+    content: "Завтра падел"
+  - role: assistant
+    content: |
+      {
+        "intent": "ask_clarification",
+        "text_original": "Завтра падел",
+        "title": "Падел",
+        "description": null,
+        "timezone": null,
+        "fixed_datetime": null,
+        "recurrence": null,
+        "need_confirmation": false,
+        "question": "Во сколько завтра?",
+        "expects": "time",
+        "variants": []
+      }
+
