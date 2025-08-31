@@ -1133,12 +1133,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, "Я не понял, попробуй ещё раз.", reply_markup=MAIN_MENU_KB)
 
 # ---------- Error handler ----------
+import traceback
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error in PTB")
+    # печатаем сам апдейт (коротко) и полный traceback
+    try:
+        upd_short = None
+        if isinstance(update, Update):
+            # старайся не логировать огромные вложения
+            upd_short = {
+                "chat_id": getattr(getattr(update, "effective_chat", None), "id", None),
+                "user_id": getattr(getattr(update, "effective_user", None), "id", None),
+                "data_kind": (
+                    "callback_query" if update.callback_query
+                    else "message" if update.message
+                    else None
+                ),
+                "text": (update.message.text if getattr(update, "message", None) and update.message.text else None),
+                "callback_data": (update.callback_query.data if getattr(update, "callback_query", None) else None),
+            }
+        tb = "".join(traceback.format_exception(None, context.error, getattr(context.error, "__traceback__", None)))
+        log.error("Unhandled error in handler. update=%r\n%s", upd_short, tb)
+    except Exception:
+        # на всякий случай
+        log.exception("Failed to log error details")
+
+    # ответ пользователю — мягко и безопасно
     try:
         if isinstance(update, Update):
             await safe_reply(update, "Случилась ошибка. Попробуй ещё раз 🙏")
     except Exception:
+        # не позволяем error handler-у самоуничтожиться
         pass
 
 # ---------- Startup ----------
