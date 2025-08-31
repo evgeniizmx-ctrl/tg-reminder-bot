@@ -1217,61 +1217,62 @@ def db_init():
                   offset_minutes integer
                 )
             """)
+            # безопасные миграции
             conn.execute("alter table reminders add column if not exists parent_id bigint")
             conn.execute("alter table reminders add column if not exists offset_minutes integer")
             conn.execute("create index if not exists reminders_user_idx on reminders(user_id)")
             conn.execute("create index if not exists reminders_status_idx on reminders(status)")
             conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)")
-    else:
-    import sqlite3
-    conn.execute("""
-        create table if not exists users (
-            user_id integer primary key,
-            tz text
-        )
-    """)
-    conn.execute("""
-        create table if not exists reminders (
-            id integer primary key autoincrement,
-            user_id integer not null,
-            title text not null,
-            body text,
-            when_iso text,
-            status text default 'scheduled',
-            kind text default 'oneoff',
-            recurrence_json text,
-            parent_id integer,
-            offset_minutes integer
-        )
-    """)
+        else:
+            import sqlite3
+            conn.execute("""
+                create table if not exists users (
+                    user_id integer primary key,
+                    tz text
+                )
+            """)
+            conn.execute("""
+                create table if not exists reminders (
+                    id integer primary key autoincrement,
+                    user_id integer not null,
+                    title text not null,
+                    body text,
+                    when_iso text,
+                    status text default 'scheduled',
+                    kind text default 'oneoff',
+                    recurrence_json text,
+                    parent_id integer,
+                    offset_minutes integer
+                )
+            """)
 
-    try:
-        conn.execute("alter table reminders add column kind text default 'oneoff'")
-    except Exception:
-        pass
+            # безопасные миграции — каждая в отдельном try/except
+            try:
+                conn.execute("alter table reminders add column kind text default 'oneoff'")
+            except Exception:
+                pass
 
-    try:
-        conn.execute("alter table reminders add column recurrence_json text")
-    except Exception:
-        pass
+            try:
+                conn.execute("alter table reminders add column recurrence_json text")
+            except Exception:
+                pass
 
-    try:
-        conn.execute("alter table reminders add column parent_id integer")
-    except Exception:
-        pass
+            try:
+                conn.execute("alter table reminders add column parent_id integer")
+            except Exception:
+                pass
 
-    try:
-        conn.execute("alter table reminders add column offset_minutes integer")
-    except Exception:
-        pass
+            try:
+                conn.execute("alter table reminders add column offset_minutes integer")
+            except Exception:
+                pass
 
-    try:
-        conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)")
-    except Exception:
-        pass
+            try:
+                conn.execute("create index if not exists reminders_parent_idx on reminders(parent_id)")
+            except Exception:
+                pass
 
-    conn.commit()
-
+            conn.commit()
 
 # ---------- PRE-ALERTS (старый обработчик для совместимости) ----------
 async def cb_prealerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
